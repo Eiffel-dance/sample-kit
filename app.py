@@ -31,6 +31,7 @@ import math
 import numbers
 import random
 import sys
+from fractions import Fraction
 
 # 文本/字节类型虽然满足 Sequence 协议, 但不作为“元素序列”接受。
 _TEXT_TYPES = (str, bytes, bytearray)
@@ -218,6 +219,54 @@ def _use_exact_integer_path(pool_weights, k):
     return False
 
 
+def _float_total_is_finite(pool_weights):
+    """判断浮点路径的全量累计是否能表示为有限浮点。
+
+    权重全部非负, 任意子集的累计都不超过全量累计, 因此全量累计有限时,
+    浮点路径逐轮求和与 needle 边界计算都不可能溢出, 基线序列保持不变。
+    全量累计溢出为无穷(如 [1e308, 1e308]), 或求和本身因超大整数与浮点
+    混合而抛 OverflowError (如 [10**400, 1.0], int->float 转换溢出)时,
+    浮点路径不可用, 调用方须改用精确路径。
+    """
+    try:
+        total = sum(pool_weights)
+        return not math.isinf(total)
+    except OverflowError:
+        return False
+
+
+def _scale_to_exact_integer_weights(pool_weights):
+    """把有限实数权重按统一比例放大为精确整数权重, 供纯整数路径使用。
+
+    每个有限 float 都是分母为 2 的幂的精确分数, int / Fraction 同样
+    精确; 取全部分母的最小公倍数作为统一比例放大后, 所有权重成为精确
+    整数, 相对比例逐点保持 —— 正权重仍为正(每个正权重位置保留候选资
+    格), 零权重仍为零(永不被选中)。用于浮点求和/累计会溢出的极端输
+    入, 抽样概率严格等于原始正权重的相对比例。
+    """
+    fractions = [Fraction(w) for w in pool_weights]
+    scale = 1
+    for f in fractions:
+        scale = math.lcm(scale, f.denominator)
+    return [int(f * scale) for f in fractions]
+
+
+def _select_sampling_plan(pool_weights, k):
+    """返回 (抽样用权重, 是否走纯整数精确路径)。
+
+    优先沿用基线规则: 全整数且累计超 2**53 走纯整数路径; 总和可正常
+    表示的输入保持既有浮点路径与锁定序列不变。仅当浮点求和/累计会溢
+    出(有限浮点权重总和为无穷, 或超大整数与浮点混合求和溢出)时, 把
+    权重精确放大为整数后走纯整数路径 —— 只改变原本会产生无效或不完
+    整结果的极端场景。
+    """
+    if _use_exact_integer_path(pool_weights, k):
+        return pool_weights, True
+    if k > 0 and not _float_total_is_finite(pool_weights):
+        return _scale_to_exact_integer_weights(pool_weights), True
+    return pool_weights, False
+
+
 def _draw_indices_once(n, pool_weights, k, rng, use_exact):
     """从原始位置出发完成一轮抽样。
 
@@ -238,7 +287,7 @@ def weighted_sample_indices(items, weights, k, seed=0):
     # 复制到本地, 绝不修改入参。
     pool_weights = list(weights)
     rng = random.Random(seed)
-    use_exact = _use_exact_integer_path(pool_weights, k)
+    pool_weights, use_exact = _select_sampling_plan(pool_weights, k)
 
     return _draw_indices_once(n, pool_weights, k, rng, use_exact)
 
@@ -268,7 +317,7 @@ def weighted_sample_many_indices(items, weights, k, draws, seed=0):
 
     pool_weights = list(weights)
     rng = random.Random(seed)
-    use_exact = _use_exact_integer_path(pool_weights, k)
+    pool_weights, use_exact = _select_sampling_plan(pool_weights, k)
 
     rounds = []
     for _ in range(draws):

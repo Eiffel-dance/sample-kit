@@ -680,6 +680,105 @@ class WeightedSampleManyTest(unittest.TestCase):
         self.assertAlmostEqual(counts[1] / trials, 2 / 3, delta=0.04)
 
 
+class OverflowFloatWeightTest(unittest.TestCase):
+    """有限浮点权重求和/累计溢出为无穷时的精确回退路径。"""
+
+    def test_sum_overflow_returns_full_k(self):
+        # [1e308, 1e308] 的浮点总和为 inf; 修复前返回不完整结果。
+        idx = weighted_sample_indices(["a", "b"], [1e308, 1e308], 2, 42)
+        self.assertEqual(sorted(idx), [0, 1])
+        self.assertEqual(
+            idx, weighted_sample_indices(["a", "b"], [1e308, 1e308], 2, 42)
+        )
+        out = weighted_sample(["a", "b"], [1e308, 1e308], 2, 42)
+        self.assertEqual(out, [["a", "b"][i] for i in idx])
+
+    def test_overflow_with_mixed_magnitudes(self):
+        items = ["a", "b", "c"]
+        weights = [1e308, 1e308, 1.0]
+        for seed in range(20):
+            idx = weighted_sample_indices(items, weights, 3, seed)
+            self.assertEqual(sorted(idx), [0, 1, 2])
+            self.assertEqual(
+                idx, weighted_sample_indices(items, weights, 3, seed)
+            )
+
+    def test_mixed_huge_int_and_float_weights(self):
+        # 10**400 + 1.0 的求和会因 int->float 转换抛 OverflowError。
+        idx = weighted_sample_indices(["a", "b"], [10 ** 400, 1.0], 2, 42)
+        self.assertEqual(sorted(idx), [0, 1])
+        self.assertEqual(
+            idx, weighted_sample_indices(["a", "b"], [10 ** 400, 1.0], 2, 42)
+        )
+
+    def test_zero_weight_never_chosen_under_overflow(self):
+        for seed in range(100):
+            idx = weighted_sample_indices(
+                ["x", "y", "z"], [1e308, 0.0, 1e308], 1, seed
+            )
+            self.assertIn(idx, ([0], [2]))
+
+    def test_proportions_follow_original_weights(self):
+        # 总和溢出 (2.55e308 -> inf), 相对比例仍须为 2 : 1。
+        counts = [0, 0]
+        trials = 3000
+        for seed in range(trials):
+            i = weighted_sample_indices(
+                ["a", "b"], [1.7e308, 0.85e308], 1, seed
+            )[0]
+            counts[i] += 1
+        self.assertAlmostEqual(counts[0] / trials, 2 / 3, delta=0.04)
+        self.assertAlmostEqual(counts[1] / trials, 1 / 3, delta=0.04)
+
+    def test_many_first_round_matches_single_entry(self):
+        items = ["a", "b", "c"]
+        weights = [1e308, 1e308, 1.0]
+        for seed in (0, 1, 42, -7, 1.5, "s", b"s", True):
+            many = weighted_sample_many_indices(items, weights, 2, 4, seed)
+            self.assertEqual(
+                many[0], weighted_sample_indices(items, weights, 2, seed)
+            )
+            self.assertEqual(len(many), 4)
+            self.assertTrue(all(len(rd) == 2 for rd in many))
+
+    def test_many_k_exceeding_positive_raises_before_any_round(self):
+        with self.assertRaises(ValueError):
+            weighted_sample_many_indices(["a", "b"], [1e308, 0.0], 2, 3, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_many_indices(["a", "b"], [1e308, 0.0], 2, 0, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_many(["a", "b"], [1e308, 0.0], 2, 5, 0)
+
+    def test_k_zero_still_empty_under_overflow_scale(self):
+        self.assertEqual(weighted_sample_indices(["a"], [1e308], 0, 0), [])
+        self.assertEqual(
+            weighted_sample_many_indices(["a", "b"], [1e308, 1e308], 0, 2, 0),
+            [[], []],
+        )
+
+    def test_inputs_not_mutated_under_overflow(self):
+        items = ["a", "b", "c"]
+        weights = [1e308, 1e308, 1.0]
+        items_snap, weights_snap = list(items), list(weights)
+        weighted_sample(items, weights, 3, 5)
+        weighted_sample_many_indices(items, weights, 2, 3, 5)
+        self.assertEqual(items, items_snap)
+        self.assertEqual(weights, weights_snap)
+
+    def test_finite_total_keeps_baseline_float_path(self):
+        # 总和可正常表示的输入继续走浮点路径, 序列与基线一致。
+        import random as _random
+
+        w = [1e308, 1.0]
+        self.assertTrue(math.isfinite(sum(w)))
+        for s in range(20):
+            pool, pw = [0, 1], list(w)
+            self.assertEqual(
+                weighted_sample_indices(["a", "b"], w, 2, s),
+                app._sample_indices_float(pool, pw, 2, _random.Random(s)),
+            )
+
+
 class SerializeMetricsTest(unittest.TestCase):
     def test_baseline_format_locked(self):
         text = serialize_metrics({"b": 1, "a": {"z": 2, "y": 3}})
