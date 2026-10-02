@@ -6,21 +6,27 @@
     weighted_sample_indices(items, weights, k, seed=0)
         与 weighted_sample 同规则, 但返回按抽样先后排列的零基原始索引;
         items 中相等的值仍按不同位置独立处理。
-    weighted_sample_many(items, weights, k, draws, seed=0)
+    weighted_sample_many(items, weights, k, draws, seed=0, start=0)
         weighted_sample 的批量入口: 一次调用按同一输入生成 draws 轮加权
         无放回样本, 返回长度等于 draws 的外层序列, 每轮返回元素值。
         每轮都从原始位置重新开始(同一轮内位置最多出现一次, 重复值按位置
         区分, 轮次之间允许再次选中同一位置); 所有轮次共享同一个由 seed
         初始化的随机流, 第一轮与 weighted_sample 逐项相同。
-    weighted_sample_many_indices(items, weights, k, draws, seed=0)
-        与 weighted_sample_many 同规则, 但每轮返回按抽样先后排列的零基
-        原始索引, 两个批量入口逐轮对应。
-    weighted_sample_stream_indices(items, weights, k, draws, seed=0)
+        可选的 start(默认 0)表示先从该 seed 对应的轮次流开始跳过 start
+        个完整轮次(跳过只消耗同一条确定性随机流), 再生成 draws 轮;
+        结果与 start=0 的完整调用按零基区间 [start, start+draws) 切片
+        逐项一致。start 只接受非布尔整数(其他类型 TypeError), 不得为负
+        (负数 ValueError)。
+    weighted_sample_many_indices(items, weights, k, draws, seed=0, start=0)
+        与 weighted_sample_many 同规则(含 start 窗口语义), 但每轮返回
+        按抽样先后排列的零基原始索引, 两个批量入口逐轮对应。
+    weighted_sample_stream_indices(items, weights, k, draws, seed=0, start=0)
         weighted_sample_many_indices 的按需逐轮入口: 返回一个可迭代对象,
         调用方逐轮取得与 weighted_sample_many_indices 完全一致的轮次
         (每轮一份按抽样先后排列的零基原始索引列表), 不必一次物化全部
         draws 轮。完整校验在调用时完成, 失败结果在产生第一轮前确定。
-    weighted_sample_stream(items, weights, k, draws, seed=0)
+        start 语义与批量入口相同: 迭代时先按需跳过 start 个完整轮次。
+    weighted_sample_stream(items, weights, k, draws, seed=0, start=0)
         与 weighted_sample_stream_indices 同规则, 但每轮按相同索引产出
         元素值列表, 与 weighted_sample_many 逐轮对应。
     serialize_metrics(metrics)
@@ -164,6 +170,14 @@ def _validate_draws(draws):
         raise TypeError("draws must be a non-boolean integer")
     if draws < 0:
         raise ValueError("draws must be non-negative")
+
+
+def _validate_start(start):
+    """批量/流式入口的 start 必须是非布尔非负整数 (TypeError / ValueError)。"""
+    if isinstance(start, bool) or not isinstance(start, int):
+        raise TypeError("start must be a non-boolean integer")
+    if start < 0:
+        raise ValueError("start must be non-negative")
 
 
 def _count_positive_weights(weights):
@@ -377,7 +391,7 @@ def weighted_sample(items, weights, k, seed=0):
     return [items[i] for i in indices]
 
 
-def weighted_sample_many_indices(items, weights, k, draws, seed=0):
+def weighted_sample_many_indices(items, weights, k, draws, seed=0, start=0):
     """weighted_sample_indices 的批量入口: 一次调用生成 draws 轮样本。
 
     返回长度等于 draws 的外层序列, 每个元素是一轮按抽样先后排列的零基
@@ -385,19 +399,35 @@ def weighted_sample_many_indices(items, weights, k, draws, seed=0):
     之间允许再次选中同一位置); 所有轮次共享同一个由 seed 初始化的随机
     流, 第一轮与 weighted_sample_indices 逐项相同, 后续轮次继续消耗该
     流, 相同调用下得到相同的嵌套序列。seed=None 保留现有随机语义。
+
+    可选的 start(默认 0)表示先从该 seed 对应的轮次流开始跳过 start 个
+    完整轮次 —— 跳过只消耗同一条确定性随机流, 不改变任何选择规则 ——
+    再生成 draws 轮; 因此返回值与 start=0 的完整调用结果按零基区间
+    [start, start+draws) 切片逐项一致。start 只接受非布尔整数(其他类型
+    抛 TypeError), 负数抛 ValueError; start=0 时行为与既有公开结果完全
+    相同。
     """
     n = _validate_sample_inputs(items, weights, k, seed)
     _validate_draws(draws)
+    _validate_start(start)
 
     # 可行性前置检查: 每轮无放回抽取 k 个位置, 至少需要 k 个正权重位置
     # (k=0 时即使权重全为零也合法)。在开始任何一轮抽样之前判定, 保证
-    # 非法调用确定抛 ValueError 且绝不返回部分外层结果。
+    # 非法调用确定抛 ValueError 且绝不返回部分外层结果 —— 即使 draws
+    # 为 0 或 start 很大也不例外。
     if k > 0 and k > _count_positive_weights(weights):
         raise ValueError("no positive weight")
 
     pool_weights = list(weights)
     rng = random.Random(seed)
     pool_weights, use_exact = _select_sampling_plan(pool_weights, k)
+
+    # 先跳过 start 个完整轮次: 与完整序列消耗同一条确定性随机流, 因此
+    # 后续轮次与 start=0 的完整调用按区间切片逐项一致。k=0 的轮次不消耗
+    # 随机流, draws=0 时跳过与否不影响空结果, 两种情形都无需空转。
+    if k > 0 and draws > 0:
+        for _ in range(start):
+            _draw_indices_once(n, pool_weights, k, rng, use_exact)
 
     rounds = []
     for _ in range(draws):
@@ -407,16 +437,16 @@ def weighted_sample_many_indices(items, weights, k, draws, seed=0):
     return rounds
 
 
-def weighted_sample_many(items, weights, k, draws, seed=0):
+def weighted_sample_many(items, weights, k, draws, seed=0, start=0):
     """weighted_sample 的批量入口, 规则与 weighted_sample_many_indices
-    完全一致, 区别仅在于每轮返回元素值而非原始索引; 两个批量入口逐轮
-    逐项对应。
+    完全一致(含 start 窗口语义), 区别仅在于每轮返回元素值而非原始索引;
+    两个批量入口逐轮逐项对应。
     """
-    rounds = weighted_sample_many_indices(items, weights, k, draws, seed)
+    rounds = weighted_sample_many_indices(items, weights, k, draws, seed, start)
     return [[items[i] for i in round_indices] for round_indices in rounds]
 
 
-def weighted_sample_stream_indices(items, weights, k, draws, seed=0):
+def weighted_sample_stream_indices(items, weights, k, draws, seed=0, start=0):
     """weighted_sample_many_indices 的按需逐轮入口。
 
     返回一个可迭代对象, 每次迭代产出一轮按抽样先后排列的零基原始索引
@@ -424,6 +454,12 @@ def weighted_sample_stream_indices(items, weights, k, draws, seed=0):
     weighted_sample_many_indices(items, weights, k, draws, seed) 返回的
     全部轮次完全一致(第一轮同样与 weighted_sample_indices 逐项相同)。
     每轮都从原始位置重新开始, 轮内不放回, 重复值按位置区分。
+
+    可选的 start(默认 0)与批量入口语义相同: 迭代时先从该 seed 对应的
+    轮次流按需跳过 start 个完整轮次(只消耗同一条确定性随机流), 再逐轮
+    产出 draws 轮; 转成列表后与 start=0 的完整结果按零基区间
+    [start, start+draws) 切片逐项一致。start 只接受非布尔整数(其他类型
+    抛 TypeError), 负数抛 ValueError。
 
     与批量入口不同, 轮次在调用方消费时才逐轮生成, 长批次不必一次物化;
     但全部校验(结构、类型、取值、正权重可行性)都在调用时完成 —— 非法
@@ -433,6 +469,7 @@ def weighted_sample_stream_indices(items, weights, k, draws, seed=0):
     """
     n = _validate_sample_inputs(items, weights, k, seed)
     _validate_draws(draws)
+    _validate_start(start)
 
     # 与批量入口相同的可行性前置检查: 在产生第一轮之前确定失败结果,
     # 保证迭代过程中不会再抛出任何异常。
@@ -445,19 +482,26 @@ def weighted_sample_stream_indices(items, weights, k, draws, seed=0):
     pool_weights, use_exact = _select_sampling_plan(pool_weights, k)
 
     def _rounds():
+        # 按需跳过 start 个完整轮次: 与完整序列消耗同一条确定性随机流。
+        # k=0 的轮次不消耗随机流, draws=0 时跳过与否不影响空结果, 两种
+        # 情形都无需空转。
+        if k > 0 and draws > 0:
+            for _ in range(start):
+                _draw_indices_once(n, pool_weights, k, rng, use_exact)
         for _ in range(draws):
             yield _draw_indices_once(n, pool_weights, k, rng, use_exact)
 
     return _rounds()
 
 
-def weighted_sample_stream(items, weights, k, draws, seed=0):
+def weighted_sample_stream(items, weights, k, draws, seed=0, start=0):
     """weighted_sample 的按需逐轮入口, 规则与
-    weighted_sample_stream_indices 完全一致, 区别仅在于每轮按相同索引
-    产出元素值列表; 与 weighted_sample_many 的逐轮结果完全一致。
+    weighted_sample_stream_indices 完全一致(含 start 窗口语义), 区别
+    仅在于每轮按相同索引产出元素值列表; 与 weighted_sample_many 的逐轮
+    结果完全一致。
     """
     index_stream = weighted_sample_stream_indices(
-        items, weights, k, draws, seed
+        items, weights, k, draws, seed, start
     )
     return ([items[i] for i in round_indices] for round_indices in index_stream)
 
