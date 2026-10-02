@@ -15,6 +15,14 @@
     weighted_sample_many_indices(items, weights, k, draws, seed=0)
         与 weighted_sample_many 同规则, 但每轮返回按抽样先后排列的零基
         原始索引, 两个批量入口逐轮对应。
+    weighted_sample_stream_indices(items, weights, k, draws, seed=0)
+        weighted_sample_many_indices 的按需逐轮入口: 返回一个可迭代对象,
+        调用方逐轮取得与 weighted_sample_many_indices 完全一致的轮次
+        (每轮一份按抽样先后排列的零基原始索引列表), 不必一次物化全部
+        draws 轮。完整校验在调用时完成, 失败结果在产生第一轮前确定。
+    weighted_sample_stream(items, weights, k, draws, seed=0)
+        与 weighted_sample_stream_indices 同规则, 但每轮按相同索引产出
+        元素值列表, 与 weighted_sample_many 逐轮对应。
     serialize_metrics(metrics)
         将指标树稳定序列化为紧凑 JSON 文本, 任意精度整数保持精确十进制。
         字典键先统一转换为成员名文本(str 原样, None->null, bool->true/false,
@@ -406,6 +414,52 @@ def weighted_sample_many(items, weights, k, draws, seed=0):
     """
     rounds = weighted_sample_many_indices(items, weights, k, draws, seed)
     return [[items[i] for i in round_indices] for round_indices in rounds]
+
+
+def weighted_sample_stream_indices(items, weights, k, draws, seed=0):
+    """weighted_sample_many_indices 的按需逐轮入口。
+
+    返回一个可迭代对象, 每次迭代产出一轮按抽样先后排列的零基原始索引
+    列表, 共 draws 轮; 对相同输入和种子, 逐轮结果与
+    weighted_sample_many_indices(items, weights, k, draws, seed) 返回的
+    全部轮次完全一致(第一轮同样与 weighted_sample_indices 逐项相同)。
+    每轮都从原始位置重新开始, 轮内不放回, 重复值按位置区分。
+
+    与批量入口不同, 轮次在调用方消费时才逐轮生成, 长批次不必一次物化;
+    但全部校验(结构、类型、取值、正权重可行性)都在调用时完成 —— 非法
+    输入在调用当场抛出稳定的 TypeError / ValueError, 绝不会延迟到已经
+    产出部分轮次之后。draws=0 时仍完成全部校验并返回不产出元素的迭代
+    对象; k=0 时每轮产出空列表。不修改入参。
+    """
+    n = _validate_sample_inputs(items, weights, k, seed)
+    _validate_draws(draws)
+
+    # 与批量入口相同的可行性前置检查: 在产生第一轮之前确定失败结果,
+    # 保证迭代过程中不会再抛出任何异常。
+    if k > 0 and k > _count_positive_weights(weights):
+        raise ValueError("no positive weight")
+
+    # 复制到本地, 绝不修改入参。
+    pool_weights = list(weights)
+    rng = random.Random(seed)
+    pool_weights, use_exact = _select_sampling_plan(pool_weights, k)
+
+    def _rounds():
+        for _ in range(draws):
+            yield _draw_indices_once(n, pool_weights, k, rng, use_exact)
+
+    return _rounds()
+
+
+def weighted_sample_stream(items, weights, k, draws, seed=0):
+    """weighted_sample 的按需逐轮入口, 规则与
+    weighted_sample_stream_indices 完全一致, 区别仅在于每轮按相同索引
+    产出元素值列表; 与 weighted_sample_many 的逐轮结果完全一致。
+    """
+    index_stream = weighted_sample_stream_indices(
+        items, weights, k, draws, seed
+    )
+    return ([items[i] for i in round_indices] for round_indices in index_stream)
 
 
 # ---------------------------------------------------------------------------

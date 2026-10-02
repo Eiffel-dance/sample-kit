@@ -10,6 +10,8 @@ from app import (
     weighted_sample_indices,
     weighted_sample_many,
     weighted_sample_many_indices,
+    weighted_sample_stream,
+    weighted_sample_stream_indices,
     serialize_metrics,
 )
 
@@ -681,6 +683,256 @@ class WeightedSampleManyTest(unittest.TestCase):
             ] += 1
         self.assertAlmostEqual(counts[0] / trials, 1 / 3, delta=0.04)
         self.assertAlmostEqual(counts[1] / trials, 2 / 3, delta=0.04)
+
+
+class WeightedSampleStreamTest(unittest.TestCase):
+    """按需逐轮入口 weighted_sample_stream / weighted_sample_stream_indices。"""
+
+    def test_stream_matches_many_round_by_round(self):
+        # 相同输入和种子下, 逐轮结果必须与批量入口完全一致。
+        cases = [
+            (list("abcdef"), [1, 3, 2, 5, 0, 2], 4),
+            (list(range(20)), [10 ** 80 + i for i in range(20)], 10),
+            (["p", "q"], [0.5, 1.5], 2),
+            ([], [], 0),
+            (list("xyz"), [10 ** 100, 1, 10 ** 50], 2),
+            (["p", "q", "r"], [2, Fraction(1), 0.5], 3),
+            (["a", "b", "c"], [Decimal("1.5"), Decimal("0.5"), Decimal("2")], 3),
+        ]
+        for items, weights, k in cases:
+            for seed in (0, 1, 42, -7, 1.5, "s", b"s", bytearray(b"s"), True):
+                with self.subTest(items=items, k=k, seed=seed):
+                    self.assertEqual(
+                        list(weighted_sample_stream_indices(
+                            items, weights, k, 4, seed)),
+                        weighted_sample_many_indices(items, weights, k, 4, seed),
+                    )
+                    self.assertEqual(
+                        list(weighted_sample_stream(items, weights, k, 4, seed)),
+                        weighted_sample_many(items, weights, k, 4, seed),
+                    )
+
+    def test_first_round_matches_single_entry(self):
+        cases = [
+            (list("abcdef"), [1, 3, 2, 5, 0, 2], 4),
+            (list(range(20)), [10 ** 80 + i for i in range(20)], 10),
+            (["p", "q"], [0.5, 1.5], 2),
+            (list("xyz"), [10 ** 100, 1, 10 ** 50], 2),
+        ]
+        for items, weights, k in cases:
+            for seed in (0, 1, 42, -7, 1.5, "s", b"s", True):
+                with self.subTest(items=items, k=k, seed=seed):
+                    stream_i = weighted_sample_stream_indices(
+                        items, weights, k, 3, seed)
+                    self.assertEqual(
+                        next(iter(stream_i)),
+                        weighted_sample_indices(items, weights, k, seed),
+                    )
+                    stream_v = weighted_sample_stream(
+                        items, weights, k, 3, seed)
+                    self.assertEqual(
+                        next(iter(stream_v)),
+                        weighted_sample(items, weights, k, seed),
+                    )
+
+    def test_returns_iterable_consumed_on_demand(self):
+        # 返回可迭代对象而非已物化的外层序列; 逐轮消费, 前缀与批量一致。
+        items, weights, k = list("abcdef"), [1, 3, 2, 5, 0, 2], 4
+        stream = weighted_sample_stream_indices(items, weights, k, 100, 7)
+        self.assertFalse(isinstance(stream, list))
+        iterator = iter(stream)
+        full = weighted_sample_many_indices(items, weights, k, 100, 7)
+        for expected in full[:5]:
+            self.assertEqual(next(iterator), expected)
+        # 继续消费仍与批量逐轮一致。
+        for expected in full[5:10]:
+            self.assertEqual(next(iterator), expected)
+
+    def test_values_and_indices_streams_correspond(self):
+        items, weights = list("abcdef"), [1, 3, 2, 5, 0, 2]
+        idx = list(weighted_sample_stream_indices(items, weights, 4, 5, 7))
+        vals = list(weighted_sample_stream(items, weights, 4, 5, 7))
+        self.assertEqual(vals, [[items[i] for i in rd] for rd in idx])
+
+    def test_each_round_restarts_from_original_positions(self):
+        for seed in range(50):
+            for rd in weighted_sample_stream_indices(
+                list(range(6)), [10 ** 100, 1, 10 ** 99, 3, 0, 5], 5, 7, seed
+            ):
+                self.assertEqual(len(rd), 5)
+                self.assertEqual(len(set(rd)), 5)
+                self.assertTrue(all(0 <= i < 6 for i in rd))
+                self.assertNotIn(4, rd)  # 零权重位置永不出现
+
+    def test_duplicate_values_distinct_positions(self):
+        idx = list(weighted_sample_stream_indices([1, 1, 1], [1, 1, 1], 3, 2, 123))
+        vals = list(weighted_sample_stream([1, 1, 1], [1, 1, 1], 3, 2, 123))
+        self.assertTrue(all(sorted(rd) == [0, 1, 2] for rd in idx))
+        self.assertEqual(vals, [[1, 1, 1], [1, 1, 1]])
+
+    def test_draws_zero_validates_then_yields_nothing(self):
+        self.assertEqual(
+            list(weighted_sample_stream_indices(["a", "b"], [1, 2], 2, 0, 0)),
+            [],
+        )
+        self.assertEqual(
+            list(weighted_sample_stream(["a", "b"], [1, 2], 2, 0, 0)), []
+        )
+        # draws=0 仍须完成全部校验, 且在调用当场抛出(不等到迭代)。
+        with self.assertRaises(TypeError):
+            weighted_sample_stream_indices("ab", [1, 2], 1, 0, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_stream_indices(["a", "b"], [1], 0, 0, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_stream_indices(["a"], [float("nan")], 0, 0, 0)
+        with self.assertRaises(TypeError):
+            weighted_sample_stream(["a"], [True], 0, 0, 0)
+
+    def test_k_zero_yields_empty_lists(self):
+        self.assertEqual(
+            list(weighted_sample_stream_indices(["a", "b"], [0, 0], 0, 4, 0)),
+            [[], [], [], []],
+        )
+        self.assertEqual(
+            list(weighted_sample_stream(["a", "b"], [0, 0], 0, 3, 0)),
+            [[], [], []],
+        )
+        self.assertEqual(
+            list(weighted_sample_stream_indices([], [], 0, 2, 0)), [[], []]
+        )
+
+    def test_validation_fails_at_call_time_not_mid_iteration(self):
+        # 所有失败结果都在产生第一轮之前确定: 调用当场抛异常, 而不是
+        # 返回一个迭代到中途才抛错的迭代对象。
+        def expect_raises(exc, fn, *args):
+            with self.assertRaises(exc):
+                fn(*args)  # 调用本身就必须抛出
+
+        expect_raises(
+            ValueError, weighted_sample_stream_indices,
+            ["a", "b"], [1, 0], 2, 3, 0)  # k 大于正权重个数
+        expect_raises(
+            ValueError, weighted_sample_stream_indices,
+            ["a"], [0], 1, 5, 0)  # 没有有效正权重
+        expect_raises(
+            ValueError, weighted_sample_stream,
+            ["a", "b", "c"], [10 ** 100, 0, 1], 3, 2, 0)
+        expect_raises(
+            TypeError, weighted_sample_stream_indices,
+            ["a", "b"], [1, "x"], 1, 1, 0)
+        expect_raises(
+            TypeError, weighted_sample_stream_indices,
+            ["a", "b"], [1, True], 1, 1, 0)
+        expect_raises(
+            TypeError, weighted_sample_stream_indices,
+            ["a"], [1], True, 1, 0)
+        expect_raises(
+            TypeError, weighted_sample_stream_indices,
+            ["a"], [1], 1, 1, object())
+        expect_raises(
+            TypeError, weighted_sample_stream_indices,
+            ["a"], [1], 0, True, 0)
+        expect_raises(
+            TypeError, weighted_sample_stream_indices,
+            ["a"], [1], 0, 1.0, 0)
+        expect_raises(
+            ValueError, weighted_sample_stream_indices,
+            ["a"], [1], 0, -1, 0)
+        expect_raises(
+            ValueError, weighted_sample_stream_indices,
+            ["a", "b"], [1, -1], 1, 1, 0)
+        expect_raises(
+            ValueError, weighted_sample_stream_indices,
+            ["a", "b"], [1, float("inf")], 1, 1, 0)
+        expect_raises(
+            ValueError, weighted_sample_stream_indices,
+            ["a", "b"], [1], 1, 1, 0)  # 长度不一致
+        expect_raises(
+            ValueError, weighted_sample_stream_indices,
+            ["a"], [1], 2, 1, 0)  # k 超出范围
+        expect_raises(
+            TypeError, weighted_sample_stream_indices,
+            iter(["a"]), [1], 0, 1, 0)  # items 非可确定长度序列
+        expect_raises(
+            TypeError, weighted_sample_stream_indices,
+            ["a"], iter([1]), 0, 1, 0)  # weights 非可确定长度序列
+        # Decimal 非法值同样在调用当场抛出。
+        expect_raises(
+            ValueError, weighted_sample_stream_indices,
+            ["a"], [Decimal("NaN")], 0, 0, 0)
+        expect_raises(
+            ValueError, weighted_sample_stream,
+            ["a"], [Decimal("Infinity")], 1, 0, 0)
+
+    def test_no_partial_results_before_error(self):
+        # 非法调用得不到任何可迭代的部分结果: 调用直接抛异常。
+        for exc, args in (
+            (ValueError, (["a", "b"], [1, 0], 2, 1000, 0)),
+            (TypeError, (["a", "b"], [1, "x"], 1, 1000, 0)),
+        ):
+            with self.subTest(args=args):
+                try:
+                    weighted_sample_stream_indices(*args)
+                except exc:
+                    pass
+                else:
+                    self.fail("no exception at call time for %r" % (args,))
+
+    def test_inputs_not_mutated(self):
+        items = ["p", "q", "r", "s"]
+        weights = [Decimal("1.5"), 2, Fraction(1, 3), 0.5]
+        items_snap, weights_snap = list(items), list(weights)
+        stream_i = weighted_sample_stream_indices(items, weights, 3, 4, 99)
+        stream_v = weighted_sample_stream(items, weights, 2, 4, -3)
+        # 即使只消费部分轮次, 入参也不得被修改。
+        next(iter(stream_i))
+        list(stream_v)
+        self.assertEqual(items, items_snap)
+        self.assertEqual(weights, weights_snap)
+
+    def test_exact_paths_supported(self):
+        # 超大整数 / 极小精确权重 / 浮点求和溢出等确定性路径与批量一致。
+        cases = [
+            (["a", "b"], [10 ** 400, 10 ** 400], 2),
+            (["H", "t", "z"], [10 ** 100, Decimal("1E-100"), Decimal("-0")], 2),
+            (["a", "b", "c"], [1e308, 1e308, 1.0], 3),
+            (["a", "b"], [9, Fraction(1, 100)], 1),
+            (["a", "b"], [1, Fraction(1, 10 ** 100)], 1),
+        ]
+        for items, weights, k in cases:
+            for seed in (0, 7, 2316):
+                with self.subTest(items=items, k=k, seed=seed):
+                    self.assertEqual(
+                        list(weighted_sample_stream_indices(
+                            items, weights, k, 3, seed)),
+                        weighted_sample_many_indices(items, weights, k, 3, seed),
+                    )
+        # 零权重排除: 流式入口同样保证。
+        for seed in range(50):
+            for rd in weighted_sample_stream_indices(["x", "y"], [0, 5], 1, 3, seed):
+                self.assertEqual(rd, [1])
+
+    def test_seed_none_keeps_random_semantics(self):
+        rounds = list(weighted_sample_stream_indices(
+            list(range(50)), list(range(1, 51)), 10, 4, None))
+        self.assertEqual(len(rounds), 4)
+        for rd in rounds:
+            self.assertEqual(len(rd), 10)
+            self.assertEqual(len(set(rd)), 10)
+            self.assertTrue(all(0 <= i < 50 for i in rd))
+
+    def test_existing_entries_unchanged(self):
+        # 既有入口的序列、返回类型不受新入口影响。
+        self.assertEqual(
+            weighted_sample(["red", "green", "blue"], [1, 3, 2], 2, 42),
+            ["green", "red"],
+        )
+        many = weighted_sample_many_indices(
+            ["p", "q", "r"], [2, Fraction(1), 0.5], 3, 4, 42)
+        self.assertIsInstance(many, list)
+        self.assertEqual(
+            many, [[1, 0, 2], [0, 2, 1], [0, 1, 2], [0, 2, 1]]
+        )
 
 
 class OverflowFloatWeightTest(unittest.TestCase):
