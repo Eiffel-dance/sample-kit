@@ -1,5 +1,6 @@
 import math
 import unittest
+from fractions import Fraction
 
 import app
 from app import (
@@ -777,6 +778,283 @@ class OverflowFloatWeightTest(unittest.TestCase):
                 weighted_sample_indices(["a", "b"], w, 2, s),
                 app._sample_indices_float(pool, pw, 2, _random.Random(s)),
             )
+
+
+class RationalFractionSamplingTest(unittest.TestCase):
+    """权重序列含 fractions.Fraction 时的精确有理无放回抽样。
+
+    与 int / 有限 float 混合时, 全部权重按分母最小公倍数精确放大为
+    整数, 再走纯整数路径 —— 极小正分数不能被浮点 2**-53 的离散网格
+    吞掉, 零分数永不入选, 比例严格保持。
+    """
+
+    class _ScriptedRNG:
+        def __init__(self, values):
+            self._values = list(values)
+
+        def getrandbits(self, bits):
+            return self._values.pop(0)
+
+    def test_fraction_only_path_is_exact_integer(self):
+        scaled, use_exact = app._select_sampling_plan(
+            [Fraction(1, 3), Fraction(2, 3)], 1
+        )
+        self.assertTrue(use_exact)
+        self.assertEqual(scaled, [1, 2])
+
+    def test_mixed_int_fraction_float_scales_exactly(self):
+        scaled, use_exact = app._select_sampling_plan(
+            [1, Fraction(1, 3), 0.5, 0.0, Fraction(0, 7)], 1
+        )
+        self.assertTrue(use_exact)
+        # Fraction(0,7) 归一化为 0/1; LCM(1,3,2,1,1) = 6: [6,2,3,0,0]。
+        self.assertEqual(scaled, [6, 2, 3, 0, 0])
+
+    def test_no_fraction_keeps_baseline_paths(self):
+        # 不含 Fraction 的普通输入: 小整数与普通浮点仍走基线浮点路径。
+        _, use_exact_small = app._select_sampling_plan([1, 3, 2], 2)
+        self.assertFalse(use_exact_small)
+        _, use_exact_float = app._select_sampling_plan([0.5, 1.5], 2)
+        self.assertFalse(use_exact_float)
+        # 全大整数仍走精确整数路径(既有规则)。
+        _, use_exact_huge = app._select_sampling_plan([10 ** 100, 1], 1)
+        self.assertTrue(use_exact_huge)
+
+    def test_tiny_positive_fraction_selected_at_exact_ratio(self):
+        # [1, 1, 1/2**60] 放大为 [2**60, 2**60, 1]。浮点离散网格下第三
+        # 个权重区间内没有任何可取 needle, 会被彻底吞掉; 精确路径下
+        # needle=total-1 必须落到该极小正权重位置。
+        weights = [1, 1, Fraction(1, 1 << 60)]
+        scaled = app._scale_to_exact_integer_weights(weights)
+        self.assertEqual(scaled, [1 << 60, 1 << 60, 1])
+        total = sum(scaled)
+        chosen = app._sample_indices_exact_integer(
+            [0, 1, 2], list(scaled), 1, self._ScriptedRNG([total - 1])
+        )
+        self.assertEqual(chosen, [2])
+
+    def test_tiny_fraction_sole_positive_weight_is_eligible(self):
+        # 极小正 Fraction 是唯一正权重时必须可抽, 且各 seed 下都选中它。
+        w = [Fraction(1, 10 ** 100), Fraction(0, 3)]
+        for seed in range(30):
+            self.assertEqual(
+                weighted_sample_indices(["tiny", "zero"], w, 1, seed), [0]
+            )
+
+    def test_extreme_numerator_and_denominator_accepted(self):
+        # 极小分子、极大分母、超过整数位数上限的权重都合法且确定。
+        big = 10 ** 5000
+        cases = [
+            [Fraction(big, 1), 1],
+            [Fraction(1, big), Fraction(1, big)],
+            [Fraction(big, 3), Fraction(7, 11), 1],
+            [big, Fraction(big, 3)],
+        ]
+        for case_no, w in enumerate(cases):
+            items = ["c%d" % j for j in range(len(w))]
+            idx = weighted_sample_indices(items, w, len(w), 2026)
+            self.assertEqual(sorted(idx), list(range(len(w))))
+            self.assertEqual(
+                idx, weighted_sample_indices(items, w, len(w), 2026)
+            )
+            self.assertEqual(
+                weighted_sample(items, w, len(w), 2026),
+                [items[i] for i in idx],
+            )
+
+    def test_zero_fraction_never_chosen(self):
+        for seed in range(200):
+            idx = weighted_sample_indices(
+                ["a", "b", "z"], [3, 2, Fraction(0, 7)], 1, seed
+            )
+            self.assertNotIn(2, idx)
+        self.assertEqual(
+            weighted_sample_indices(["a", "z"], [5, Fraction(0)], 1, 0), [0]
+        )
+
+    def test_proportions_exact_in_mixed_sequence(self):
+        # [1, 1, 1/3] 放大 [3,3,1], 第一轮比例严格 3:3:1。
+        w = [1, 1, Fraction(1, 3)]
+        counts = [0, 0, 0]
+        trials = 6000
+        for seed in range(trials):
+            counts[
+                weighted_sample_indices(["a", "b", "c"], w, 1, seed)[0]
+            ] += 1
+        self.assertAlmostEqual(counts[0] / trials, 3 / 7, delta=0.03)
+        self.assertAlmostEqual(counts[1] / trials, 3 / 7, delta=0.03)
+        self.assertAlmostEqual(counts[2] / trials, 1 / 7, delta=0.03)
+
+    def test_deterministic_all_legal_seed_types(self):
+        w = [10 ** 200, Fraction(3, 7), 0.25]
+        for seed in (0, 1, -9, 42, 2.5, "s", b"s", bytearray(b"s"), True):
+            first = weighted_sample_indices(["a", "b", "c"], w, 2, seed)
+            for _ in range(3):
+                self.assertEqual(
+                    weighted_sample_indices(["a", "b", "c"], w, 2, seed),
+                    first,
+                )
+
+    def test_many_first_round_matches_single_with_fractions(self):
+        cases = [
+            (["a", "b", "c", "d"], [10 ** 300, Fraction(1, 3), Fraction(5, 7), 0], 3),
+            (list("xyz"), [Fraction(1, 10 ** 50), 2, Fraction(2, 3)], 2),
+            (["p", "q"], [Fraction(1, 2), Fraction(1, 2)], 2),
+        ]
+        for items, w, k in cases:
+            for seed in (0, 1, 42, -7, 1.5, "s", b"s", True):
+                with self.subTest(k=k, seed=seed):
+                    many_i = weighted_sample_many_indices(items, w, k, 5, seed)
+                    self.assertEqual(
+                        many_i[0], weighted_sample_indices(items, w, k, seed)
+                    )
+                    many_v = weighted_sample_many(items, w, k, 5, seed)
+                    self.assertEqual(
+                        many_v[0], weighted_sample(items, w, k, seed)
+                    )
+
+    def test_many_mixed_bigint_fraction_reproducible_and_corresponding(self):
+        items = ["a", "b", "c", "d"]
+        w = [10 ** 300, Fraction(1, 3), Fraction(5, 7), 0]
+        first = weighted_sample_many_indices(items, w, 3, 6, 2026)
+        self.assertEqual(
+            first, weighted_sample_many_indices(items, w, 3, 6, 2026)
+        )
+        # 每轮: 数量正确、无重复、零权重位置 3 永不出现。
+        for rd in first:
+            self.assertEqual(len(rd), 3)
+            self.assertEqual(len(set(rd)), 3)
+            self.assertNotIn(3, rd)
+        # values 入口逐轮对应。
+        self.assertEqual(
+            weighted_sample_many(items, w, 3, 6, 2026),
+            [[items[i] for i in rd] for rd in first],
+        )
+        # 不同 draws 的前缀逐轮一致(共享同一随机流)。
+        head = weighted_sample_many_indices(items, w, 3, 2, 2026)
+        self.assertEqual(first[:2], head)
+
+    def test_many_rounds_share_one_stream_with_fractions(self):
+        import random as _random
+
+        items = list("abcd")
+        w = [Fraction(1, 3), 7, Fraction(5, 2), 0]
+        scaled = app._scale_to_exact_integer_weights(w)
+        for draws in (1, 2, 5):
+            rng = _random.Random(99)
+            manual = [
+                app._sample_indices_exact_integer(
+                    list(range(4)), list(scaled), 3, rng
+                )
+                for _ in range(draws)
+            ]
+            self.assertEqual(
+                weighted_sample_many_indices(items, w, 3, draws, 99), manual
+            )
+
+    def test_seed_none_random_semantics_preserved(self):
+        w = [Fraction(i + 1, 7) for i in range(4)]
+        rounds = weighted_sample_many_indices(list(range(4)), w, 3, 3, None)
+        self.assertEqual(len(rounds), 3)
+        for rd in rounds:
+            self.assertEqual(len(set(rd)), 3)
+            self.assertTrue(all(0 <= i < 4 for i in rd))
+
+    def test_insufficient_positive_positions_raises_before_results(self):
+        # 单次入口: 极小正 Fraction 计为 1 个正位置; 不足时在出结果前抛错。
+        with self.assertRaises(ValueError):
+            weighted_sample(["a", "b"], [Fraction(1, 10 ** 100), 0], 2, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_indices(["a"], [Fraction(0)], 1, 0)
+        # 批量入口: 产生任何一轮前抛错。
+        with self.assertRaises(ValueError):
+            weighted_sample_many(
+                ["a", "b"], [Fraction(1, 10 ** 100), 0], 2, 3, 0
+            )
+        with self.assertRaises(ValueError):
+            weighted_sample_many_indices(
+                ["a", "b"], [Fraction(1, 10 ** 100), 0], 2, 0, 0
+            )
+
+    def test_k_zero_and_draws_zero_with_fractions(self):
+        self.assertEqual(
+            weighted_sample(["a"], [Fraction(1, 2)], 0, 0), []
+        )
+        self.assertEqual(
+            weighted_sample_many_indices(["a", "b"], [1, Fraction(1, 2)], 0, 4, 0),
+            [[], [], [], []],
+        )
+        self.assertEqual(
+            weighted_sample_many_indices(["a", "b"], [1, Fraction(1, 2)], 2, 0, 0),
+            [],
+        )
+        # draws=0 仍完成全部输入校验(类型/取值/长度/k/可行性)。
+        with self.assertRaises(ValueError):
+            weighted_sample_many_indices(["a"], [float("nan")], 0, 0, 0)
+        with self.assertRaises(TypeError):
+            weighted_sample_many_indices(["a"], [True], 0, 0, 0)
+        with self.assertRaises(TypeError):
+            weighted_sample_many_indices("ab", [1, 2], 0, 0, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_many_indices(["a", "b"], [1, 0], 2, 0, 0)
+
+    def test_error_types_unchanged_alongside_fractions(self):
+        def te(fn):
+            with self.assertRaises(TypeError):
+                fn()
+
+        def ve(fn):
+            with self.assertRaises(ValueError):
+                fn()
+
+        te(lambda: weighted_sample(["a", "b"], [Fraction(1, 2), True], 1, 0))
+        te(lambda: weighted_sample(["a", "b"], [Fraction(1, 2), 1 + 0j], 1, 0))
+        te(lambda: weighted_sample(["a", "b"], [Fraction(1, 2), "1"], 1, 0))
+        te(lambda: weighted_sample(["a"], [Fraction(1, 2)], 1, object()))
+        ve(lambda: weighted_sample(["a", "b"], [Fraction(1, 2), -1], 1, 0))
+        ve(lambda: weighted_sample(["a", "b"], [Fraction(-1, 3), 1], 1, 0))
+        ve(lambda: weighted_sample(
+            ["a", "b"], [Fraction(1, 2), float("nan")], 1, 0))
+        ve(lambda: weighted_sample(
+            ["a", "b"], [Fraction(1, 2), float("inf")], 1, 0))
+        ve(lambda: weighted_sample_many_indices(
+            ["a"], [Fraction(1, 2)], 2, 1, 0))
+        te(lambda: weighted_sample_many_indices(
+            ["a"], [Fraction(1, 2)], 0, True, 0))
+
+    def test_float_inf_nan_mixed_with_fraction_use_value_rules(self):
+        with self.assertRaises(ValueError):
+            weighted_sample_indices(["a", "b"], [Fraction(1, 2), float("nan")], 1, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_indices(["a", "b"], [Fraction(1, 2), float("-inf")], 1, 0)
+
+    def test_inputs_not_mutated_with_fractions(self):
+        items = ["a", "b", "c"]
+        w = [10 ** 200, Fraction(3, 7), 0.5]
+        items_snap, w_snap = list(items), list(w)
+        weighted_sample(items, w, 3, 1)
+        weighted_sample_indices(items, w, 2, -3)
+        weighted_sample_many(items, w, 3, 4, 1)
+        weighted_sample_many_indices(items, w, 2, 4, 1)
+        self.assertEqual(items, items_snap)
+        self.assertEqual(w, w_snap)
+
+    def test_baseline_integer_and_float_sequences_unchanged(self):
+        # 小整数锁定序列。
+        self.assertEqual(
+            weighted_sample(["red", "green", "blue"], [1, 3, 2], 2, 42),
+            ["green", "red"],
+        )
+        self.assertEqual(
+            weighted_sample_indices(["a", "b", "c"], [1, 3, 2], 3, 7),
+            [1, 0, 2],
+        )
+        # 普通浮点仍可重复且完整。
+        out = weighted_sample(["p", "q"], [0.5, 1.5], 2, 3)
+        self.assertEqual(sorted(out), ["p", "q"])
+        self.assertEqual(
+            weighted_sample(["p", "q"], [0.5, 1.5], 2, 3), out
+        )
 
 
 class SerializeMetricsTest(unittest.TestCase):

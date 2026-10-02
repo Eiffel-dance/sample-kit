@@ -23,6 +23,13 @@
 
 这些函数都在产生任何结果/文本之前完成全部校验, 非法输入以稳定的
 TypeError / ValueError 告知调用方, 且不会修改入参。
+
+权重接受 int、有限 float 与 fractions.Fraction, 三者可任意混合。
+只要权重序列中包含 Fraction, 全部权重就按分母最小公倍数精确放大
+为整数后走纯整数无放回抽样: 每个有理数的精确值都参与比例计算,
+严格为正的 Fraction(哪怕相对总量只有 10**-100)都不会因转浮点而
+变成零; 不含 Fraction 时, 小整数与普通浮点输入沿用既有浮点路径,
+公开序列与基线完全一致。
 """
 
 import collections.abc
@@ -92,10 +99,11 @@ def _validate_sample_inputs(items, weights, k, seed):
 
     # ---- 4. 权重取值: NaN / 无穷 / 负数 (ValueError) ----
     for index, w in enumerate(weights):
-        # 整数(布尔已在第 3 步拒绝)既不可能是 NaN 也不可能是无穷; 直接判断
-        # 符号, 避免 math.isnan/isinf 把超大整数(如 10**400)转成浮点而抛
-        # OverflowError —— 任意精度整数权重始终是合法的有限权重。
-        if isinstance(w, int):
+        # 整数与精确有理数 Fraction (bool 已在第 3 步拒绝) 既不可能是 NaN
+        # 也不可能是无穷, 直接判断符号即可: 避免 math.isnan/isinf 把超大
+        # 整数或分数(如 10**400、Fraction(10**400, 3))转成浮点而抛
+        # OverflowError —— 任意精度的精确有理权重始终是合法的有限权重。
+        if isinstance(w, numbers.Rational):
             if w < 0:
                 raise ValueError("negative weight")
             continue
@@ -120,13 +128,14 @@ def _validate_draws(draws):
 def _count_positive_weights(weights):
     """统计严格为正的权重个数。
 
-    整数直接判正负, 不经过浮点 —— 超大整数(如 10**400)也是合法有限值;
-    浮点 +0.0/-0.0 都不计入, 正的有限浮点才计入。调用前权重已通过
-    类型与取值校验(无 bool / NaN / 无穷 / 负数)。
+    整数与 Fraction 直接做精确有理判正负, 不经过浮点 —— 超大整数 / 极小
+    正分数(如 Fraction(1, 10**100))都被如实计入; 浮点 +0.0/-0.0 都不计
+    入, 正的有限浮点才计入。调用前权重已通过类型与取值校验(无 bool /
+    NaN / 无穷 / 负数)。
     """
     count = 0
     for w in weights:
-        if isinstance(w, int):
+        if isinstance(w, numbers.Rational):
             if w > 0:
                 count += 1
         elif w > 0:
@@ -255,13 +264,17 @@ def _select_sampling_plan(pool_weights, k):
     """返回 (抽样用权重, 是否走纯整数精确路径)。
 
     优先沿用基线规则: 全整数且累计超 2**53 走纯整数路径; 总和可正常
-    表示的输入保持既有浮点路径与锁定序列不变。仅当浮点求和/累计会溢
-    出(有限浮点权重总和为无穷, 或超大整数与浮点混合求和溢出)时, 把
-    权重精确放大为整数后走纯整数路径 —— 只改变原本会产生无效或不完
-    整结果的极端场景。
+    表示的输入保持既有浮点路径与锁定序列不变。只要权重序列中出现
+    Fraction(可与 int / 有限 float 混合), 就把全部权重按分母最小公倍
+    数精确放大为整数后走纯整数路径 —— 相对比例逐点保持, 任何严格为
+    正的分数都保留精确的选中概率, 不会被浮点路径 2**-53 的离散网格
+    吞成零; 零分数仍为零, 永不被选中。仅当纯 int/float 输入的浮点
+    求和/累计会溢出时, 才对其做同样的精确放大回退。
     """
     if _use_exact_integer_path(pool_weights, k):
         return pool_weights, True
+    if k > 0 and any(isinstance(w, Fraction) for w in pool_weights):
+        return _scale_to_exact_integer_weights(pool_weights), True
     if k > 0 and not _float_total_is_finite(pool_weights):
         return _scale_to_exact_integer_weights(pool_weights), True
     return pool_weights, False
@@ -283,6 +296,13 @@ def _draw_indices_once(n, pool_weights, k, rng, use_exact):
 
 def weighted_sample_indices(items, weights, k, seed=0):
     n = _validate_sample_inputs(items, weights, k, seed)
+
+    # 可行性前置检查: 无放回抽取 k 个位置, 至少需要 k 个正权重位置
+    # (k=0 时即使权重全为零也合法)。在产生任何抽样结果之前判定, 保证
+    # 非法调用确定抛 ValueError 且绝不返回部分结果 —— 与批量入口一致;
+    # 极小正 Fraction 也在此被精确计入, 不会被浮点判成零。
+    if k > 0 and k > _count_positive_weights(weights):
+        raise ValueError("no positive weight")
 
     # 复制到本地, 绝不修改入参。
     pool_weights = list(weights)
