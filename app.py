@@ -6,14 +6,23 @@
     weighted_sample_indices(items, weights, k, seed=0)
         与 weighted_sample 同规则, 但返回按抽样先后排列的零基原始索引;
         items 中相等的值仍按不同位置独立处理。
+    weighted_sample_many(items, weights, k, draws, seed=0)
+        一次调用进行 draws 轮加权无放回抽样, 返回长度为 draws 的外层序列,
+        每轮为该轮抽中的元素值; 每轮都从原始位置重新开始。
+    weighted_sample_many_indices(items, weights, k, draws, seed=0)
+        与 weighted_sample_many 同规则, 但每轮返回按抽样先后排列的零基
+        原始索引; 两个批量入口逐轮逐项对应。
     serialize_metrics(metrics)
         将指标树稳定序列化为紧凑 JSON 文本, 任意精度整数保持精确十进制。
         字典键先统一转换为成员名文本(str 原样, None->null, bool->true/false,
         int->十进制, 有限 float->编码器数值文本), 再按 Unicode 文本升序排列;
         不同原始键转换得到同一成员名时抛 ValueError。
 
-两个函数都在产生任何结果/文本之前完成全部校验, 非法输入以稳定的
-TypeError / ValueError 告知调用方, 且不会修改入参。
+批量入口的所有轮次共享同一个由 seed 初始化的随机流: 第一轮与对应的
+单轮入口逐项相同, 后续轮次继续消耗该流; 同一轮内位置至多出现一次,
+轮次之间允许再次选中同一位置。所有函数都在产生任何结果/文本之前完成
+全部校验, 非法输入以稳定的 TypeError / ValueError 告知调用方, 且不会
+修改入参。
 """
 
 import collections.abc
@@ -51,11 +60,13 @@ def _is_length_determinable_sequence(value):
     )
 
 
-def _validate_sample_inputs(items, weights, k, seed):
-    """weighted_sample / weighted_sample_indices 共用的全部前置校验。
+def _validate_sample_inputs(items, weights, k, seed, draws=None):
+    """weighted_sample(_indices) / weighted_sample_many(_indices) 共用的
+    全部前置校验。
 
-    校验通过后返回位置数 n; 非法输入以稳定的 TypeError / ValueError
-    告知调用方, 不会触碰 items / weights 的内容。
+    draws 为 None 时按单轮入口校验; 否则额外按与 k 相同的规则校验批量
+    轮数。校验通过后返回位置数 n; 非法输入以稳定的 TypeError /
+    ValueError 告知调用方, 不会触碰 items / weights 的内容。
     """
     # ---- 1. 结构与参数类型 (TypeError) ----
     if not _is_length_determinable_sequence(items):
@@ -64,6 +75,9 @@ def _validate_sample_inputs(items, weights, k, seed):
         raise TypeError("weights must be a length-determinable sequence")
     if isinstance(k, bool) or not isinstance(k, int):
         raise TypeError("k must be a non-boolean integer")
+    if draws is not None:
+        if isinstance(draws, bool) or not isinstance(draws, int):
+            raise TypeError("draws must be a non-boolean integer")
     if not isinstance(seed, _SEED_TYPES):
         raise TypeError("unsupported seed type: %s" % type(seed).__name__)
 
@@ -71,6 +85,8 @@ def _validate_sample_inputs(items, weights, k, seed):
     n = len(items)
     if len(weights) != n or k < 0 or k > n:
         raise ValueError("invalid sample size")
+    if draws is not None and draws < 0:
+        raise ValueError("draws must be non-negative")
 
     # ---- 3. 权重类型: 布尔值和非实数权重 (TypeError) ----
     for index, w in enumerate(weights):
@@ -164,6 +180,25 @@ def _sample_indices_exact_integer(pool, weights, k, rng):
     return indices
 
 
+def _use_exact_integer_path(pool_weights, k):
+    """与单轮入口完全一致的路径判定: 全部权重均为 int (bool 已在类型
+    校验中拒绝) 时, 以全量累计权重决定路径 —— 累计 > 2**53, 或累计无法
+    转换为有限浮点(如 10**400, float() 抛 OverflowError)时走纯整数路径,
+    杜绝浮点溢出与舍入; 全量累计 <= 2**53 时任意子集累计同样 <= 2**53,
+    浮点路径逐轮精确可表示, 基线锁定的公开序列因此保持不变。
+    """
+    if k <= 0 or not all(isinstance(w, int) for w in pool_weights):
+        return False
+    total = sum(pool_weights)
+    if total > _EXACT_INTEGER_THRESHOLD:
+        return True
+    try:
+        float(total)
+    except OverflowError:
+        return True
+    return False
+
+
 def weighted_sample_indices(items, weights, k, seed=0):
     n = _validate_sample_inputs(items, weights, k, seed)
 
@@ -172,23 +207,7 @@ def weighted_sample_indices(items, weights, k, seed=0):
     pool_weights = list(weights)
     rng = random.Random(seed)
 
-    # 全部权重均为 int (bool 已在类型校验中拒绝) 时, 以全量累计权重决定
-    # 路径: 累计 > 2**53, 或累计无法转换为有限浮点(如 10**400,
-    # float() 抛 OverflowError)时走纯整数路径, 杜绝浮点溢出与舍入。
-    # 全量累计 <= 2**53 时, 任意子集累计同样 <= 2**53, 浮点路径逐轮
-    # 精确可表示, 基线锁定的公开序列因此保持不变。
-    use_exact = False
-    if k > 0 and all(isinstance(w, int) for w in pool_weights):
-        total = sum(pool_weights)
-        if total > _EXACT_INTEGER_THRESHOLD:
-            use_exact = True
-        else:
-            try:
-                float(total)
-            except OverflowError:
-                use_exact = True
-
-    if use_exact:
+    if _use_exact_integer_path(pool_weights, k):
         return _sample_indices_exact_integer(pool, pool_weights, k, rng)
     return _sample_indices_float(pool, pool_weights, k, rng)
 
@@ -196,6 +215,54 @@ def weighted_sample_indices(items, weights, k, seed=0):
 def weighted_sample(items, weights, k, seed=0):
     indices = weighted_sample_indices(items, weights, k, seed)
     return [items[i] for i in indices]
+
+
+def weighted_sample_many_indices(items, weights, k, draws, seed=0):
+    """批量入口: 一次调用产出 draws 轮加权无放回抽样的零基原始索引。
+
+    返回长度为 draws 的外层列表, 每个元素是该轮长度为 k 的索引列表。
+    所有轮次共享同一个由 seed 初始化的随机流: 第一轮与
+    weighted_sample_indices(items, weights, k, seed) 逐项相同, 后续轮次
+    从同一原始位置序列重新开始, 继续消耗该随机流。同一轮内位置至多
+    出现一次, 轮次之间允许再次选中同一位置。全部参数在任何抽样开始前
+    一次性校验, 非法时抛 TypeError / ValueError 且不返回部分外层结果。
+    """
+    n = _validate_sample_inputs(items, weights, k, seed, draws)
+    pool_weights = list(weights)
+
+    # 批量入口要求“整次调用确定”可完成: 正权重位置数必须足以支撑每轮
+    # 的 k 次无放回抽取。k=0 时即使权重全为零也合法(每轮为空)。该检查在
+    # 抽样前完成, 保证失败时不会产生任何部分外层结果。校验已保证每个权重
+    # 都是有限、非负的实数, 故 w > 0 对 int 与 float 均为精确判定。
+    if k > 0:
+        positive_positions = sum(1 for w in pool_weights if w > 0)
+        if positive_positions < k:
+            raise ValueError("no positive weight")
+
+    rng = random.Random(seed)
+    use_exact = _use_exact_integer_path(pool_weights, k)
+
+    rounds = []
+    for _ in range(draws):
+        # 每轮从原始位置序列重新开始; 池与权重均为本轮私有副本,
+        # 绝不修改入参, 也不影响其他轮次。
+        pool = list(range(n))
+        round_weights = list(pool_weights)
+        if use_exact:
+            rounds.append(
+                _sample_indices_exact_integer(pool, round_weights, k, rng)
+            )
+        else:
+            rounds.append(
+                _sample_indices_float(pool, round_weights, k, rng)
+            )
+    return rounds
+
+
+def weighted_sample_many(items, weights, k, draws, seed=0):
+    """与 weighted_sample_many_indices 同规则, 但每轮返回元素值。"""
+    rounds = weighted_sample_many_indices(items, weights, k, draws, seed)
+    return [[items[i] for i in indices] for indices in rounds]
 
 
 # ---------------------------------------------------------------------------

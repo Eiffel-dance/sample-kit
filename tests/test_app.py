@@ -2,7 +2,13 @@ import math
 import unittest
 
 import app
-from app import weighted_sample, weighted_sample_indices, serialize_metrics
+from app import (
+    weighted_sample,
+    weighted_sample_indices,
+    weighted_sample_many,
+    weighted_sample_many_indices,
+    serialize_metrics,
+)
 
 
 class WeightedSampleDeterminismTest(unittest.TestCase):
@@ -471,6 +477,221 @@ class ExactIntegerSamplingTest(unittest.TestCase):
             weighted_sample_indices(["a", "b"], [10 ** 100, -1], 1, 0)
         with self.assertRaises(ValueError):
             weighted_sample_indices(["a"], [10 ** 100], 2, 0)
+
+
+class WeightedSampleManyTest(unittest.TestCase):
+    """批量入口 weighted_sample_many / weighted_sample_many_indices。"""
+
+    HUGH = 10 ** 100
+
+    CASES = [
+        (list("abcdef"), [1, 3, 2, 5, 4, 2], 4),
+        (list("wxyz"), [10 ** 100, 1, 10 ** 100 * 2, 7], 3),
+        (["p", "q", "r"], [0.5, 1.5, 2.5], 3),
+        (list(range(20)), [10 ** 80 + i for i in range(20)], 10),
+        (["a", "b"], [2 ** 53 - 1, 1], 2),
+        (["a", "b"], [10 ** 400, 10 ** 400], 2),
+        (["x"], [10 ** 100], 1),
+    ]
+
+    def _reference_many(self, items, weights, k, draws, seed):
+        """单个 Random 实例连续驱动各轮(每轮重建池)的参考实现。"""
+        import random as _random
+
+        rng = _random.Random(seed)
+        use_exact = app._use_exact_integer_path(list(weights), k)
+        sampler = (app._sample_indices_exact_integer if use_exact
+                   else app._sample_indices_float)
+        out = []
+        for _ in range(draws):
+            idx = sampler(list(range(len(items))), list(weights), k, rng)
+            out.append(idx)
+        return out
+
+    def test_outer_length_and_inner_shapes(self):
+        for items, weights, k in self.CASES:
+            for draws in (0, 1, 2, 5):
+                with self.subTest(k=k, draws=draws):
+                    rounds = weighted_sample_many_indices(
+                        items, weights, k, draws, 3
+                    )
+                    values = weighted_sample_many(items, weights, k, draws, 3)
+                    self.assertEqual(len(rounds), draws)
+                    self.assertEqual(len(values), draws)
+                    for r_i, r_v in zip(rounds, values):
+                        self.assertEqual(len(r_i), k)
+                        self.assertEqual(len(set(r_i)), k)
+                        self.assertTrue(
+                            all(isinstance(i, int) and 0 <= i < len(items)
+                                for i in r_i)
+                        )
+                        self.assertEqual(r_v, [items[i] for i in r_i])
+
+    def test_first_round_equals_single_entry(self):
+        for items, weights, k in self.CASES:
+            for seed in (0, 1, 42, -5, 1.5, "s", b"s", bytearray(b"s"), True):
+                with self.subTest(k=k, seed=seed):
+                    self.assertEqual(
+                        weighted_sample_many_indices(
+                            items, weights, k, 3, seed
+                        )[0],
+                        weighted_sample_indices(items, weights, k, seed),
+                    )
+                    self.assertEqual(
+                        weighted_sample_many(items, weights, k, 3, seed)[0],
+                        weighted_sample(items, weights, k, seed),
+                    )
+
+    def test_rounds_share_one_seeded_stream(self):
+        for items, weights, k in self.CASES:
+            for seed in (0, 7, 42, 123, 999, 1.5, "seed"):
+                with self.subTest(k=k, seed=seed):
+                    got = weighted_sample_many_indices(
+                        items, weights, k, 6, seed
+                    )
+                    self.assertEqual(
+                        got, self._reference_many(items, weights, k, 6, seed)
+                    )
+                    # 相同 (输入, draws, seed) 给出相同嵌套序列。
+                    self.assertEqual(
+                        got, weighted_sample_many_indices(
+                            items, weights, k, 6, seed
+                        )
+                    )
+
+    def test_earlier_rounds_are_stream_prefix(self):
+        args = (list("abcdef"), [1, 3, 2, 5, 4, 2], 2)
+        two = weighted_sample_many_indices(*args, 2, 42)
+        three = weighted_sample_many_indices(*args, 3, 42)
+        self.assertEqual(three[:2], two)
+
+    def test_position_may_repeat_across_rounds_not_within(self):
+        rounds = weighted_sample_many_indices(["only"], [self.HUGH], 1, 5, 0)
+        self.assertEqual(rounds, [[0]] * 5)
+        rounds = weighted_sample_many_indices(
+            list(range(4)), [self.HUGH, 1, self.HUGH, 0], 3, 40, 0
+        )
+        self.assertEqual(len(rounds), 40)
+        for r in rounds:
+            self.assertEqual(len(r), len(set(r)))
+            self.assertNotIn(3, r)  # 零权重永不出现在任何轮次
+
+    def test_duplicate_values_distinct_positions_per_round(self):
+        items = ["x", "x", "x"]
+        values = weighted_sample_many(items, [1, 1, 1], 3, 4, 123)
+        indices = weighted_sample_many_indices(items, [1, 1, 1], 3, 4, 123)
+        self.assertEqual(values, [["x", "x", "x"]] * 4)
+        self.assertTrue(all(sorted(r) == [0, 1, 2] for r in indices))
+
+    def test_draws_zero_returns_empty_after_validation(self):
+        self.assertEqual(
+            weighted_sample_many_indices(["a", "b"], [1, 2], 2, 0, 0), []
+        )
+        self.assertEqual(
+            weighted_sample_many(["a", "b"], [1, 2], 2, 0, 0), []
+        )
+        # draws=0 仍须先完成全部权重校验。
+        with self.assertRaises(ValueError):
+            weighted_sample_many_indices(["a"], [float("nan")], 0, 0, 0)
+        with self.assertRaises(TypeError):
+            weighted_sample_many_indices(["a"], [True], 0, 0, 0)
+
+    def test_k_zero_yields_draws_empty_inner_rounds(self):
+        self.assertEqual(
+            weighted_sample_many_indices(["a", "b"], [0, 0], 0, 3, 0),
+            [[], [], []],
+        )
+        self.assertEqual(
+            weighted_sample_many([], [], 0, 2, 0), [[], []]
+        )
+
+    def test_k_beyond_positive_support_raises_value_error(self):
+        with self.assertRaises(ValueError):
+            weighted_sample_many_indices(["a", "b"], [self.HUGH, 0], 2, 3, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_many(["a"], [0], 1, 1, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_many_indices(
+                ["a", "b", "c"], [1, 0, 2], 3, 5, 0
+            )
+        with self.assertRaises(ValueError):
+            weighted_sample_many_indices(["a", "b"], [0.5, 0.0], 2, 1, 0)
+        # 正权重位置足够时多轮正常。
+        out = weighted_sample_many_indices(["a", "b"], [self.HUGH, 0], 1, 10, 0)
+        self.assertEqual(out, [[0]] * 10)
+
+    def test_draws_must_be_non_boolean_integer(self):
+        for bad in (True, False, 1.0, "1", None, 1 + 0j, [1]):
+            with self.subTest(bad=bad):
+                with self.assertRaises(TypeError):
+                    weighted_sample_many_indices(["a"], [1], 0, bad, 0)
+                with self.assertRaises(TypeError):
+                    weighted_sample_many(["a"], [1], 0, bad, 0)
+
+    def test_draws_negative_is_value_error(self):
+        with self.assertRaises(ValueError):
+            weighted_sample_many_indices(["a"], [1], 0, -1, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_many(["a"], [1], 0, -2, 0)
+
+    def test_existing_validation_rules_apply_to_batch(self):
+        with self.assertRaises(TypeError):
+            weighted_sample_many_indices("ab", [1, 2], 1, 1, 0)
+        with self.assertRaises(TypeError):
+            weighted_sample_many_indices(["a"], [1], 1.0, 1, 0)
+        with self.assertRaises(TypeError):
+            weighted_sample_many_indices(["a"], [1], True, 1, 0)
+        with self.assertRaises(TypeError):
+            weighted_sample_many_indices(["a"], [1], 1, 1, object())
+        with self.assertRaises(ValueError):
+            weighted_sample_many_indices(["a"], [1], -1, 1, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_many_indices(["a"], [1], 2, 1, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_many_indices(["a", "b"], [1], 1, 1, 0)
+        with self.assertRaises(TypeError):
+            weighted_sample_many_indices(["a", "b"], [1, "x"], 1, 1, 0)
+        with self.assertRaises(TypeError):
+            weighted_sample_many_indices(["a", "b"], [1, True], 1, 1, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_many_indices(["a", "b"], [1, -1], 1, 1, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_many_indices(["a"], [float("inf")], 1, 1, 0)
+
+    def test_no_partial_outer_result_on_error(self):
+        with self.assertRaises(ValueError):
+            weighted_sample_many_indices(
+                ["a", "b"], [self.HUGH, 0], 2, 5, 0
+            )
+
+    def test_inputs_not_mutated(self):
+        items = ["a", "b", "c"]
+        weights = [self.HUGH, self.HUGH * 2, 1]
+        isnap, wsnap = list(items), list(weights)
+        weighted_sample_many(items, weights, 3, 10, 99)
+        weighted_sample_many_indices(items, weights, 2, 10, -3)
+        self.assertEqual(items, isnap)
+        self.assertEqual(weights, wsnap)
+
+    def test_seed_none_keeps_random_semantics(self):
+        outcomes = {
+            tuple(tuple(r) for r in weighted_sample_many_indices(
+                list(range(6)), [1, 2, 3, 4, 5, 6], 3, 2, None
+            ))
+            for _ in range(20)
+        }
+        self.assertGreater(len(outcomes), 1)
+
+    def test_result_determined_by_inputs_draws_seed(self):
+        items = list("abcdefgh")
+        weights = [self.HUGH, 0, 1, self.HUGH * 3, 7, 0, 10 ** 60, 2]
+        a = weighted_sample_many_indices(items, weights, 4, 8, 20261002)
+        b = weighted_sample_many_indices(items, weights, 4, 8, 20261002)
+        av = weighted_sample_many(items, weights, 4, 8, 20261002)
+        self.assertEqual(a, b)
+        self.assertTrue(
+            all(av[d] == [items[i] for i in a[d]] for d in range(8))
+        )
 
 
 class SerializeMetricsTest(unittest.TestCase):
