@@ -1,5 +1,6 @@
 import math
 import unittest
+from fractions import Fraction
 
 import app
 from app import (
@@ -777,6 +778,299 @@ class OverflowFloatWeightTest(unittest.TestCase):
                 weighted_sample_indices(["a", "b"], w, 2, s),
                 app._sample_indices_float(pool, pw, 2, _random.Random(s)),
             )
+
+
+class FractionWeightSamplingTest(unittest.TestCase):
+    """权重序列包含 Fraction 时全程走精确有理数路径, 不被浮点吞掉。"""
+
+    # ------------------------------------------------------------------
+    # 极小正 Fraction: 精确比例允许时可被选中
+    # ------------------------------------------------------------------
+    def test_tiny_positive_fraction_selectable_via_public_entry(self):
+        # [9, 1/100] 精确放大为 [900, 1]; 微小位置以精确比例 1/901 可被选中。
+        # 锁定一个确实命中微小位置的 seed, 证明公开入口不会把它吞成零。
+        items = ["big", "tiny"]
+        weights = [9, Fraction(1, 100)]
+        idx = weighted_sample_indices(items, weights, 1, 2316)
+        self.assertEqual(idx, [1])
+        self.assertEqual(weighted_sample(items, weights, 1, 2316), ["tiny"])
+        # 同 seed 完全可复现。
+        for _ in range(5):
+            self.assertEqual(
+                weighted_sample_indices(items, weights, 1, 2316), [1]
+            )
+
+    def test_extreme_ratio_tiny_fraction_never_swallowed_exact(self):
+        # 极端比例 10**100 : 1/10**100 —— 微小权重 float() 后严格为零,
+        # 任何浮点路径都永不可能选中; 精确放大为 [10**200, 1] 后,
+        # needle=total-1 必须落到微小 Fraction 位置。
+        import app as _app
+
+        original = [10 ** 100, Fraction(1, 10 ** 100)]
+        scaled = _app._scale_to_exact_integer_weights(original)
+        self.assertEqual(scaled, [10 ** 200, 1])
+
+        class _ScriptedRNG:
+            def __init__(self, values):
+                self._values = list(values)
+
+            def getrandbits(self, bits):
+                return self._values.pop(0)
+
+        total = sum(scaled)
+        chosen = _app._sample_indices_exact_integer(
+            [0, 1], list(scaled), 1, _ScriptedRNG([total - 1])
+        )
+        self.assertEqual(chosen, [1])
+
+    def test_zero_fraction_skipped_in_exact_locator(self):
+        import app as _app
+
+        class _ScriptedRNG:
+            def __init__(self, value):
+                self._value = value
+
+            def getrandbits(self, bits):
+                return self._value
+
+        original = [10 ** 100, Fraction(0), Fraction(1, 10 ** 100)]
+        scaled = _app._scale_to_exact_integer_weights(original)
+        self.assertEqual(scaled[1], 0)
+        chosen = _app._sample_indices_exact_integer(
+            [0, 1, 2], list(scaled), 1, _ScriptedRNG(sum(scaled) - 1)
+        )
+        self.assertEqual(chosen, [2])
+
+    def test_mixed_int_fraction_proportions_exact(self):
+        # [1, 1/3] 精确放大为 [3, 1]: 第一位置 3/4, 第二位置 1/4。
+        counts = [0, 0]
+        trials = 4000
+        for seed in range(trials):
+            i = weighted_sample_indices(
+                ["a", "b"], [1, Fraction(1, 3)], 1, seed
+            )[0]
+            counts[i] += 1
+        self.assertAlmostEqual(counts[0] / trials, 3 / 4, delta=0.04)
+        self.assertAlmostEqual(counts[1] / trials, 1 / 4, delta=0.04)
+
+    # ------------------------------------------------------------------
+    # 零 Fraction 永不入选
+    # ------------------------------------------------------------------
+    def test_zero_fraction_never_chosen(self):
+        for seed in range(100):
+            self.assertEqual(
+                weighted_sample_indices(
+                    ["x", "y"], [Fraction(7, 3), Fraction(0)], 1, seed
+                ),
+                [0],
+            )
+        # 与超大整数混排时零 Fraction 仍永不出现。
+        for seed in range(100):
+            idx = weighted_sample_indices(
+                ["a", "z"], [10 ** 100, Fraction(0)], 1, seed
+            )
+            self.assertEqual(idx, [0])
+
+    def test_zero_fraction_excluded_from_full_draw(self):
+        for seed in range(50):
+            idx = weighted_sample_indices(
+                ["a", "b", "c"],
+                [Fraction(1, 2), Fraction(0), Fraction(1, 4)],
+                2, seed,
+            )
+            self.assertEqual(sorted(idx), [0, 2])
+
+    def test_insufficient_positive_raises_before_any_result(self):
+        # 单次入口: 正权重位置不足 -> ValueError。
+        with self.assertRaises(ValueError):
+            weighted_sample_indices(
+                ["a", "b"], [Fraction(1), Fraction(0)], 2, 0
+            )
+        with self.assertRaises(ValueError):
+            weighted_sample_indices(
+                ["a"], [Fraction(0, 10 ** 100)], 1, 0
+            )
+        # 批量入口: 在产生任何一轮前抛出, 不返回部分外层结果。
+        with self.assertRaises(ValueError):
+            weighted_sample_many_indices(
+                ["a", "b"], [Fraction(1), Fraction(0)], 2, 1000, 0
+            )
+        with self.assertRaises(ValueError):
+            weighted_sample_many(
+                ["a", "b"],
+                [10 ** 100, Fraction(0), Fraction(1, 10 ** 100)],
+                3, 2, 0,
+            )
+
+    # ------------------------------------------------------------------
+    # 混合 int / Fraction / float: 精确、可复现、入口一致
+    # ------------------------------------------------------------------
+    def test_mixed_int_fraction_float_batch_reproducible(self):
+        items = ["p", "q", "r"]
+        weights = [2, Fraction(1), 0.5]  # 精确放大为 [4, 2, 1]
+        locked = [[1, 0, 2], [0, 2, 1], [0, 1, 2], [0, 2, 1]]
+        many_i = weighted_sample_many_indices(items, weights, 3, 4, 42)
+        self.assertEqual(many_i, locked)
+        # 完全可复现。
+        self.assertEqual(
+            many_i, weighted_sample_many_indices(items, weights, 3, 4, 42)
+        )
+        # 两个批量入口逐轮逐项对应。
+        many_v = weighted_sample_many(items, weights, 3, 4, 42)
+        self.assertEqual(
+            many_v, [[items[i] for i in rd] for rd in many_i]
+        )
+        # 第一轮与同 seed 的单次调用逐项一致。
+        self.assertEqual(
+            many_i[0], weighted_sample_indices(items, weights, 3, 42)
+        )
+        self.assertEqual(
+            many_v[0], weighted_sample(items, weights, 3, 42)
+        )
+
+    def test_fraction_only_weights_exact_and_deterministic(self):
+        items = ["a", "b"]
+        weights = [Fraction(1, 3), Fraction(2, 3)]
+        for seed in (0, 1, 5, 42, -7, 1.5, "s", b"s", True):
+            with self.subTest(seed=seed):
+                single = weighted_sample_indices(items, weights, 2, seed)
+                self.assertEqual(
+                    single, weighted_sample_indices(items, weights, 2, seed)
+                )
+                self.assertEqual(
+                    weighted_sample_many_indices(items, weights, 2, 3, seed)[0],
+                    single,
+                )
+                self.assertEqual(sorted(single), [0, 1])
+
+    def test_mixed_huge_integer_and_fraction_valid_and_reproducible(self):
+        # 极大整数 + 极小分母 Fraction: 校验与缩放都不得触发浮点转换。
+        items = ["H", "t", "z"]
+        weights = [10 ** 400, Fraction(1, 10 ** 400), Fraction(0)]
+        rounds = weighted_sample_many_indices(items, weights, 1, 3, 7)
+        self.assertEqual(rounds, [[0], [0], [0]])  # 零权重永不出现
+        self.assertEqual(
+            rounds, weighted_sample_many_indices(items, weights, 1, 3, 7)
+        )
+        # 极端分子 / 分母的 Fraction 通过校验且确定抽取。
+        for w in (
+            Fraction(10 ** 5000, 1),
+            Fraction(1, 10 ** 5000),
+            Fraction(10 ** 5000, 10 ** 5000 + 1),
+        ):
+            idx = weighted_sample_indices(["a", "b"], [w, 1], 1, 3)
+            self.assertIn(idx[0], (0, 1))
+            self.assertEqual(
+                idx, weighted_sample_indices(["a", "b"], [w, 1], 1, 3)
+            )
+
+    # ------------------------------------------------------------------
+    # 校验: 类型 / 取值 / 顺序异常分类保持不变
+    # ------------------------------------------------------------------
+    def test_fraction_validation_error_classes(self):
+        def te(fn):
+            with self.assertRaises(TypeError):
+                fn()
+
+        def ve(fn):
+            with self.assertRaises(ValueError):
+                fn()
+
+        # bool 继续按非法权重抛 TypeError(即使与 Fraction 混排)。
+        te(lambda: weighted_sample_indices(
+            ["a", "b"], [Fraction(1), True], 1, 0))
+        te(lambda: weighted_sample_indices(
+            ["a", "b"], [Fraction(1), False], 1, 0))
+        # 非实数权重 TypeError。
+        te(lambda: weighted_sample_indices(
+            ["a", "b"], [Fraction(1), 1 + 2j], 1, 0))
+        te(lambda: weighted_sample_indices(
+            ["a", "b"], [Fraction(1), "1"], 1, 0))
+        te(lambda: weighted_sample_indices(
+            ["a", "b"], [Fraction(1), None], 1, 0))
+        # 负 Fraction / NaN / 正负无穷沿用 ValueError 规则。
+        ve(lambda: weighted_sample_indices(
+            ["a"], [Fraction(-1, 3)], 1, 0))
+        ve(lambda: weighted_sample_indices(
+            ["a", "b"], [Fraction(1), float("nan")], 1, 0))
+        ve(lambda: weighted_sample_indices(
+            ["a", "b"], [Fraction(1), float("inf")], 1, 0))
+        ve(lambda: weighted_sample_indices(
+            ["a", "b"], [Fraction(1), float("-inf")], 1, 0))
+        ve(lambda: weighted_sample_indices(
+            ["a", "b"], [Fraction(1), -0.5], 1, 0))
+
+    def test_fraction_validation_completes_before_sampling(self):
+        # k=0 仍完成全部权重校验。
+        with self.assertRaises(ValueError):
+            weighted_sample_indices(["a"], [Fraction(-1, 2)], 0, 0)
+        with self.assertRaises(TypeError):
+            weighted_sample_indices(["a"], [True], 0, 0)
+        self.assertEqual(
+            weighted_sample_indices(["a"], [Fraction(1, 10 ** 100)], 0, 0),
+            [],
+        )
+
+    def test_fraction_draws_zero_validates_then_empty(self):
+        self.assertEqual(
+            weighted_sample_many_indices(["a"], [Fraction(1)], 1, 0, 0), []
+        )
+        self.assertEqual(
+            weighted_sample_many(["a"], [Fraction(1)], 1, 0, 0), []
+        )
+        # draws=0 仍完成全部校验。
+        with self.assertRaises(ValueError):
+            weighted_sample_many_indices(
+                ["a"], [float("nan")], 0, 0, 0
+            )
+        with self.assertRaises(TypeError):
+            weighted_sample_many_indices("ab", [Fraction(1, 2)], 1, 0, 0)
+
+    def test_fraction_k_zero_empty_rounds(self):
+        self.assertEqual(
+            weighted_sample_many_indices(
+                ["a", "b"], [Fraction(0), Fraction(0)], 0, 3, 0
+            ),
+            [[], [], []],
+        )
+
+    # ------------------------------------------------------------------
+    # seed=None 语义 / 入参不变 / 纯浮点路径不受影响
+    # ------------------------------------------------------------------
+    def test_seed_none_random_semantics_preserved(self):
+        items = list(range(20))
+        weights = [Fraction(i + 1, 7) for i in range(20)]
+        rounds = weighted_sample_many_indices(items, weights, 8, 3, None)
+        self.assertEqual(len(rounds), 3)
+        for rd in rounds:
+            self.assertEqual(len(rd), 8)
+            self.assertEqual(len(set(rd)), 8)
+            self.assertTrue(all(0 <= i < 20 for i in rd))
+
+    def test_inputs_not_mutated_with_fractions(self):
+        items = ["p", "q", "r"]
+        weights = [2, Fraction(1, 3), 0.5]
+        items_snap = list(items)
+        weights_snap = list(weights)
+        weighted_sample(items, weights, 3, 5)
+        weighted_sample_indices(items, weights, 2, -3)
+        weighted_sample_many(items, weights, 3, 4, 99)
+        weighted_sample_many_indices(items, weights, 2, 4, -3)
+        self.assertEqual(items, items_snap)
+        self.assertEqual(weights, weights_snap)
+
+    def test_pure_float_inputs_keep_baseline_path(self):
+        # 不含 Fraction 的普通浮点输入不改变既有可观察结果。
+        out = weighted_sample(["p", "q"], [0.5, 1.5], 2, 3)
+        self.assertEqual(sorted(out), ["p", "q"])
+        self.assertEqual(
+            out, weighted_sample(["p", "q"], [0.5, 1.5], 2, 3)
+        )
+        # Fraction 与 float 混合时每个 float 也按精确值参与(0.5 -> 1/2)。
+        idx = weighted_sample_many_indices(
+            ["a", "b"], [Fraction(1, 2), 0.5], 2, 5, 11
+        )
+        self.assertTrue(all(sorted(rd) == [0, 1] for rd in idx))
 
 
 class SerializeMetricsTest(unittest.TestCase):

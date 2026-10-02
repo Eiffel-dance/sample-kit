@@ -16,6 +16,7 @@
 import math
 import random
 import sys
+from fractions import Fraction
 
 import app
 
@@ -302,6 +303,180 @@ rng_r = _ScriptedReject()
 picked = app._sample_indices_exact_integer([0, 1, 2], [1, 1, 1], 1, rng_r)
 check(picked == [2] and rng_r.saw == [3, 3, 2],
       "needle 落在拒绝区间时重抽, 接受值取模后定位正确")
+
+
+# ---------------------------------------------------------------------------
+# 10. Fraction 权重: 精确有理数路径, 极小正权重不被浮点吞掉
+# ---------------------------------------------------------------------------
+section("Fraction 权重的精确无放回抽样")
+
+# 10.1 极小正 Fraction 通过公开入口在精确比例允许时被选中。
+#   [9, 1/100] 精确放大为 [900, 1], 锁定 seed 命中微小位置; 走浮点路径时
+#   该微小权重相对总和虽不致归零, 但这里走的是精确路径, 比例严格为 1/901。
+tiny_public = app.weighted_sample(
+    ["big", "tiny"], [9, Fraction(1, 100)], 1, 2316
+)
+check(tiny_public == ["tiny"], "极小正 Fraction 在公开入口可被选中 (seed 锁定)")
+
+# 10.2 极端比例 10**100 : 1/10**100 —— float() 后微小方严格为零, 浮点路径
+#   永不可能选中; 精确放大为 [10**200, 1], needle=total-1 必须命中微小位置。
+extreme = [10 ** 100, Fraction(1, 10 ** 100)]
+scaled_extreme = app._scale_to_exact_integer_weights(extreme)
+extreme_pick = app._sample_indices_exact_integer(
+    [0, 1], list(scaled_extreme), 1, _FixedRNG([sum(scaled_extreme) - 1])
+)
+check(
+    scaled_extreme == [10 ** 200, 1] and extreme_pick == [1],
+    "极端比例下极小正 Fraction 不被浮点吞掉 (10**200:1, needle=total-1)",
+)
+
+# 10.3 零 Fraction 永不入选(含与超大整数混排、整轮抽满)。
+zero_frac_ok = all(
+    app.weighted_sample_indices(["x", "y"], [Fraction(7, 3), Fraction(0)], 1, s)
+    == [0]
+    for s in range(200)
+)
+zero_frac_ok = zero_frac_ok and all(
+    app.weighted_sample_indices(["a", "z"], [10 ** 100, Fraction(0)], 1, s)
+    == [0]
+    for s in range(200)
+)
+zero_frac_ok = zero_frac_ok and all(
+    sorted(app.weighted_sample_indices(
+        ["a", "b", "c"],
+        [Fraction(1, 2), Fraction(0), Fraction(1, 4)], 2, s)) == [0, 2]
+    for s in range(100)
+)
+check(zero_frac_ok, "零 Fraction 在 200 个 seed 下从不出现, 整轮抽满也被排除")
+
+# 10.4 零 Fraction 在精确定位遍历中被精确跳过。
+zero_locate = [10 ** 100, Fraction(0), Fraction(1, 10 ** 100)]
+scaled_zero = app._scale_to_exact_integer_weights(zero_locate)
+zero_skip_pick = app._sample_indices_exact_integer(
+    [0, 1, 2], list(scaled_zero), 1, _FixedRNG([sum(scaled_zero) - 1])
+)
+check(zero_skip_pick == [2] and scaled_zero[1] == 0,
+      "定位遍历时零 Fraction 位置被精确跳过")
+
+# 10.5 混合 int / Fraction / float 的批量序列可复现, 第一轮与单次一致,
+#   values 与 indices 两个批量入口逐轮对应。
+mixed_items = ["p", "q", "r"]
+mixed_weights = [2, Fraction(1), 0.5]  # 精确放大为 [4, 2, 1]
+mixed_locked = [[1, 0, 2], [0, 2, 1], [0, 1, 2], [0, 2, 1]]
+mixed_idx = app.weighted_sample_many_indices(mixed_items, mixed_weights, 3, 4, 42)
+mixed_val = app.weighted_sample_many(mixed_items, mixed_weights, 3, 4, 42)
+mixed_ok = (
+    mixed_idx == mixed_locked
+    and mixed_idx == app.weighted_sample_many_indices(
+        mixed_items, mixed_weights, 3, 4, 42)
+    and mixed_val == [[mixed_items[i] for i in rd] for rd in mixed_idx]
+    and mixed_idx[0] == app.weighted_sample_indices(
+        mixed_items, mixed_weights, 3, 42)
+    and mixed_val[0] == app.weighted_sample(mixed_items, mixed_weights, 3, 42)
+)
+check(mixed_ok, "混合 int/Fraction/float 批量序列可复现, 第一轮与单次逐项一致")
+
+# 10.6 极大整数 + 极小分母 Fraction 混排: 不触发浮点转换, 确定可复现。
+huge_mixed = [10 ** 400, Fraction(1, 10 ** 400), Fraction(0)]
+hm_rounds = app.weighted_sample_many_indices(
+    ["H", "t", "z"], huge_mixed, 1, 3, 7
+)
+check(
+    hm_rounds == [[0], [0], [0]]
+    and hm_rounds == app.weighted_sample_many_indices(
+        ["H", "t", "z"], huge_mixed, 1, 3, 7),
+    "混合大整数与 Fraction 的批量序列可复现, 零权重被排除",
+)
+for w in (Fraction(10 ** 5000, 1), Fraction(1, 10 ** 5000)):
+    pick = app.weighted_sample_indices(["a", "b"], [w, 1], 1, 3)
+    check(
+        pick == app.weighted_sample_indices(["a", "b"], [w, 1], 1, 3),
+        "极大分子/极大分母 Fraction 通过校验并确定抽取 (%s)"
+        % ("大分子" if w.numerator > 1 else "大分母"),
+    )
+
+# 10.7 混合权重的统计比例: [1, 1/3] -> [3,1], 严格 3:1。
+frac_counts = [0, 0]
+FRAC_TRIALS = 4000
+for seed in range(FRAC_TRIALS):
+    frac_counts[app.weighted_sample_indices(
+        ["a", "b"], [1, Fraction(1, 3)], 1, seed)[0]] += 1
+frac_prop_ok = (
+    abs(frac_counts[0] / FRAC_TRIALS - 0.75) < 0.04
+    and abs(frac_counts[1] / FRAC_TRIALS - 0.25) < 0.04
+)
+print("  观测比例: %.4f %.4f (期望 0.7500 0.2500)"
+      % (frac_counts[0] / FRAC_TRIALS, frac_counts[1] / FRAC_TRIALS))
+check(frac_prop_ok, "混合 int/Fraction 第一轮比例收敛到精确的 3:1")
+
+# 10.8 正权重位置不足: 单次与批量都在产生任何结果前抛 ValueError。
+raises(ValueError,
+       lambda: app.weighted_sample_indices(
+           ["a", "b"], [Fraction(1), Fraction(0)], 2, 0),
+       "Fraction: 单次入口正权重位置不足 -> ValueError")
+raises(ValueError,
+       lambda: app.weighted_sample_many_indices(
+           ["a", "b"], [Fraction(1), Fraction(0)], 2, 1000, 0),
+       "Fraction: 批量入口在任何一轮前 -> ValueError")
+raises(ValueError,
+       lambda: app.weighted_sample_indices(
+           ["a"], [Fraction(0, 10 ** 100)], 1, 0),
+       "极小分子的零 Fraction (0/10**100) k>0 -> ValueError")
+
+# 10.9 非法输入只产生确定的 TypeError / ValueError。
+raises(TypeError,
+       lambda: app.weighted_sample_indices(["a", "b"], [Fraction(1), True], 1, 0),
+       "Fraction 混排 bool 权重 -> TypeError")
+raises(TypeError,
+       lambda: app.weighted_sample_indices(["a", "b"], [Fraction(1), 1 + 2j], 1, 0),
+       "Fraction 混排非实数权重 -> TypeError")
+raises(ValueError,
+       lambda: app.weighted_sample_indices(["a"], [Fraction(-1, 3)], 1, 0),
+       "负 Fraction -> ValueError")
+raises(ValueError,
+       lambda: app.weighted_sample_indices(
+           ["a", "b"], [Fraction(1), float("nan")], 1, 0),
+       "Fraction 混排 NaN -> ValueError")
+raises(ValueError,
+       lambda: app.weighted_sample_indices(
+           ["a", "b"], [Fraction(1), float("inf")], 1, 0),
+       "Fraction 混排正无穷 -> ValueError")
+
+# 10.10 k=0 返回空样本; draws=0 返回空轮次但完成全部校验。
+check(app.weighted_sample_indices(
+    ["a"], [Fraction(1, 10 ** 100)], 0, 0) == [],
+    "Fraction: k=0 且输入合法 -> []")
+check(app.weighted_sample_many_indices(["a"], [Fraction(1)], 1, 0, 0) == [],
+    "Fraction: draws=0 -> []")
+raises(ValueError,
+       lambda: app.weighted_sample_many_indices(
+           ["a"], [float("nan")], 0, 0, 0),
+       "Fraction: draws=0 仍先完成权重校验 (NaN -> ValueError)")
+
+# 10.11 seed=None 随机语义保留; 入参不被修改。
+app.weighted_sample_indices(
+    ["a", "b"], [Fraction(1, 2), Fraction(1, 3)], 1, None)
+print("  PASS: Fraction 权重下 seed=None 可正常工作")
+
+frac_items = ["p", "q", "r"]
+frac_weights = [2, Fraction(1, 3), 0.5]
+fi_snap, fw_snap = list(frac_items), list(frac_weights)
+app.weighted_sample(frac_items, frac_weights, 3, 5)
+app.weighted_sample_many(frac_items, frac_weights, 3, 4, 99)
+app.weighted_sample_indices(frac_items, frac_weights, 2, -3)
+check(frac_items == fi_snap and frac_weights == fw_snap,
+      "Fraction: items / weights 原样保留")
+
+# 10.12 不含 Fraction 的小整数 / 普通浮点可观察结果保持不变。
+check(
+    app.weighted_sample(["red", "green", "blue"], [1, 3, 2], 2, 42)
+    == ["green", "red"],
+    "Fraction 改动后小整数基线序列仍保持",
+)
+check(
+    sorted(app.weighted_sample(["p", "q"], [0.5, 1.5], 2, 3)) == ["p", "q"],
+    "Fraction 改动后普通浮点基线行为仍保持",
+)
 
 
 # ---------------------------------------------------------------------------

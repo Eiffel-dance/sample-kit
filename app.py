@@ -99,6 +99,14 @@ def _validate_sample_inputs(items, weights, k, seed):
             if w < 0:
                 raise ValueError("negative weight")
             continue
+        if isinstance(w, Fraction):
+            # Fraction 与 int 同为精确有理数, 既不可能是 NaN 也不可能是
+            # 无穷; 直接按精确值判符号, 避免 math.isnan/isinf 把极大分子
+            # 或极小分母的 Fraction(如 Fraction(10**5000, 1)、
+            # Fraction(1, 10**5000))强制转成浮点而抛 OverflowError。
+            if w < 0:
+                raise ValueError("negative weight")
+            continue
         if math.isnan(w):
             raise ValueError("weight at index %d must not be NaN" % index)
         if math.isinf(w):
@@ -241,8 +249,10 @@ def _scale_to_exact_integer_weights(pool_weights):
     每个有限 float 都是分母为 2 的幂的精确分数, int / Fraction 同样
     精确; 取全部分母的最小公倍数作为统一比例放大后, 所有权重成为精确
     整数, 相对比例逐点保持 —— 正权重仍为正(每个正权重位置保留候选资
-    格), 零权重仍为零(永不被选中)。用于浮点求和/累计会溢出的极端输
-    入, 抽样概率严格等于原始正权重的相对比例。
+    格, 哪怕是分子为 1、分母为 10**100 的极小正 Fraction), 零权重仍为
+    零(永不被选中)。用于两种场景: 权重序列包含 Fraction(杜绝任何
+    float 转换把微小正有理数吞成零、或把精确比例舍入), 以及浮点求和/
+    累计会溢出的极端输入。抽样概率严格等于原始正权重的相对比例。
     """
     fractions = [Fraction(w) for w in pool_weights]
     scale = 1
@@ -251,15 +261,27 @@ def _scale_to_exact_integer_weights(pool_weights):
     return [int(f * scale) for f in fractions]
 
 
+def _contains_fraction(pool_weights):
+    return any(isinstance(w, Fraction) for w in pool_weights)
+
+
 def _select_sampling_plan(pool_weights, k):
     """返回 (抽样用权重, 是否走纯整数精确路径)。
 
-    优先沿用基线规则: 全整数且累计超 2**53 走纯整数路径; 总和可正常
-    表示的输入保持既有浮点路径与锁定序列不变。仅当浮点求和/累计会溢
-    出(有限浮点权重总和为无穷, 或超大整数与浮点混合求和溢出)时, 把
-    权重精确放大为整数后走纯整数路径 —— 只改变原本会产生无效或不完
-    整结果的极端场景。
+    路径选择规则:
+      1. 权重序列中只要出现 Fraction(可与 int 及有限 float 混合), 就把
+         全部权重按 LCM 统一放大为精确整数后走纯整数路径。这样每个有理
+         数都以精确数学值参与抽样: 严格为正的 Fraction(哪怕极小)不会因
+         转成 float 而变成零, 比例也不被浮点舍入改变。
+      2. 全整数且累计超 2**53 走纯整数路径(基线规则)。
+      3. 总和可正常表示的纯 int / float 输入保持既有浮点路径与锁定序列
+         不变。
+      4. 浮点求和/累计会溢出(有限浮点权重总和为无穷, 或超大整数与浮点
+         混合求和溢出)时, 把权重精确放大为整数后走纯整数路径 —— 只改变
+         原本会产生无效或不完整结果的极端场景。
     """
+    if k > 0 and _contains_fraction(pool_weights):
+        return _scale_to_exact_integer_weights(pool_weights), True
     if _use_exact_integer_path(pool_weights, k):
         return pool_weights, True
     if k > 0 and not _float_total_is_finite(pool_weights):
