@@ -3,6 +3,9 @@
 公开接口:
     weighted_sample(items, weights, k, seed=0)
         按元素位置的加权无放回抽样, 相同 (输入, seed) 给出完全一致的序列。
+    weighted_sample_indices(items, weights, k, seed=0)
+        与 weighted_sample 同规则, 但返回按抽样先后排列的零基原始索引;
+        items 中相等的值仍按不同位置独立处理。
     serialize_metrics(metrics)
         将指标树稳定序列化为紧凑 JSON 文本, 任意精度整数保持精确十进制。
 
@@ -32,7 +35,12 @@ def _is_length_determinable_sequence(value):
     )
 
 
-def weighted_sample(items, weights, k, seed=0):
+def _validate_sample_inputs(items, weights, k, seed):
+    """weighted_sample / weighted_sample_indices 共用的全部前置校验。
+
+    校验通过后返回位置数 n; 非法输入以稳定的 TypeError / ValueError
+    告知调用方, 不会触碰 items / weights 的内容。
+    """
     # ---- 1. 结构与参数类型 (TypeError) ----
     if not _is_length_determinable_sequence(items):
         raise TypeError("items must be a length-determinable sequence")
@@ -65,24 +73,37 @@ def weighted_sample(items, weights, k, seed=0):
         if w < 0:
             raise ValueError("negative weight")
 
+    return n
+
+
+def weighted_sample_indices(items, weights, k, seed=0):
+    n = _validate_sample_inputs(items, weights, k, seed)
+
     # 以下为确定性的加权无放回抽取; 复制到本地池, 绝不修改入参。
-    pool = [(item, w) for item, w in zip(items, weights)]
-    out = []
+    pool = list(range(n))
+    pool_weights = list(weights)
+    indices = []
     rng = random.Random(seed)
     for _ in range(k):
-        total = sum(w for _, w in pool)
+        total = sum(pool_weights)
         if total <= 0:
             # 仍有抽取请求, 但剩余权重没有正值。
             raise ValueError("no positive weight")
         needle = rng.random() * total
         acc = 0
-        for i, (item, w) in enumerate(pool):
+        for i, w in enumerate(pool_weights):
             acc += w
             if needle < acc:
-                out.append(item)
-                pool.pop(i)  # 同一位置不可再次被选
+                indices.append(pool[i])  # 记录原始零基位置
+                pool.pop(i)
+                pool_weights.pop(i)  # 同一位置不可再次被选
                 break
-    return out
+    return indices
+
+
+def weighted_sample(items, weights, k, seed=0):
+    indices = weighted_sample_indices(items, weights, k, seed)
+    return [items[i] for i in indices]
 
 
 # ---------------------------------------------------------------------------
