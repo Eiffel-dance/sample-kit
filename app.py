@@ -3,6 +3,8 @@
 公开接口:
     weighted_sample(items, weights, k, seed=0)
         按元素位置的加权无放回抽样, 相同 (输入, seed) 给出完全一致的序列。
+        权重接受非布尔的 int、有限 float、Fraction 与有限非负 decimal.Decimal,
+        四类可任意混合; 每个权重按自身精确数值参与抽样。
     weighted_sample_indices(items, weights, k, seed=0)
         与 weighted_sample 同规则, 但返回按抽样先后排列的零基原始索引;
         items 中相等的值仍按不同位置独立处理。
@@ -31,6 +33,7 @@ import math
 import numbers
 import random
 import sys
+from decimal import Decimal
 from fractions import Fraction
 
 # 文本/字节类型虽然满足 Sequence 协议, 但不作为“元素序列”接受。
@@ -83,8 +86,13 @@ def _validate_sample_inputs(items, weights, k, seed):
         raise ValueError("invalid sample size")
 
     # ---- 3. 权重类型: 布尔值和非实数权重 (TypeError) ----
+    # Decimal 不是 numbers.Real 的子类, 但属于受支持的精确权重类型,
+    # 需显式放行; 其余非 Real 值(complex、str、None、容器等)仍是 TypeError。
     for index, w in enumerate(weights):
-        if isinstance(w, bool) or not isinstance(w, numbers.Real):
+        if (
+            isinstance(w, bool)
+            or not (isinstance(w, numbers.Real) or isinstance(w, Decimal))
+        ):
             raise TypeError(
                 "weight at index %d must be a real number, not %s"
                 % (index, type(w).__name__)
@@ -104,6 +112,23 @@ def _validate_sample_inputs(items, weights, k, seed):
             # 无穷; 直接按精确值判符号, 避免 math.isnan/isinf 把极大分子
             # 或极小分母的 Fraction(如 Fraction(10**5000, 1)、
             # Fraction(1, 10**5000))强制转成浮点而抛 OverflowError。
+            if w < 0:
+                raise ValueError("negative weight")
+            continue
+        if isinstance(w, Decimal):
+            # Decimal 必须先用非信号谓词判定 NaN / 无穷: 对 NaN / sNaN
+            # 直接使用 < 等比较会抛 decimal.InvalidOperation, 绝不能让它
+            # 泄漏成调用方看到的异常。有限 Decimal(含 +/-0.0)再按精确
+            # 数值判符号; 带符号零 -0.0 与 +0.0 同样不小于 0, 属于合法
+            # 的零权重(永不被选中)。
+            if w.is_nan():
+                raise ValueError(
+                    "weight at index %d must not be NaN" % index
+                )
+            if w.is_infinite():
+                raise ValueError(
+                    "weight at index %d must be finite" % index
+                )
             if w < 0:
                 raise ValueError("negative weight")
             continue
@@ -129,8 +154,9 @@ def _count_positive_weights(weights):
     """统计严格为正的权重个数。
 
     整数直接判正负, 不经过浮点 —— 超大整数(如 10**400)也是合法有限值;
-    浮点 +0.0/-0.0 都不计入, 正的有限浮点才计入。调用前权重已通过
-    类型与取值校验(无 bool / NaN / 无穷 / 负数)。
+    浮点 +0.0/-0.0 都不计入, 正的有限浮点才计入; Decimal(含带符号零
+    -0.0、零指数表示 0E5 等)与 Fraction 同理, 仅严格为正才计入。调用前
+    权重已通过类型与取值校验(无 bool / NaN / 无穷 / 负数)。
     """
     count = 0
     for w in weights:
@@ -247,11 +273,13 @@ def _scale_to_exact_integer_weights(pool_weights):
     """把有限实数权重按统一比例放大为精确整数权重, 供纯整数路径使用。
 
     每个有限 float 都是分母为 2 的幂的精确分数, int / Fraction 同样
-    精确; 取全部分母的最小公倍数作为统一比例放大后, 所有权重成为精确
-    整数, 相对比例逐点保持 —— 正权重仍为正(每个正权重位置保留候选资
-    格, 哪怕是分子为 1、分母为 10**100 的极小正 Fraction), 零权重仍为
-    零(永不被选中)。用于两种场景: 权重序列包含 Fraction(杜绝任何
-    float 转换把微小正有理数吞成零、或把精确比例舍入), 以及浮点求和/
+    精确; 有限 decimal.Decimal(含任意指数, 如 1E-100、1E100000)经
+    Fraction(Decimal) 转换也是与其十进制值逐点相等的精确有理数。取全部
+    分母的最小公倍数作为统一比例放大后, 所有权重成为精确整数, 相对比例
+    逐点保持 —— 正权重仍为正(每个正权重位置保留候选资格, 哪怕是分子为
+    1、分母为 10**100 的极小正 Fraction/Decimal), 零权重(含带符号零
+    -0.0)仍为零(永不被选中)。用于权重序列包含 Fraction 或 Decimal(杜绝
+    任何 float 转换把微小正值吞成零、或把精确比例舍入), 以及浮点求和/
     累计会溢出的极端输入。抽样概率严格等于原始正权重的相对比例。
     """
     fractions = [Fraction(w) for w in pool_weights]
@@ -261,18 +289,22 @@ def _scale_to_exact_integer_weights(pool_weights):
     return [int(f * scale) for f in fractions]
 
 
-def _contains_fraction(pool_weights):
-    return any(isinstance(w, Fraction) for w in pool_weights)
+def _contains_exact_rational(pool_weights):
+    """权重序列是否含 Fraction 或 Decimal —— 两者都须走精确放大路径。"""
+    return any(
+        isinstance(w, (Fraction, Decimal)) for w in pool_weights
+    )
 
 
 def _select_sampling_plan(pool_weights, k):
     """返回 (抽样用权重, 是否走纯整数精确路径)。
 
     路径选择规则:
-      1. 权重序列中只要出现 Fraction(可与 int 及有限 float 混合), 就把
-         全部权重按 LCM 统一放大为精确整数后走纯整数路径。这样每个有理
-         数都以精确数学值参与抽样: 严格为正的 Fraction(哪怕极小)不会因
-         转成 float 而变成零, 比例也不被浮点舍入改变。
+      1. 权重序列中只要出现 Fraction 或 Decimal(可与 int 及有限 float
+         任意混合), 就把全部权重按 LCM 统一放大为精确整数后走纯整数路径。
+         这样每个有理数/十进制数都以精确数学值参与抽样: 严格为正的
+         Fraction/Decimal(哪怕极小, 如 1E-100)不会因转成 float 而变成零,
+         比例也不被浮点舍入改变; 超大指数(如 1E100000)同样精确保持。
       2. 全整数且累计超 2**53 走纯整数路径(基线规则)。
       3. 总和可正常表示的纯 int / float 输入保持既有浮点路径与锁定序列
          不变。
@@ -280,7 +312,7 @@ def _select_sampling_plan(pool_weights, k):
          混合求和溢出)时, 把权重精确放大为整数后走纯整数路径 —— 只改变
          原本会产生无效或不完整结果的极端场景。
     """
-    if k > 0 and _contains_fraction(pool_weights):
+    if k > 0 and _contains_exact_rational(pool_weights):
         return _scale_to_exact_integer_weights(pool_weights), True
     if _use_exact_integer_path(pool_weights, k):
         return pool_weights, True

@@ -13,9 +13,11 @@
 用法:  python3 verify_exact.py   (全部通过时退出码为 0)
 """
 
+import decimal
 import math
 import random
 import sys
+from decimal import Decimal
 from fractions import Fraction
 
 import app
@@ -476,6 +478,154 @@ check(
 check(
     sorted(app.weighted_sample(["p", "q"], [0.5, 1.5], 2, 3)) == ["p", "q"],
     "Fraction 改动后普通浮点基线行为仍保持",
+)
+
+
+# ---------------------------------------------------------------------------
+# 11. Decimal 权重: 精确十进制/有理数路径, 与 int/float/Fraction 混用
+# ---------------------------------------------------------------------------
+section("Decimal 权重的精确无放回抽样")
+
+from decimal import Decimal
+
+# 11.1 Decimal 与 Fraction 逐点相等: 0.1 是精确的 1/10, 任意 seed 同序列。
+d_dec = [1, Decimal("0.1")]
+d_frac = [1, Fraction(1, 10)]
+d_eq = all(
+    app.weighted_sample_indices(["a", "b"], d_dec, 1, s)
+    == app.weighted_sample_indices(["a", "b"], d_frac, 1, s)
+    for s in range(300)
+)
+check(d_eq, "Decimal(0.1) 与 Fraction(1,10) 在 300 个 seed 下序列逐点相同")
+
+# 11.2 超过默认 context 精度(28 位)的长 Decimal 仍按精确值缩放, 比例严格 1:2。
+long1 = Decimal("1." + "1" * 60)
+long2 = Decimal("2." + "2" * 60)
+long_scaled = app._scale_to_exact_integer_weights([long1, long2])
+check(
+    long_scaled[1] == 2 * long_scaled[0] and long_scaled[0] > 0,
+    "60 位 Decimal 超出 context 精度仍精确放大为严格 1:2",
+)
+
+# 11.3 极小正 Decimal 在公开入口可被选中; 极端比例 10**100 : 1E-100
+#   精确放大为 [10**200, 1], needle=total-1 必须命中微小位置。
+tiny_d = app.weighted_sample(["big", "tiny"], [9, Decimal("0.01")], 1, 2316)
+check(tiny_d == ["tiny"], "极小正 Decimal 在公开入口可被选中 (seed 锁定)")
+
+extreme_d = [10 ** 100, Decimal("1E-100")]
+scaled_ed = app._scale_to_exact_integer_weights(extreme_d)
+extreme_pick_d = app._sample_indices_exact_integer(
+    [0, 1], list(scaled_ed), 1, _FixedRNG([sum(scaled_ed) - 1])
+)
+check(
+    scaled_ed == [10 ** 200, 1] and extreme_pick_d == [1],
+    "极端比例下极小正 Decimal 不被浮点吞掉 (10**200:1)",
+)
+
+# 11.4 超大正指数 1E100000 与 1 混排: 不触发浮点转换, 确定可复现,
+#   且与 Fraction(10**100000, 1) 同序列。
+huge_d = [Decimal("1E100000"), Decimal("1")]
+huge_f = [Fraction(10 ** 100000, 1), Fraction(1)]
+hd_ok = all(
+    app.weighted_sample_indices(["a", "b"], huge_d, 1, s)
+    == app.weighted_sample_indices(["a", "b"], huge_f, 1, s)
+    for s in (0, 1, 42, 7, 99)
+) and app.weighted_sample_indices(["a", "b"], huge_d, 1, 7) == \
+    app.weighted_sample_indices(["a", "b"], huge_d, 1, 7)
+check(hd_ok, "超大指数 Decimal 1E100000 精确、确定, 与对应 Fraction 同序列")
+
+# 11.5 零值(含带符号零)始终不可选, 且为合法权重不抛异常。
+zero_d_ok = all(
+    app.weighted_sample_indices(
+        ["x", "y"], [z, Decimal(5)], 1, s
+    ) == [1]
+    for z in (Decimal(0), Decimal("-0.0"), Decimal("0E5"), Decimal("-0E100"))
+    for s in range(60)
+)
+check(zero_d_ok, "Decimal 零(含 +/-0.0、零指数表示)在 60 个 seed 下从不出现")
+
+# 11.6 四类权重混合: 精确放大、批量可复现、第一轮与单次一致、入口逐轮对应。
+four_items = ["p", "q", "r", "s"]
+four_weights = [2, Fraction(1), 0.5, Decimal("0.25")]  # -> [8, 4, 2, 1]
+four_locked = [[1, 0, 2], [1, 0, 2], [0, 1, 3], [0, 2, 3]]
+four_i = app.weighted_sample_many_indices(four_items, four_weights, 3, 4, 42)
+four_v = app.weighted_sample_many(four_items, four_weights, 3, 4, 42)
+four_ok = (
+    app._scale_to_exact_integer_weights(four_weights) == [8, 4, 2, 1]
+    and four_i == four_locked
+    and four_i == app.weighted_sample_many_indices(four_items, four_weights, 3, 4, 42)
+    and four_v == [[four_items[i] for i in rd] for rd in four_i]
+    and four_i[0] == app.weighted_sample_indices(four_items, four_weights, 3, 42)
+)
+check(four_ok, "int/float/Fraction/Decimal 四类混合批量精确、可复现、第一轮与单次一致")
+
+# 11.7 非法取值: NaN / sNaN / 正负无穷 / 负数 -> ValueError, 不泄漏
+#   decimal.InvalidOperation。
+for bad_d in (Decimal("NaN"), Decimal("sNaN"), Decimal("Infinity"),
+              Decimal("-Infinity"), Decimal("-0.01"), Decimal("-1E100000")):
+    try:
+        app.weighted_sample_indices(["a"], [bad_d], 1, 0)
+        check(False, "Decimal %s 应抛 ValueError" % bad_d)
+    except decimal.InvalidOperation:
+        check(False, "Decimal %s 泄漏了 InvalidOperation" % bad_d)
+    except ValueError:
+        pass
+    except Exception as _e:  # noqa
+        check(False, "Decimal %s 得到 %s" % (bad_d, type(_e).__name__))
+print("  PASS: Decimal NaN/sNaN/Infinity/负数 均为 ValueError, 不泄漏 InvalidOperation")
+
+# 11.8 非法类型 -> TypeError; 结构 / k / seed / draws 分类不变。
+raises(TypeError,
+       lambda: app.weighted_sample_indices(["a", "b"], [Decimal(1), True], 1, 0),
+       "Decimal 混排 bool 权重 -> TypeError")
+raises(TypeError,
+       lambda: app.weighted_sample_indices(["a", "b"], [Decimal(1), 1 + 2j], 1, 0),
+       "Decimal 混排非实数权重 -> TypeError")
+raises(TypeError,
+       lambda: app.weighted_sample_many_indices(["a"], [Decimal(1)], 1, "2", 0),
+       "Decimal: draws 非整数 -> TypeError")
+raises(ValueError,
+       lambda: app.weighted_sample_many_indices(["a"], [Decimal(1)], 1, -1, 0),
+       "Decimal: draws 为负 -> ValueError")
+
+# 11.9 k=0 / draws=0 边界: 先完成校验再返回空。
+check(app.weighted_sample_indices(["a"], [Decimal("1E-9")], 0, 0) == [],
+      "Decimal: k=0 且合法 -> []")
+check(app.weighted_sample_many_indices(["a"], [Decimal(1)], 1, 0, 0) == [],
+      "Decimal: draws=0 -> []")
+raises(ValueError,
+       lambda: app.weighted_sample_many_indices(["a"], [Decimal("sNaN")], 0, 0, 0),
+       "Decimal: draws=0 仍先完成权重校验 (sNaN -> ValueError)")
+
+# 11.10 正权重位置不足: 单次与批量都在任何结果前抛 ValueError。
+raises(ValueError,
+       lambda: app.weighted_sample_indices(["a", "b"], [Decimal(1), 0], 2, 0),
+       "Decimal: 单次入口正权重位置不足 -> ValueError")
+raises(ValueError,
+       lambda: app.weighted_sample_many_indices(["a"], [Decimal(0)], 1, 5, 0),
+       "Decimal: 批量入口在任何一轮前 -> ValueError")
+
+# 11.11 seed=None 可用; 入参不被修改。
+app.weighted_sample_indices(["a", "b"], [Decimal("0.5"), Decimal("1.5")], 1, None)
+print("  PASS: Decimal 权重下 seed=None 可正常工作")
+d_items = ["p", "q"]
+d_weights = [Decimal("1.50"), Decimal("2.50")]
+di_snap, dw_snap = list(d_items), [repr(x) for x in d_weights]
+app.weighted_sample(d_items, d_weights, 2, 5)
+app.weighted_sample_many_indices(d_items, d_weights, 1, 3, -3)
+check(d_items == di_snap and [repr(x) for x in d_weights] == dw_snap,
+      "Decimal: items / weights 原样保留")
+
+# 11.12 既有 int / float / Fraction 结果与指标序列化保持不变。
+check(
+    app.weighted_sample(["red", "green", "blue"], [1, 3, 2], 2, 42)
+    == ["green", "red"],
+    "Decimal 改动后小整数基线序列仍保持",
+)
+check(
+    app.serialize_metrics({10 ** 100: 1, "名": [1, 2]})
+    == '{"1%s":1,"名":[1,2]}' % ("0" * 100),
+    "Decimal 改动后超大整数指标精确十进制 / 键排序 / Unicode / 紧凑格式不变",
 )
 
 

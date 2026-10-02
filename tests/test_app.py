@@ -1,5 +1,6 @@
 import math
 import unittest
+from decimal import Decimal
 from fractions import Fraction
 
 import app
@@ -1071,6 +1072,405 @@ class FractionWeightSamplingTest(unittest.TestCase):
             ["a", "b"], [Fraction(1, 2), 0.5], 2, 5, 11
         )
         self.assertTrue(all(sorted(rd) == [0, 1] for rd in idx))
+
+
+class DecimalWeightSamplingTest(unittest.TestCase):
+    """权重序列包含 decimal.Decimal 时全程走精确十进制/有理数路径。"""
+
+    # ------------------------------------------------------------------
+    # 可接受性 / 确定性 / 两个单轮入口逐项对应
+    # ------------------------------------------------------------------
+    def test_decimal_weights_deterministic_and_entries_correspond(self):
+        items = ["a", "b", "c", "d"]
+        weights = [Decimal("1.5"), 3, Fraction(1, 2), 0.25]
+        for k in (1, 2, 3):
+            for seed in (0, 1, 42, -7, 1.5, "s", b"s", bytearray(b"s"), True):
+                idx = weighted_sample_indices(items, weights, k, seed)
+                self.assertEqual(len(idx), k)
+                self.assertEqual(len(set(idx)), k)
+                self.assertTrue(all(0 <= i < 4 for i in idx))
+                self.assertEqual(
+                    idx, weighted_sample_indices(items, weights, k, seed)
+                )
+                self.assertEqual(
+                    weighted_sample(items, weights, k, seed),
+                    [items[i] for i in idx],
+                )
+
+    def test_seed_none_works_with_decimal_weights(self):
+        idx = weighted_sample_indices(
+            list(range(20)), [Decimal(i + 1) for i in range(20)], 8, None
+        )
+        self.assertEqual(len(idx), 8)
+        self.assertEqual(len(set(idx)), 8)
+
+    def test_duplicate_values_are_distinct_positions_with_decimal(self):
+        items = [1, 1, 1]
+        idx = weighted_sample_many_indices(items, [Decimal(1)] * 3, 3, 2, 123)
+        vals = weighted_sample_many(items, [Decimal(1)] * 3, 3, 2, 123)
+        self.assertTrue(all(sorted(rd) == [0, 1, 2] for rd in idx))
+        self.assertEqual(vals, [[1, 1, 1], [1, 1, 1]])
+
+    # ------------------------------------------------------------------
+    # 精确性: Decimal 与 Fraction 逐点相等; 长数字不受 context 精度影响
+    # ------------------------------------------------------------------
+    def test_decimal_matches_fraction_exactly_across_seeds(self):
+        # Decimal("0.1") 与 Fraction(1,10) 是同一个精确有理数, 任意 seed
+        # 下索引序列必须逐点相同(浮点 0.1 并不是精确的 1/10)。
+        wd = [1, Decimal("0.1")]
+        wf = [1, Fraction(1, 10)]
+        for seed in range(200):
+            self.assertEqual(
+                weighted_sample_indices(["a", "b"], wd, 1, seed),
+                weighted_sample_indices(["a", "b"], wf, 1, seed),
+            )
+
+    def test_decimal_beyond_context_precision_stays_exact(self):
+        # 默认 context 精度只有 28 位; 直接构造的 Decimal 保留全部 60 位,
+        # 经 Fraction 放大后两份权重仍严格保持 1:2, 不被舍入。
+        import app as _app
+
+        s1 = Decimal("1." + "1" * 60)
+        s2 = Decimal("2." + "2" * 60)
+        scaled = _app._scale_to_exact_integer_weights([s1, s2])
+        self.assertEqual(scaled[1], 2 * scaled[0])
+        self.assertTrue(scaled[0] > 0)
+        # 公开入口按精确 1:2 比例抽取且确定。
+        counts = [0, 0]
+        trials = 3000
+        for seed in range(trials):
+            counts[
+                weighted_sample_indices(["a", "b"], [s1, s2], 1, seed)[0]
+            ] += 1
+        self.assertAlmostEqual(counts[0] / trials, 1 / 3, delta=0.04)
+        self.assertAlmostEqual(counts[1] / trials, 2 / 3, delta=0.04)
+
+    def test_tiny_positive_decimal_selectable_via_public_entry(self):
+        # [9, 0.01] 精确放大为 [900, 1]; 与 Fraction(1,100) 同 seed 同序列。
+        items = ["big", "tiny"]
+        wd = [9, Decimal("0.01")]
+        wf = [9, Fraction(1, 100)]
+        self.assertEqual(
+            weighted_sample_indices(items, wd, 1, 2316), [1]
+        )
+        self.assertEqual(weighted_sample(items, wd, 1, 2316), ["tiny"])
+        self.assertEqual(
+            weighted_sample_indices(items, wd, 1, 2316),
+            weighted_sample_indices(items, wf, 1, 2316),
+        )
+
+    def test_extreme_ratio_tiny_decimal_never_swallowed_exact(self):
+        # 10**100 : 1E-100 —— 微小方 float() 后严格为零; 精确放大为
+        # [10**200, 1], needle=total-1 必须落到微小 Decimal 位置。
+        import app as _app
+
+        original = [10 ** 100, Decimal("1E-100")]
+        scaled = _app._scale_to_exact_integer_weights(original)
+        self.assertEqual(scaled, [10 ** 200, 1])
+
+        class _ScriptedRNG:
+            def __init__(self, values):
+                self._values = list(values)
+
+            def getrandbits(self, bits):
+                return self._values.pop(0)
+
+        chosen = _app._sample_indices_exact_integer(
+            [0, 1], list(scaled), 1, _ScriptedRNG([sum(scaled) - 1])
+        )
+        self.assertEqual(chosen, [1])
+
+    def test_huge_exponent_decimal_exact_and_deterministic(self):
+        # 超大正指数 1E100000 与 1 混排: 不触发浮点转换, 确定可复现,
+        # 且与 Fraction(10**100000, 1) 逐点同序列。
+        wd = [Decimal("1E100000"), Decimal("1")]
+        wf = [Fraction(10 ** 100000, 1), Fraction(1)]
+        for seed in (0, 1, 42, 7):
+            with self.subTest(seed=seed):
+                a = weighted_sample_indices(["a", "b"], wd, 1, seed)
+                self.assertIn(a[0], (0, 1))
+                self.assertEqual(
+                    a, weighted_sample_indices(["a", "b"], wd, 1, seed)
+                )
+                self.assertEqual(
+                    a, weighted_sample_indices(["a", "b"], wf, 1, seed)
+                )
+
+    def test_huge_exponent_mixed_with_zero_decimal(self):
+        items = ["H", "t", "z"]
+        weights = [Decimal("1E100000"), Decimal("1E-100000"), Decimal(0)]
+        rounds = weighted_sample_many_indices(items, weights, 1, 3, 7)
+        self.assertTrue(all(rd == [0] or rd == [1] for rd in rounds))
+        self.assertNotIn([2], rounds)
+        self.assertEqual(
+            rounds, weighted_sample_many_indices(items, weights, 1, 3, 7)
+        )
+
+    # ------------------------------------------------------------------
+    # 零值(含带符号零)始终不可选
+    # ------------------------------------------------------------------
+    def test_zero_and_signed_zero_decimal_never_chosen(self):
+        for zero in (Decimal(0), Decimal("0.0"), Decimal("-0.0"),
+                     Decimal("0E5"), Decimal("-0E100")):
+            for seed in range(60):
+                self.assertEqual(
+                    weighted_sample_indices(
+                        ["x", "y"], [zero, Decimal(5)], 1, seed
+                    ),
+                    [1],
+                )
+            # 带符号零是合法的零权重(不抛异常), k=0 正常返回空。
+            self.assertEqual(
+                weighted_sample_indices(["x"], [zero], 0, 0), []
+            )
+
+    def test_zero_decimal_excluded_from_full_draw(self):
+        weights = [Decimal("1.5"), Decimal(0), Decimal("0.5")]
+        for seed in range(80):
+            idx = weighted_sample_indices(["a", "b", "c"], weights, 2, seed)
+            self.assertEqual(sorted(idx), [0, 2])
+
+    # ------------------------------------------------------------------
+    # 四类权重混合: 精确缩放、锁定序列、批量约定
+    # ------------------------------------------------------------------
+    def test_mixed_all_four_weight_types_exact_scaling(self):
+        import app as _app
+
+        weights = [2, Fraction(1), 0.5, Decimal("0.25")]
+        # 统一放大 8 倍 -> [8, 4, 2, 1]。
+        self.assertEqual(
+            _app._scale_to_exact_integer_weights(weights), [8, 4, 2, 1]
+        )
+
+    def test_mixed_all_four_types_batch_locked_and_corresponding(self):
+        items = ["p", "q", "r", "s"]
+        weights = [2, Fraction(1), 0.5, Decimal("0.25")]
+        locked = [[1, 0, 2], [1, 0, 2], [0, 1, 3], [0, 2, 3]]
+        many_i = weighted_sample_many_indices(items, weights, 3, 4, 42)
+        self.assertEqual(many_i, locked)
+        self.assertEqual(
+            many_i, weighted_sample_many_indices(items, weights, 3, 4, 42)
+        )
+        many_v = weighted_sample_many(items, weights, 3, 4, 42)
+        self.assertEqual(
+            many_v, [[items[i] for i in rd] for rd in many_i]
+        )
+        # 第一轮与同 seed 的单轮入口逐项一致。
+        self.assertEqual(
+            many_i[0], weighted_sample_indices(items, weights, 3, 42)
+        )
+        self.assertEqual(
+            many_v[0], weighted_sample(items, weights, 3, 42)
+        )
+
+    def test_batch_rounds_share_one_seed_stream_and_restart(self):
+        import random as _random
+        import app as _app
+
+        items, weights, k = list("abcdef"), [
+            Decimal("1.5"), 1, Fraction(1, 2), 7, Decimal(0), 3
+        ], 4
+        scaled = _app._scale_to_exact_integer_weights(weights)
+        for draws in (1, 2, 6):
+            rng = _random.Random(99)
+            manual = []
+            for _ in range(draws):
+                # 每轮都从原始位置池重新开始, 但继续消耗同一随机流。
+                manual.append(
+                    _app._sample_indices_exact_integer(
+                        list(range(len(items))), list(scaled), k, rng
+                    )
+                )
+            self.assertEqual(
+                weighted_sample_many_indices(items, weights, k, draws, 99),
+                manual,
+            )
+        full = weighted_sample_many_indices(items, weights, k, 8, 123)
+        head = weighted_sample_many_indices(items, weights, k, 3, 123)
+        self.assertEqual(full[:3], head)
+        # 每轮内无重复、零权重位置 4 永不出现。
+        for rd in full:
+            self.assertEqual(len(rd), len(set(rd)))
+            self.assertNotIn(4, rd)
+
+    def test_batch_may_reselect_position_between_rounds(self):
+        rounds = weighted_sample_many_indices(
+            ["a", "b"], [Decimal(1), Decimal(1)], 1, 20, 0
+        )
+        self.assertEqual(len(rounds), 20)
+        self.assertTrue(all(rd == [0] or rd == [1] for rd in rounds))
+
+    # ------------------------------------------------------------------
+    # 正权重位置不足: 单轮与批量都在产出任何结果前抛 ValueError
+    # ------------------------------------------------------------------
+    def test_insufficient_positive_weights_raises_value_error(self):
+        with self.assertRaises(ValueError):
+            weighted_sample_indices(["a", "b"], [Decimal(1), 0], 2, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_indices(["a"], [Decimal(0)], 1, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_indices(
+                ["a", "b"], [Decimal("1E100"), Decimal(0)], 2, 0
+            )
+        with self.assertRaises(ValueError):
+            weighted_sample_many_indices(
+                ["a", "b"], [Decimal(1), Decimal(0)], 2, 5, 0
+            )
+        with self.assertRaises(ValueError):
+            weighted_sample_many(["a"], [Decimal(0)], 1, 5, 0)
+
+    # ------------------------------------------------------------------
+    # 非法取值: NaN / sNaN / 正负无穷 / 负数 -> ValueError, 不泄漏
+    # decimal.InvalidOperation
+    # ------------------------------------------------------------------
+    def test_nonfinite_and_negative_decimal_raise_value_error(self):
+        import decimal
+
+        bad_values = [
+            Decimal("NaN"),
+            Decimal("sNaN"),
+            Decimal("Infinity"),
+            Decimal("-Infinity"),
+            Decimal("-0.0001"),
+            Decimal("-1E100000"),
+        ]
+        for bad in bad_values:
+            with self.subTest(bad=str(bad)):
+                for fn in (
+                    lambda: weighted_sample_indices(["a"], [bad], 1, 0),
+                    lambda: weighted_sample(["a"], [bad], 1, 0),
+                    lambda: weighted_sample_many_indices(
+                        ["a"], [bad], 1, 1, 0
+                    ),
+                    lambda: weighted_sample_many(["a"], [bad], 1, 1, 0),
+                ):
+                    try:
+                        fn()
+                    except decimal.InvalidOperation:
+                        # Decimal 自身的比较异常不得泄漏。
+                        self.fail(
+                            "decimal.InvalidOperation leaked for %r" % bad
+                        )
+                    except ValueError:
+                        pass
+                    except Exception as exc:  # noqa: PT027
+                        self.fail(
+                            "expected ValueError for %r, got %s"
+                            % (bad, type(exc).__name__)
+                        )
+                    else:
+                        self.fail("expected ValueError for %r" % bad)
+
+    def test_nonfinite_decimal_still_validated_at_k_zero_and_draws_zero(self):
+        # k=0 / draws=0 仍须先完成全部权重校验。
+        with self.assertRaises(ValueError):
+            weighted_sample_indices(["a"], [Decimal("sNaN")], 0, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_indices(["a"], [Decimal("-Infinity")], 0, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_many_indices(["a"], [Decimal("NaN")], 0, 0, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_many(["a"], [Decimal("-1")], 0, 0, 0)
+
+    # ------------------------------------------------------------------
+    # 非法类型: bool 及其他不支持的类型 -> TypeError
+    # ------------------------------------------------------------------
+    def test_unsupported_weight_types_raise_type_error(self):
+        for bad in (True, False, 1 + 0j, "1", None, [1], 3.14j):
+            with self.subTest(bad=bad):
+                with self.assertRaises(TypeError):
+                    weighted_sample_indices(
+                        ["a", "b"], [Decimal(1), bad], 1, 0
+                    )
+                with self.assertRaises(TypeError):
+                    weighted_sample_many_indices(
+                        ["a", "b"], [Decimal(1), bad], 1, 1, 0
+                    )
+        # 全 Decimal 合法输入不被误判。
+        weighted_sample_indices(["a"], [Decimal("1")], 1, 0)
+
+    def test_existing_structure_and_size_rules_unchanged_with_decimal(self):
+        with self.assertRaises(TypeError):
+            weighted_sample_indices("ab", [Decimal(1), Decimal(2)], 1, 0)
+        with self.assertRaises(TypeError):
+            weighted_sample_indices(["a"], [Decimal(1)], True, 0)
+        with self.assertRaises(TypeError):
+            weighted_sample_indices(["a"], [Decimal(1)], 1, object())
+        with self.assertRaises(ValueError):
+            weighted_sample_indices(["a", "b"], [Decimal(1)], 1, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_indices(["a"], [Decimal(1)], 2, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_indices(["a"], [Decimal(1)], -1, 0)
+
+    def test_draws_rules_unchanged_with_decimal(self):
+        for bad in (True, False, 1.0, "2", None, [2]):
+            with self.subTest(bad=bad):
+                with self.assertRaises(TypeError):
+                    weighted_sample_many_indices(
+                        ["a"], [Decimal(1)], 1, bad, 0
+                    )
+        with self.assertRaises(ValueError):
+            weighted_sample_many_indices(["a"], [Decimal(1)], 1, -1, 0)
+
+    # ------------------------------------------------------------------
+    # k=0 单轮空; draws=0 完成校验后空轮次集合; k=0 批量空轮次
+    # ------------------------------------------------------------------
+    def test_k_zero_and_draws_zero_shapes(self):
+        self.assertEqual(
+            weighted_sample(["a", "b"], [Decimal(1), Decimal(2)], 0, 0), []
+        )
+        self.assertEqual(
+            weighted_sample_indices(["a"], [Decimal("1E-9")], 0, 0), []
+        )
+        self.assertEqual(
+            weighted_sample_many_indices(["a"], [Decimal(1)], 1, 0, 0), []
+        )
+        self.assertEqual(
+            weighted_sample_many(["a"], [Decimal(1)], 1, 0, 0), []
+        )
+        self.assertEqual(
+            weighted_sample_many_indices(
+                ["a", "b"], [Decimal(0), Decimal(0)], 0, 3, 0
+            ),
+            [[], [], []],
+        )
+        self.assertEqual(
+            weighted_sample_many(
+                ["a", "b"], [Decimal(0), Decimal(0)], 0, 2, 0
+            ),
+            [[], []],
+        )
+
+    # ------------------------------------------------------------------
+    # 入参不变 / 既有 int/float/Fraction 结果与指标序列化保持不变
+    # ------------------------------------------------------------------
+    def test_inputs_not_mutated_with_decimal(self):
+        items = ["p", "q", "r"]
+        weights = [Decimal("1.5"), 2, Fraction(1, 3)]
+        items_snap = list(items)
+        weights_snap = [repr(w) for w in weights]
+        weighted_sample(items, weights, 2, 5)
+        weighted_sample_indices(items, weights, 2, -3)
+        weighted_sample_many(items, weights, 2, 3, 99)
+        weighted_sample_many_indices(items, weights, 2, 3, -3)
+        self.assertEqual(items, items_snap)
+        self.assertEqual([repr(w) for w in weights], weights_snap)
+
+    def test_existing_locked_sequences_and_serialization_unchanged(self):
+        # 既有 int / float / Fraction 锁定序列。
+        self.assertEqual(
+            weighted_sample(["red", "green", "blue"], [1, 3, 2], 2, 42),
+            ["green", "red"],
+        )
+        self.assertEqual(
+            weighted_sample(["p", "q"], [0.5, 1.5], 2, 3), ["p", "q"]
+        )
+        # 超大整数指标仍为精确十进制、键排序与紧凑格式不变。
+        self.assertEqual(
+            serialize_metrics({10 ** 100: 1, "名": [1, 2]}),
+            '{"1%s":1,"名":[1,2]}' % ("0" * 100),
+        )
 
 
 class SerializeMetricsTest(unittest.TestCase):
