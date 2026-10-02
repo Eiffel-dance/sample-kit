@@ -596,6 +596,138 @@ class SerializeMetricsTest(unittest.TestCase):
             '{"1%s":1}' % ("0" * 100),
         )
 
+    def test_integers_beyond_runtime_digit_limit_exact_decimal(self):
+        # CPython 3.11+ 的 str(int) 默认拒绝约 4300 位以上的转换。
+        # 序列化必须绕过该限制: 任意位数的 int 都给出精确十进制文本,
+        # 不使用科学计数法、浮点近似或截断。
+        import sys
+
+        if not hasattr(sys, "get_int_max_str_digits"):
+            self.skipTest("解释器没有可配置的整数转文本位数限制")
+        limit = sys.get_int_max_str_digits()
+        if limit == 0:
+            self.skipTest("整数转文本位数限制已关闭")
+        self.addCleanup(sys.set_int_max_str_digits, limit)
+
+        digits = limit + 1000
+        big = 10 ** (digits - 1) + 123456789
+        neg = -big
+
+        def unlimited_str(value):
+            sys.set_int_max_str_digits(0)
+            try:
+                return str(value)
+            finally:
+                sys.set_int_max_str_digits(limit)
+
+        # 顶层
+        self.assertEqual(serialize_metrics(big), unlimited_str(big))
+        self.assertEqual(serialize_metrics(neg), unlimited_str(neg))
+        self.assertEqual(serialize_metrics(0), "0")
+        # list / tuple / 任意深度的 dict
+        nested = {"a": [big, (neg,)], "b": {"c": {"d": big}}}
+        expected = (
+            '{"a":[%s,[%s]],"b":{"c":{"d":%s}}}'
+            % (unlimited_str(big), unlimited_str(neg), unlimited_str(big))
+        )
+        self.assertEqual(serialize_metrics(nested), expected)
+        # 纯十进制: 无指数、无小数点, 且整段输出逐字精确。
+        self.assertEqual(
+            serialize_metrics({"n": neg}),
+            '{"n":%s}' % unlimited_str(neg),
+        )
+        self.assertNotIn("e", serialize_metrics(big).lower())
+        self.assertNotIn(".", serialize_metrics(big))
+
+    def test_super_large_integer_key_beyond_digit_limit(self):
+        import sys
+
+        if not hasattr(sys, "get_int_max_str_digits"):
+            self.skipTest("解释器没有可配置的整数转文本位数限制")
+        limit = sys.get_int_max_str_digits()
+        if limit == 0:
+            self.skipTest("整数转文本位数限制已关闭")
+        self.addCleanup(sys.set_int_max_str_digits, limit)
+
+        big = 10 ** (limit + 7)
+        sys.set_int_max_str_digits(0)
+        try:
+            big_name = str(big)
+        finally:
+            sys.set_int_max_str_digits(limit)
+
+        # 精确成员名, 并按文本顺序 ("100.. < "2") 排列。
+        self.assertEqual(
+            serialize_metrics({2: "a", big: "b"}),
+            '{"%s":"b","2":"a"}' % big_name,
+        )
+        # 与同名字符串键冲突仍为 ValueError。
+        with self.assertRaises(ValueError):
+            serialize_metrics({big: 1, big_name: 2})
+
+    def test_serializes_when_digit_limit_lowered_to_minimum(self):
+        # 即使调用方把位数上限压到可配置的最低值, 分块转换仍须成功。
+        import sys
+
+        if not hasattr(sys, "set_int_max_str_digits"):
+            self.skipTest("解释器没有可配置的整数转文本位数限制")
+        old = sys.get_int_max_str_digits()
+        self.addCleanup(sys.set_int_max_str_digits, old)
+        sys.set_int_max_str_digits(640)
+
+        big = 10 ** 5000 - 1
+        sys.set_int_max_str_digits(0)
+        try:
+            reference = str(big)
+        finally:
+            sys.set_int_max_str_digits(640)
+
+        self.assertEqual(serialize_metrics(big), reference)
+        self.assertEqual(serialize_metrics([big, -big]),
+                         "[" + reference + ",-" + reference + "]")
+        self.assertEqual(
+            serialize_metrics({10 ** 1000: 1}),
+            '{"1%s":1}' % ("0" * 1000),
+        )
+
+    def test_bools_remain_json_booleans_next_to_huge_integers(self):
+        import sys
+
+        big = 10 ** 5000
+        text = serialize_metrics({"t": True, "f": False, "n": big})
+        self.assertIn('"t":true', text)
+        self.assertIn('"f":false', text)
+        self.assertIn('"n":1' + "0" * 5000, text)
+        self.assertEqual(serialize_metrics((True, False)), "[true,false]")
+
+    def test_integer_subclass_uses_exact_value_decimal(self):
+        # 与标准库编码器一致: int 子类自定义的 __str__/__repr__ 必须被忽略,
+        # 结果只取整数值的十进制; 超过位数上限时同样适用。
+        class WeirdInt(int):
+            def __str__(self):
+                return "not-a-number"
+
+            __repr__ = __str__
+
+        self.assertEqual(serialize_metrics(WeirdInt(42)), "42")
+        self.assertEqual(serialize_metrics({"x": WeirdInt(-7)}), '{"x":-7}')
+        self.assertEqual(serialize_metrics({WeirdInt(42): 1}), '{"42":1}')
+        big = WeirdInt(10 ** 5000)
+        self.assertEqual(serialize_metrics(big), "1" + "0" * 5000)
+
+    def test_error_classes_unchanged_alongside_huge_integers(self):
+        # 位数本身不是错误条件, 但同树中的其他非法值仍按原分类报错,
+        # 且在产出任何文本前完成校验。
+        big = 10 ** 5000
+        with self.assertRaises(TypeError):
+            serialize_metrics({"ok": big, "bad": {1, 2}})
+        with self.assertRaises(ValueError):
+            serialize_metrics({"ok": big, "bad": float("nan")})
+        with self.assertRaises(ValueError):
+            serialize_metrics([big, float("inf")])
+        with self.assertRaises(TypeError):
+            serialize_metrics([big, b"bytes"])
+
     def test_colliding_member_names_raise_value_error(self):
         # 不同原始键转换得到同一成员名 -> ValueError, 不得静默覆盖。
         for bad in (

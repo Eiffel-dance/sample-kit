@@ -21,6 +21,7 @@ import json
 import math
 import numbers
 import random
+import sys
 
 # 文本/字节类型虽然满足 Sequence 协议, 但不作为“元素序列”接受。
 _TEXT_TYPES = (str, bytes, bytearray)
@@ -33,6 +34,13 @@ _SEED_TYPES = (type(None), int, float, str, bytes, bytearray)
 # 以保留已锁定的公开序列; 超过该值则切换到纯整数精确路径。
 # 2**53 以内的整数均可被 IEEE-754 双精度精确表示。
 _EXACT_INTEGER_THRESHOLD = 1 << 53
+
+# 运行时整数<->文本转换的可配置位数上限(CPython 3.11+,
+# sys.set_int_max_str_digits); 无此 API 的解释器上为 None。
+_GET_INT_MAX_STR_DIGITS = getattr(sys, "get_int_max_str_digits", None)
+
+# 各位数上限对应的 10**(上限-1) 分块基数缓存, 避免重复构造大数。
+_INT_DECIMAL_CHUNK_BASES = {}
 
 
 def _is_length_determinable_sequence(value):
@@ -194,6 +202,101 @@ def weighted_sample(items, weights, k, seed=0):
 # 指标序列化
 # ---------------------------------------------------------------------------
 
+def _int_to_decimal_text(value):
+    """把任意位数的 int 精确转换成十进制文本, 全程不经过浮点。
+
+    CPython 3.11+ 的整数<->文本转换有可配置的位数上限
+    (sys.set_int_max_str_digits, 默认约 4300 位, 最低 640 位), 直接
+    str(value) 会在位数超限时抛 ValueError。这里按固定宽度的十进制块
+    从低位向上 divmod, 块宽取运行时当前上限减 1, 故每块的转换都严格
+    位于限制之内; 再把最高块的原文与其余补零到固定宽度的块拼接, 得到
+    与 str(value) 逐字一致的结果: 零值为 "0", 负数带一个前导 "-"。
+
+    运行时关闭限制(上限为 0)或解释器没有该限制时直接使用 str, 保持
+    与标准库一致的速度。
+    """
+    if _GET_INT_MAX_STR_DIGITS is None:
+        return str(int(value))
+    limit = _GET_INT_MAX_STR_DIGITS()
+    if limit == 0:
+        return str(int(value))
+    # 剥除 int 子类可能自定义的 __str__/__repr__: 标准库编码器对整数一律
+    # 使用 int.__repr__, 序列化结果只取决于整数值, 且必须是合法十进制。
+    value = int(value)
+    width = limit - 1
+    negative = value < 0
+    if negative:
+        value = -value
+    base = _INT_DECIMAL_CHUNK_BASES.get(width)
+    if base is None:
+        base = 10 ** width
+        _INT_DECIMAL_CHUNK_BASES[width] = base
+    if value < base:
+        # 常见路径: 位数本就在限制之内, 与 str 完全一致且零额外开销。
+        text = str(value)
+    else:
+        low_chunks = []
+        while value >= base:
+            # 单次 divmod 同时取商和余数, 避免两次大数除法。
+            value, remainder = divmod(value, base)
+            low_chunks.append(remainder)
+        parts = [str(value)]
+        zero_pad = "0%d" % width
+        for chunk in reversed(low_chunks):
+            parts.append(format(chunk, zero_pad))
+        text = "".join(parts)
+    return "-" + text if negative else text
+
+
+class _ExactIntegerEncoder(json.JSONEncoder):
+    """沿用标准库 JSON 编码器的全部规则, 只把整数数值文本替换为不受
+    位数限制的精确十进制转换。
+
+    通过 iterencode(..., _one_shot=False) 强制使用 Python 版
+    _make_iterencode, 并注入自定义 _intstr: 字符串转义、float 数值文本
+    (-0.0、指数写法)、None/bool、分隔符、键排序、tuple 按数组等行为均
+    与 json.dumps 完全一致。bool 在编码器内部先于 int 分派, 不会进入
+    _intstr, 因此仍输出 true/false。
+    """
+
+    def iterencode(self, o, _one_shot=False):
+        markers = {} if self.check_circular else None
+        # 模块级名字在有 C 加速时已被别名成 c_ 版本, 否则是纯 Python 版本,
+        # 与标准库 JSONEncoder.iterencode 的选择完全一致。
+        if self.ensure_ascii:
+            encoder = json.encoder.encode_basestring_ascii
+        else:
+            encoder = json.encoder.encode_basestring
+
+        def floatstr(o, allow_nan=self.allow_nan,
+                     _repr=float.__repr__, _inf=json.encoder.INFINITY,
+                     _neginf=-json.encoder.INFINITY):
+            if o != o:
+                text = "NaN"
+            elif o == _inf:
+                text = "Infinity"
+            elif o == _neginf:
+                text = "-Infinity"
+            else:
+                return _repr(o)
+            if not allow_nan:
+                raise ValueError(
+                    "Out of range float values are not JSON compliant: "
+                    + repr(o)
+                )
+            return text
+
+        if self.indent is None or isinstance(self.indent, str):
+            indent = self.indent
+        else:
+            indent = " " * self.indent
+        return json.encoder._make_iterencode(
+            markers, self.default, encoder, indent, floatstr,
+            self.key_separator, self.item_separator, self.sort_keys,
+            self.skipkeys, _one_shot, _intstr=_int_to_decimal_text,
+        )(o, 0)
+
+
 def _check_jsonable(value, on_path):
     """递归确认 value 可被 JSON 表示。
 
@@ -268,7 +371,9 @@ def _key_to_member_name(key):
     if isinstance(key, bool):  # 必须在 int 之前判断
         return "true" if key else "false"
     if isinstance(key, int):
-        return str(key)
+        # 不用 str(key): 整数位数超过运行时限制时会失败。分块转换对任意
+        # 位数都给出与 str 逐字一致的精确十进制成员名。
+        return _int_to_decimal_text(key)
     # 有限 float: 复用编码器对浮点值的数值文本规则。
     return json.dumps(key, allow_nan=False)
 
@@ -304,10 +409,11 @@ def serialize_metrics(metrics):
     # 按键名的 Unicode 文本升序排列 —— 同一数据内容无论构造顺序如何
     # 都得到同一份文本。
     normalized = _normalize_dict_keys(metrics)
-    return json.dumps(
-        normalized,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        allow_nan=False,
+    return "".join(
+        _ExactIntegerEncoder(
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).iterencode(normalized, _one_shot=False)
     )
