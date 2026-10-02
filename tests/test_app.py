@@ -2,7 +2,7 @@ import math
 import unittest
 
 import app
-from app import weighted_sample, serialize_metrics
+from app import weighted_sample, weighted_sample_indices, serialize_metrics
 
 
 class WeightedSampleDeterminismTest(unittest.TestCase):
@@ -136,6 +136,124 @@ class WeightedSampleValidationTest(unittest.TestCase):
             weighted_sample(["a"], [float("nan")], 0, 0)
         with self.assertRaises(TypeError):
             weighted_sample(["a"], [True], 0, 0)
+
+
+class WeightedSampleIndicesTest(unittest.TestCase):
+    def test_indices_round_trip_matches_weighted_sample(self):
+        cases = [
+            (["red", "green", "blue"], [1, 3, 2], 2, 42),
+            (["a", "b", "c"], [1, 3, 2], 3, 7),
+            (["a", "b", "c", "d"], [1, 2, 3, 4], 3, 99),
+            (["p", "q"], [0.5, 1.5], 2, 3),
+        ]
+        for items, weights, k, seed in cases:
+            with self.subTest(seed=seed):
+                idx = weighted_sample_indices(items, weights, k, seed)
+                self.assertEqual([items[i] for i in idx],
+                                 weighted_sample(items, weights, k, seed))
+
+    def test_duplicate_values_distinguished_by_position(self):
+        # 相等的值仍按位置独立处理: 三个位置全部可被选中一次。
+        idx = weighted_sample_indices([1, 1, 1], [1, 1, 1], 3, 123)
+        self.assertEqual(sorted(idx), [0, 1, 2])
+        self.assertEqual(len(idx), len(set(idx)))
+
+    def test_indices_are_zero_based_and_ordered_by_draw(self):
+        # 与锁定基线 ["green", "red"] 对应的原始位置。
+        self.assertEqual(
+            weighted_sample_indices(["red", "green", "blue"], [1, 3, 2], 2, 42),
+            [1, 0],
+        )
+        self.assertEqual(
+            weighted_sample_indices(["a", "b", "c"], [1, 3, 2], 3, 7),
+            [1, 0, 2],
+        )
+
+    def test_determinism_across_calls(self):
+        args = (["a", "b", "c", "d"], [1, 2, 3, 4], 3)
+        first = weighted_sample_indices(*args, seed=99)
+        for _ in range(5):
+            self.assertEqual(weighted_sample_indices(*args, seed=99), first)
+
+    def test_different_seed_may_differ(self):
+        args = (["a", "b", "c", "d"], [1, 2, 3, 4], 3)
+        seen = {tuple(weighted_sample_indices(*args, seed=s))
+                for s in range(8)}
+        self.assertGreater(len(seen), 1)
+
+    def test_zero_weight_position_never_returned(self):
+        for seed in range(50):
+            self.assertEqual(
+                weighted_sample_indices(["x", "y"], [0, 5], 1, seed), [1]
+            )
+
+    def test_all_zero_weights_fail_when_k_positive(self):
+        with self.assertRaises(ValueError):
+            weighted_sample_indices(["a", "b"], [0, 0], 1, 0)
+
+    def test_k_zero_empty_but_validated(self):
+        self.assertEqual(weighted_sample_indices([], [], 0, 0), [])
+        self.assertEqual(weighted_sample_indices(["a"], [0], 0, 0), [])
+        self.assertEqual(weighted_sample_indices(["a", "b"], [0, 0], 0, 0), [])
+        # k=0 仍须完成全部校验。
+        with self.assertRaises(ValueError):
+            weighted_sample_indices(["a"], [float("nan")], 0, 0)
+        with self.assertRaises(TypeError):
+            weighted_sample_indices(["a"], [True], 0, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_indices(["a"], [1], 2, 0)
+
+    def test_empty_inputs_only_succeed_at_k_zero(self):
+        self.assertEqual(weighted_sample_indices([], [], 0, 0), [])
+        with self.assertRaises(ValueError):
+            weighted_sample_indices([], [], 1, 0)
+
+    def test_inputs_not_mutated(self):
+        items = ["a", "b", "c"]
+        weights = [1, 2, 3]
+        items_snapshot = list(items)
+        weights_snapshot = list(weights)
+        weighted_sample_indices(items, weights, 2, 5)
+        self.assertEqual(items, items_snapshot)
+        self.assertEqual(weights, weights_snapshot)
+
+    def test_no_partial_indices_on_error(self):
+        # 抽样中途失败(正权重被耗尽)与前置校验失败都不得返回部分索引。
+        with self.assertRaises(ValueError):
+            weighted_sample_indices(["a", "b"], [1, 0], 2, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_indices(["a"], [0], 1, 0)
+        with self.assertRaises(TypeError):
+            weighted_sample_indices(["a", "b"], [1, "x"], 2, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_indices(["a", "b"], [1, -1], 1, 0)
+
+    def test_validation_rules_match_weighted_sample(self):
+        # 结构 / k / seed 类型
+        for bad_items in (iter(["a"]), {0: "a"}, {"a"}, "ab", 3, None):
+            with self.subTest(bad_items=bad_items):
+                with self.assertRaises(TypeError):
+                    weighted_sample_indices(bad_items, [1], 0, 0)
+        with self.assertRaises(TypeError):
+            weighted_sample_indices(["a"], [1], True, 0)
+        with self.assertRaises(TypeError):
+            weighted_sample_indices(["a"], [1], 1, object())
+        # 长度不一致 / k 越界
+        with self.assertRaises(ValueError):
+            weighted_sample_indices(["a", "b"], [1], 1, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_indices(["a"], [1], 2, 0)
+        # 权重类型与取值
+        with self.assertRaises(TypeError):
+            weighted_sample_indices(["a"], [1 + 0j], 1, 0)
+        for bad in (float("nan"), float("inf"), -1):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    weighted_sample_indices(["a"], [bad], 1, 0)
+
+    def test_public_from_app_module(self):
+        self.assertTrue(hasattr(app, "weighted_sample_indices"))
+        self.assertIs(app.weighted_sample_indices, weighted_sample_indices)
 
 
 class SerializeMetricsTest(unittest.TestCase):

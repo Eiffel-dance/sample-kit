@@ -3,6 +3,9 @@
 公开接口:
     weighted_sample(items, weights, k, seed=0)
         按元素位置的加权无放回抽样, 相同 (输入, seed) 给出完全一致的序列。
+    weighted_sample_indices(items, weights, k, seed=0)
+        与 weighted_sample 同规则, 返回按抽样先后排列的零基原始索引;
+        items 中相等的值仍按位置独立处理, 每个位置至多出现一次。
     serialize_metrics(metrics)
         将指标树稳定序列化为紧凑 JSON 文本, 任意精度整数保持精确十进制。
 
@@ -32,7 +35,13 @@ def _is_length_determinable_sequence(value):
     )
 
 
-def weighted_sample(items, weights, k, seed=0):
+def _validate_sample_inputs(items, weights, k, seed):
+    """weighted_sample / weighted_sample_indices 共用的全部前置校验。
+
+    校验顺序固定: 结构与类型 (TypeError) -> 长度与 k 范围 (ValueError)
+    -> 权重元素类型 (TypeError) -> 权重取值 (ValueError)。任何失败都在
+    抽样之前发生, 因此不会返回部分结果。
+    """
     # ---- 1. 结构与参数类型 (TypeError) ----
     if not _is_length_determinable_sequence(items):
         raise TypeError("items must be a length-determinable sequence")
@@ -65,9 +74,17 @@ def weighted_sample(items, weights, k, seed=0):
         if w < 0:
             raise ValueError("negative weight")
 
-    # 以下为确定性的加权无放回抽取; 复制到本地池, 绝不修改入参。
-    pool = [(item, w) for item, w in zip(items, weights)]
-    out = []
+    return n
+
+
+def _draw_indices(weights, k, seed, n):
+    """确定性加权无放回抽取的共享核心, 返回原始位置索引列表。
+
+    复制到本地 (索引, 权重) 池, 绝不修改入参; 每抽中一个位置就将其移出
+    池, 故每个原始位置至多出现一次, 零权重位置永远不会被选中。
+    """
+    pool = list(enumerate(weights))
+    indices = []
     rng = random.Random(seed)
     for _ in range(k):
         total = sum(w for _, w in pool)
@@ -76,13 +93,25 @@ def weighted_sample(items, weights, k, seed=0):
             raise ValueError("no positive weight")
         needle = rng.random() * total
         acc = 0
-        for i, (item, w) in enumerate(pool):
+        for i, (_, w) in enumerate(pool):
             acc += w
             if needle < acc:
-                out.append(item)
+                indices.append(pool[i][0])  # 记录原始位置
                 pool.pop(i)  # 同一位置不可再次被选
                 break
-    return out
+    return indices
+
+
+def weighted_sample_indices(items, weights, k, seed=0):
+    n = _validate_sample_inputs(items, weights, k, seed)
+    # k 为 0 时同样完成上面的全部校验, 仅不进行抽取。
+    return _draw_indices(weights, k, seed, n)
+
+
+def weighted_sample(items, weights, k, seed=0):
+    n = _validate_sample_inputs(items, weights, k, seed)
+    indices = _draw_indices(weights, k, seed, n)
+    return [items[i] for i in indices]
 
 
 # ---------------------------------------------------------------------------
