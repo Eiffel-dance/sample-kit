@@ -20,6 +20,13 @@
         字典键先统一转换为成员名文本(str 原样, None->null, bool->true/false,
         int->十进制, 有限 float->编码器数值文本), 再按 Unicode 文本升序排列;
         不同原始键转换得到同一成员名时抛 ValueError。
+        值额外支持 decimal.Decimal 与 fractions.Fraction(递归适用于顶层、
+        字典值、列表、元组及其嵌套): 有限 Decimal 按其自身十进制表示写成
+        不带引号的合法 JSON 数字, 保留精度、指数形式、尾随零与负零符号;
+        Fraction 固定写成 [分子, 正分母] 两个精确整数的 JSON 数组(整数
+        分数也保留两个元素), 分量不经过浮点。非有限 Decimal(NaN、sNaN、
+        正负无穷)抛 ValueError; Decimal / Fraction 仅可作为值, 作为字典
+        键按 TypeError 拒绝。
 
 权重接受非布尔的 int / float / fractions.Fraction / decimal.Decimal, 并允许
 四种类型混合使用; 每个权重按自身精确数值参与抽样。float 必须有限非负;
@@ -451,15 +458,48 @@ def _int_to_decimal_text(value):
     return "-" + text if negative else text
 
 
+def _decimal_to_json_number_text(value):
+    """把有限 Decimal 精确转换成合法 JSON 数值文本, 全程不经过浮点。
+
+    直接采用 Decimal 自身的十进制表示(str), 因此按值本身保留精度、指数
+    形式、尾随零与负零符号(如 "1.50"、"1E+2"、"-0.00"、"-1E-100");
+    有限 Decimal 的该文本始终是合法 JSON 数字(数字、小数点、E 指数语法
+    完全一致), 故输出不带引号, 由调用方直接拼入 JSON。超大指数(如
+    1E100000)同样原样保留, 不受双精度范围限制。剥除 Decimal 子类可能
+    自定义的 __str__/__repr__, 结果只取决于十进制值与系数表示。调用前
+    value 已经 _check_jsonable 确认为有限值(NaN/sNaN/正负无穷均已先抛
+    ValueError), 这里不做任何有序比较, decimal 的比较异常不会泄漏。
+    """
+    return str(Decimal(value))
+
+
+def _fraction_to_fixed_array_text(value):
+    """把 Fraction 精确写成含两个整数的 JSON 数组文本。
+
+    先放规范化后的分子, 再放恒为正的分母; 整数分数(如 Fraction(2, 1))
+    仍保留两个元素。两个分量都走 _int_to_decimal_text, 与超大整数一样
+    保持任意位数精确, 全程不经过浮点。剥除 Fraction 子类可能自定义的
+    __str__/__repr__, 结果只取决于规范化后的分子/分母。
+    """
+    fraction = Fraction(value)
+    return "[" + _int_to_decimal_text(fraction.numerator) + "," \
+        + _int_to_decimal_text(fraction.denominator) + "]"
+
+
 class _ExactIntegerEncoder(json.JSONEncoder):
-    """沿用标准库 JSON 编码器的全部规则, 只把整数数值文本替换为不受
-    位数限制的精确十进制转换。
+    """沿用标准库 JSON 编码器的全部规则, 只替换精确数值的文本生成。
 
     通过 iterencode(..., _one_shot=False) 强制使用 Python 版
-    _make_iterencode, 并注入自定义 _intstr: 字符串转义、float 数值文本
-    (-0.0、指数写法)、None/bool、分隔符、键排序、tuple 按数组等行为均
-    与 json.dumps 完全一致。bool 在编码器内部先于 int 分派, 不会进入
-    _intstr, 因此仍输出 true/false。
+    _make_iterencode, 并注入自定义 _intstr / _decimalstr / _fractionstr:
+    字符串转义、float 数值文本(-0.0、指数写法)、None/bool、分隔符、键
+    排序、tuple 按数组等行为均与 json.dumps 完全一致。bool 在编码器内部
+    先于 int 分派, 不会进入 _intstr, 因此仍输出 true/false。
+
+    与标准库 _make_iterencode 相比, 仅在三个标量分派点(int/float 之后)
+    各加一条 Decimal / Fraction 分支: 有限 Decimal 输出不带引号的合法
+    JSON 数字文本; Fraction 固定输出 [分子, 正分母] 两个精确整数。字典键
+    分派不增加这两个分支 —— Decimal / Fraction 作为键已在校验阶段按
+    TypeError 拒绝, 编码器收到的键仍只有 str/int/float/bool/None。
     """
 
     def iterencode(self, o, _one_shot=False):
@@ -493,19 +533,245 @@ class _ExactIntegerEncoder(json.JSONEncoder):
             indent = self.indent
         else:
             indent = " " * self.indent
-        return json.encoder._make_iterencode(
+        return _build_exact_iterencode(
             markers, self.default, encoder, indent, floatstr,
             self.key_separator, self.item_separator, self.sort_keys,
-            self.skipkeys, _one_shot, _intstr=_int_to_decimal_text,
+            self.skipkeys, _one_shot,
+            _int_to_decimal_text,
+            _decimal_to_json_number_text,
+            _fraction_to_fixed_array_text,
         )(o, 0)
+
+
+# 与标准库 _make_iterencode 平行的工厂: 每次 iterencode 都用当前编码器的
+# 配置新建一组递归闭包(markers/分隔符/排序标志均为本次调用私有)。
+def _build_exact_iterencode(markers, default, encoder, indent, floatstr,
+                            key_separator, item_separator, sort_keys,
+                            skipkeys, one_shot, intstr, decimalstr,
+                            fractionstr):
+    """构造识别 Decimal / Fraction 标量的递归 JSON 编码闭包。
+
+    结构逐段复制标准库 _make_iterencode 的 Python 实现, 仅在列表元素、
+    字典值、顶层标量三处的 isinstance(value, float) 分支之后追加 Decimal
+    / Fraction 分派; 字典键分派保持原样(只认 str/int/float/bool/None)。
+    这样紧凑分隔符、键排序、tuple 按数组、循环引用标记、add_note 上下文
+    等可观察行为与标准库完全一致, 只是新增两类精确数值。
+    """
+    ValueError_ = ValueError
+    dict_ = dict
+    id_ = id
+    isinstance_ = isinstance
+    list_ = list
+    tuple_ = tuple
+
+    def _iterencode_list(lst, _current_indent_level):
+        if not lst:
+            yield "[]"
+            return
+        if markers is not None:
+            markerid = id_(lst)
+            if markerid in markers:
+                raise ValueError_("Circular reference detected")
+            markers[markerid] = lst
+        buf = "["
+        if indent is not None:
+            _current_indent_level += 1
+            newline_indent = "\n" + indent * _current_indent_level
+            separator = item_separator + newline_indent
+            buf += newline_indent
+        else:
+            newline_indent = None
+            separator = item_separator
+        for i, value in enumerate(lst):
+            if i:
+                buf = separator
+            try:
+                if isinstance_(value, str):
+                    yield buf + encoder(value)
+                elif value is None:
+                    yield buf + "null"
+                elif value is True:
+                    yield buf + "true"
+                elif value is False:
+                    yield buf + "false"
+                elif isinstance_(value, int):
+                    # int/float 子类可覆盖 __repr__, 但仍按数值编码;
+                    # 同理 Decimal/Fraction 子类也剥掉自定义文本方法。
+                    yield buf + intstr(value)
+                elif isinstance_(value, float):
+                    yield buf + floatstr(value)
+                elif isinstance_(value, Decimal):
+                    yield buf + decimalstr(value)
+                elif isinstance_(value, Fraction):
+                    yield buf + fractionstr(value)
+                else:
+                    yield buf
+                    if isinstance_(value, (list_, tuple_)):
+                        chunks = _iterencode_list(value, _current_indent_level)
+                    elif isinstance_(value, dict_):
+                        chunks = _iterencode_dict(value, _current_indent_level)
+                    else:
+                        chunks = _iterencode(value, _current_indent_level)
+                    yield from chunks
+            except GeneratorExit:
+                raise
+            except BaseException as exc:
+                exc.add_note(
+                    "when serializing %s item %d" % (type(lst).__name__, i)
+                )
+                raise
+        if newline_indent is not None:
+            _current_indent_level -= 1
+            yield "\n" + indent * _current_indent_level
+        yield "]"
+        if markers is not None:
+            del markers[markerid]
+
+    def _iterencode_dict(dct, _current_indent_level):
+        if not dct:
+            yield "{}"
+            return
+        if markers is not None:
+            markerid = id_(dct)
+            if markerid in markers:
+                raise ValueError_("Circular reference detected")
+            markers[markerid] = dct
+        yield "{"
+        if indent is not None:
+            _current_indent_level += 1
+            newline_indent = "\n" + indent * _current_indent_level
+            item_sep = item_separator + newline_indent
+        else:
+            newline_indent = None
+            item_sep = item_separator
+        first = True
+        if sort_keys:
+            items = sorted(dct.items())
+        else:
+            items = dct.items()
+        for key, value in items:
+            # 键分派与标准库完全一致: 校验阶段已把 Decimal / Fraction 键
+            # 按 TypeError 拒绝, 这里不需要也不能把它们转成成员名。
+            if isinstance_(key, str):
+                pass
+            elif isinstance_(key, float):
+                key = floatstr(key)
+            elif key is True:
+                key = "true"
+            elif key is False:
+                key = "false"
+            elif key is None:
+                key = "null"
+            elif isinstance_(key, int):
+                key = intstr(key)
+            elif skipkeys:
+                continue
+            else:
+                raise TypeError(
+                    "keys must be str, int, float, bool or None, "
+                    "not %s" % key.__class__.__name__
+                )
+            if first:
+                first = False
+                if newline_indent is not None:
+                    yield newline_indent
+            else:
+                yield item_sep
+            yield encoder(key)
+            yield key_separator
+            try:
+                if isinstance_(value, str):
+                    yield encoder(value)
+                elif value is None:
+                    yield "null"
+                elif value is True:
+                    yield "true"
+                elif value is False:
+                    yield "false"
+                elif isinstance_(value, int):
+                    yield intstr(value)
+                elif isinstance_(value, float):
+                    yield floatstr(value)
+                elif isinstance_(value, Decimal):
+                    yield decimalstr(value)
+                elif isinstance_(value, Fraction):
+                    yield fractionstr(value)
+                else:
+                    if isinstance_(value, (list_, tuple_)):
+                        chunks = _iterencode_list(value, _current_indent_level)
+                    elif isinstance_(value, dict_):
+                        chunks = _iterencode_dict(value, _current_indent_level)
+                    else:
+                        chunks = _iterencode(value, _current_indent_level)
+                    yield from chunks
+            except GeneratorExit:
+                raise
+            except BaseException as exc:
+                exc.add_note(
+                    "when serializing %s item %r" % (type(dct).__name__, key)
+                )
+                raise
+        if not first and newline_indent is not None:
+            _current_indent_level -= 1
+            yield "\n" + indent * _current_indent_level
+        yield "}"
+        if markers is not None:
+            del markers[markerid]
+
+    def _iterencode(o, _current_indent_level):
+        if isinstance_(o, str):
+            yield encoder(o)
+        elif o is None:
+            yield "null"
+        elif o is True:
+            yield "true"
+        elif o is False:
+            yield "false"
+        elif isinstance_(o, int):
+            yield intstr(o)
+        elif isinstance_(o, float):
+            yield floatstr(o)
+        elif isinstance_(o, Decimal):
+            yield decimalstr(o)
+        elif isinstance_(o, Fraction):
+            yield fractionstr(o)
+        elif isinstance_(o, (list_, tuple_)):
+            yield from _iterencode_list(o, _current_indent_level)
+        elif isinstance_(o, dict_):
+            yield from _iterencode_dict(o, _current_indent_level)
+        else:
+            if markers is not None:
+                markerid = id_(o)
+                if markerid in markers:
+                    raise ValueError_("Circular reference detected")
+                markers[markerid] = o
+            newobj = default(o)
+            try:
+                yield from _iterencode(newobj, _current_indent_level)
+            except GeneratorExit:
+                raise
+            except BaseException as exc:
+                exc.add_note(
+                    "when serializing %s object" % type(o).__name__
+                )
+                raise
+            if markers is not None:
+                del markers[markerid]
+
+    return _iterencode
 
 
 def _check_jsonable(value, on_path):
     """递归确认 value 可被 JSON 表示。
 
     - 任意大小的 int 原样接受(由 json 以精确十进制输出, 不经过浮点);
-    - NaN / Infinity 抛 ValueError;
-    - 集合、循环引用及其他不可表示的值抛 TypeError。
+    - 有限 Decimal 接受(按自身十进制表示输出为裸 JSON 数字); NaN、sNaN、
+      正负无穷一律抛 ValueError, 且先于任何有序比较判定, decimal 的比较
+      异常不会泄漏;
+    - Fraction 原样接受(有理数不可能为 NaN/无穷), 输出为 [分子, 正分母];
+    - NaN / Infinity float 抛 ValueError;
+    - 集合、循环引用及其他不可表示的值抛 TypeError; Decimal / Fraction
+      仅可作为值, 作为字典键时按 TypeError 拒绝。
     on_path 记录当前祖先容器的 id, 用于检出循环引用(兄弟节点共享同一
     对象不属于循环, 不做标记)。
     """
@@ -518,6 +784,19 @@ def _check_jsonable(value, on_path):
             raise ValueError("NaN and Infinity are not JSON serializable")
         return
     if isinstance(value, str):
+        return
+    if isinstance(value, Decimal):
+        # 必须在任何有序比较之前判定: NaN(含 sNaN)与 Decimal 的有序比较
+        # 会抛 decimal.InvalidOperation, 该异常绝不能泄漏给调用方。
+        # is_nan() 同时覆盖静默 NaN 与 sNaN; is_infinite() 覆盖正负无穷。
+        # 判定不经过浮点, 超大指数也安全。
+        if value.is_nan():
+            raise ValueError("Decimal NaN is not JSON serializable")
+        if value.is_infinite():
+            raise ValueError("Decimal Infinity is not JSON serializable")
+        return
+    if isinstance(value, Fraction):
+        # Fraction 是精确有理数, 规范化后分母恒为正, 不可能为 NaN/无穷。
         return
 
     if isinstance(value, (list, tuple)):
