@@ -550,5 +550,102 @@ class SerializeMetricsTest(unittest.TestCase):
             serialize_metrics({"ok": 1, "bad": [float("nan")]})
 
 
+class SerializeMetricsHeterogeneousKeysTest(unittest.TestCase):
+    """异构字典键: 先转换为成员名文本, 再按 Unicode 文本升序排列。"""
+
+    def test_mixed_str_and_int_keys_deterministic(self):
+        # 转换先于编码完成, 混合键类型有确定结果。
+        self.assertEqual(
+            serialize_metrics({1: "a", "b": 2}), '{"1":"a","b":2}'
+        )
+
+    def test_insertion_order_does_not_matter(self):
+        # 同一字典只交换插入顺序, 输出逐字相同。
+        forward = {1: "x", "b": 2, None: 3, "a": 4}
+        backward = {"a": 4, None: 3, "b": 2, 1: "x"}
+        self.assertEqual(
+            serialize_metrics(forward), serialize_metrics(backward)
+        )
+        self.assertEqual(
+            serialize_metrics(forward), '{"1":"x","a":4,"b":2,"null":3}'
+        )
+
+    def test_key_conversion_rules(self):
+        # None -> null, bool -> true/false, int -> 十进制, float -> 编码器文本。
+        self.assertEqual(serialize_metrics({None: 1}), '{"null":1}')
+        self.assertEqual(serialize_metrics({True: 1, False: 2}),
+                         '{"false":2,"true":1}')
+        self.assertEqual(serialize_metrics({-7: 1}), '{"-7":1}')
+        self.assertEqual(serialize_metrics({1.5: 1}), '{"1.5":1}')
+
+    def test_float_key_negative_zero_and_exponent(self):
+        # 保留负零与指数表示的既有编码器规则。
+        self.assertEqual(serialize_metrics({-0.0: 1}), '{"-0.0":1}')
+        self.assertEqual(serialize_metrics({1e300: 1}), '{"1e+300":1}')
+
+    def test_huge_int_key_exact_decimal(self):
+        huge = 10 ** 100
+        text = serialize_metrics({huge: 1})
+        self.assertEqual(text, '{"1' + "0" * 100 + '":1}')
+
+    def test_member_names_sorted_as_unicode_text(self):
+        # 按转换后的成员名文本排序, 不是按原始键值: "10" < "9"。
+        self.assertEqual(
+            serialize_metrics({9: "a", 10: "b"}), '{"10":"b","9":"a"}'
+        )
+
+    def test_nested_dicts_follow_same_rule(self):
+        data = {"outer": {2: "x", "a": [{None: 0, "z": 1}]}, 1: "y"}
+        self.assertEqual(
+            serialize_metrics(data),
+            '{"1":"y","outer":{"2":"x","a":[{"null":0,"z":1}]}}',
+        )
+
+    def test_colliding_member_names_raise_value_error(self):
+        # 不同原始键转换后重名 -> ValueError, 不静默覆盖。
+        for bad in (
+            {1: "a", "1": "b"},
+            {None: 1, "null": 2},
+            {True: 1, "true": 2},
+            {False: 1, "false": 2},
+            {1.5: 1, "1.5": 2},
+            {10 ** 100: 1, str(10 ** 100): 2},
+        ):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    serialize_metrics(bad)
+
+    def test_collision_in_nested_dict_raises_before_output(self):
+        with self.assertRaises(ValueError):
+            serialize_metrics({"ok": 1, "deep": [{2: "a", "2": "b"}]})
+
+    def test_non_finite_float_key_raises_value_error(self):
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    serialize_metrics({bad: 1})
+
+    def test_illegal_key_types_raise_type_error(self):
+        for bad in ((1, 2), b"k", frozenset([1]), object()):
+            with self.subTest(bad=bad):
+                with self.assertRaises(TypeError):
+                    serialize_metrics({bad: 1})
+
+    def test_input_not_mutated(self):
+        inner = {2: "x", "a": 1}
+        data = {1: inner, "b": [inner]}
+        inner_snapshot = dict(inner)
+        serialize_metrics(data)
+        self.assertEqual(inner, inner_snapshot)
+        self.assertEqual(list(data.keys()), [1, "b"])
+
+    def test_all_string_keys_unchanged(self):
+        # 既有全字符串键样例逐字不变。
+        self.assertEqual(
+            serialize_metrics({"b": 1, "a": {"z": 2, "y": 3}}),
+            '{"a":{"y":3,"z":2},"b":1}',
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

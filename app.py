@@ -8,6 +8,9 @@
         items 中相等的值仍按不同位置独立处理。
     serialize_metrics(metrics)
         将指标树稳定序列化为紧凑 JSON 文本, 任意精度整数保持精确十进制。
+        字典键先统一转换为成员名文本(str 原样, None/bool/int/float 按
+        JSON 文本规则), 再按 Unicode 文本升序排列; 因此混合键类型与
+        插入顺序均不影响输出, 转换后重名的键以 ValueError 拒绝。
 
 两个函数都在产生任何结果/文本之前完成全部校验, 非法输入以稳定的
 TypeError / ValueError 告知调用方, 且不会修改入参。
@@ -250,12 +253,63 @@ def _check_jsonable(value, on_path):
     raise TypeError("object is not JSON serializable: %s" % type(value).__name__)
 
 
+def _json_member_name(key):
+    """把合法字典键转换为 JSON 成员名文本(在最终编码之前完成)。
+
+    - str 原样保留;
+    - None -> "null", True/False -> "true"/"false";
+    - int -> 不带前导零的十进制文本(任意大小, 含负号);
+    - 有限 float -> 当前 JSON 编码器产生的数值文本, 保留负零("-0.0")
+      与指数表示("1e+300")的既有规则。
+    调用前必须先通过 _check_jsonable, 因此这里不会遇到非法键类型或
+    非有限浮点。
+    """
+    if isinstance(key, str):
+        return key
+    if key is None:
+        return "null"
+    if isinstance(key, bool):  # 必须在 int 之前; bool 是 int 的子类
+        return "true" if key else "false"
+    if isinstance(key, int):
+        return str(key)
+    # 有限浮点: 复用 JSON 编码器对同一数值产生的文本。
+    return json.dumps(key, allow_nan=False)
+
+
+def _normalize_for_json(value):
+    """递归地把每一层字典的键转换为成员名文本, 返回仅含字符串键的新结构。
+
+    不修改入参(全部构造新容器); 同一层内两个不同的原始键转换出相同的
+    成员名时抛 ValueError, 绝不静默覆盖或依赖插入顺序。调用前必须先
+    通过 _check_jsonable, 因此这里不再处理非法类型、非有限浮点与循环
+    引用; 非循环的共享子对象会被重复展开, 与既有编码行为一致。
+    """
+    if isinstance(value, dict):
+        normalized = {}
+        for key, element in value.items():
+            name = _json_member_name(key)
+            if name in normalized:
+                raise ValueError(
+                    "distinct dict keys map to the same JSON member name: "
+                    "%r" % (name,)
+                )
+            normalized[name] = _normalize_for_json(element)
+        return normalized
+    if isinstance(value, (list, tuple)):
+        return [_normalize_for_json(element) for element in value]
+    return value
+
+
 def serialize_metrics(metrics):
     # 先做完整校验: 把循环引用(json 原生报 ValueError)等统一成 TypeError,
     # 保证任何非法输入都不会产出截断或近似文本。
     _check_jsonable(metrics, set())
+    # 再把全部字典键统一转换为成员名文本并做冲突预检: 转换先于最终编码
+    # 完成, 因此混合键类型与插入顺序都不影响结果; 任一步失败都不会产生
+    # 任何返回文本。
+    normalized = _normalize_for_json(metrics)
     return json.dumps(
-        metrics,
+        normalized,
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,
