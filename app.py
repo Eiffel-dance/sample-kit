@@ -26,6 +26,11 @@ _TEXT_TYPES = (str, bytes, bytearray)
 # str, bytes, bytearray。
 _SEED_TYPES = (type(None), int, float, str, bytes, bytearray)
 
+# 累计整数权重在该值(含)以内时, 走与基线一致的浮点 rng.random() 路径,
+# 以保留已锁定的公开序列; 超过该值则切换到纯整数精确路径。
+# 2**53 以内的整数均可被 IEEE-754 双精度精确表示。
+_EXACT_INTEGER_THRESHOLD = 1 << 53
+
 
 def _is_length_determinable_sequence(value):
     """items / weights 必须是长度可确定的非文本序列。"""
@@ -66,6 +71,13 @@ def _validate_sample_inputs(items, weights, k, seed):
 
     # ---- 4. 权重取值: NaN / 无穷 / 负数 (ValueError) ----
     for index, w in enumerate(weights):
+        # 整数(布尔已在第 3 步拒绝)既不可能是 NaN 也不可能是无穷; 直接判断
+        # 符号, 避免 math.isnan/isinf 把超大整数(如 10**400)转成浮点而抛
+        # OverflowError —— 任意精度整数权重始终是合法的有限权重。
+        if isinstance(w, int):
+            if w < 0:
+                raise ValueError("negative weight")
+            continue
         if math.isnan(w):
             raise ValueError("weight at index %d must not be NaN" % index)
         if math.isinf(w):
@@ -76,29 +88,98 @@ def _validate_sample_inputs(items, weights, k, seed):
     return n
 
 
-def weighted_sample_indices(items, weights, k, seed=0):
-    n = _validate_sample_inputs(items, weights, k, seed)
+def _sample_indices_float(pool, weights, k, rng):
+    """基于 rng.random() 的经典浮点加权无放回抽样(基线算法)。
 
-    # 以下为确定性的加权无放回抽取; 复制到本地池, 绝不修改入参。
-    pool = list(range(n))
-    pool_weights = list(weights)
+    仅用于非整数权重, 或全部为整数且每轮累计权重都能被双精度精确表示
+    的情形; 这样基线已锁定的公开序列完全不变。
+    """
     indices = []
-    rng = random.Random(seed)
     for _ in range(k):
-        total = sum(pool_weights)
+        total = sum(weights)
         if total <= 0:
             # 仍有抽取请求, 但剩余权重没有正值。
             raise ValueError("no positive weight")
         needle = rng.random() * total
         acc = 0
-        for i, w in enumerate(pool_weights):
+        for i, w in enumerate(weights):
             acc += w
             if needle < acc:
                 indices.append(pool[i])  # 记录原始零基位置
                 pool.pop(i)
-                pool_weights.pop(i)  # 同一位置不可再次被选
+                weights.pop(i)  # 同一位置不可再次被选
                 break
     return indices
+
+
+def _sample_indices_exact_integer(pool, weights, k, rng):
+    """纯整数加权无放回抽样, 全程不经过浮点。
+
+    每一轮在剩余位置中, 以各自整数权重为比例均匀抽取: 取区间
+    [0, total) 内与平台无关的均匀整数 needle, 再按累计权重定位。
+    needle 由 rng.getrandbits 拒绝采样产生 —— Mersenne Twister 的整数
+    输出只取决于 seed, 与字长 / 浮点实现无关。拒绝落在 [total, 2**bits)
+    的样本, 保证严格均匀, 微小正权重(哪怕相对 total 只有 10**-100)也
+    保持精确的选中比例, 既不会被舍入吞掉, 零权重也永远不会被选中。
+    """
+    indices = []
+    for _ in range(k):
+        total = sum(weights)
+        if total <= 0:
+            # 仍有抽取请求, 但剩余权重没有正值。
+            raise ValueError("no positive weight")
+        bits = (total - 1).bit_length()
+        modulus = 1 << bits
+        # total 恰为 2 的幂时 [0, total) 恰好铺满 bits 位, 无需拒绝采样。
+        if total == modulus:
+            needle = rng.getrandbits(bits)
+        else:
+            # 最大的 modulus 的整数倍上界; needle 落在 [limit, modulus)
+            # 时拒绝重抽, 避免取模引入的偏差。
+            limit = modulus - (modulus % total)
+            while True:
+                needle = rng.getrandbits(bits)
+                if needle < limit:
+                    break
+            needle %= total
+        acc = 0
+        for i, w in enumerate(weights):
+            acc += w
+            if needle < acc:
+                indices.append(pool[i])  # 记录原始零基位置
+                pool.pop(i)
+                weights.pop(i)  # 同一位置不可再次被选
+                break
+    return indices
+
+
+def weighted_sample_indices(items, weights, k, seed=0):
+    n = _validate_sample_inputs(items, weights, k, seed)
+
+    # 复制到本地池, 绝不修改入参。
+    pool = list(range(n))
+    pool_weights = list(weights)
+    rng = random.Random(seed)
+
+    # 全部权重均为 int (bool 已在类型校验中拒绝) 时, 以全量累计权重决定
+    # 路径: 累计 > 2**53, 或累计无法转换为有限浮点(如 10**400,
+    # float() 抛 OverflowError)时走纯整数路径, 杜绝浮点溢出与舍入。
+    # 全量累计 <= 2**53 时, 任意子集累计同样 <= 2**53, 浮点路径逐轮
+    # 精确可表示, 基线锁定的公开序列因此保持不变。
+    use_exact = False
+    if k > 0 and all(isinstance(w, int) for w in pool_weights):
+        total = sum(pool_weights)
+        if total > _EXACT_INTEGER_THRESHOLD:
+            use_exact = True
+        else:
+            try:
+                float(total)
+            except OverflowError:
+                use_exact = True
+
+    if use_exact:
+        return _sample_indices_exact_integer(pool, pool_weights, k, rng)
+    return _sample_indices_float(pool, pool_weights, k, rng)
 
 
 def weighted_sample(items, weights, k, seed=0):

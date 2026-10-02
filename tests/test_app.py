@@ -264,6 +264,215 @@ class WeightedSampleValidationTest(unittest.TestCase):
             weighted_sample(["a"], [True], 0, 0)
 
 
+class ExactIntegerSamplingTest(unittest.TestCase):
+    """累计权重超过 2**53 / 无法转有限浮点时的纯整数精确路径。"""
+
+    HUGE = 10 ** 100
+
+    def test_huge_weights_deterministic_and_valid(self):
+        items = ["a", "b", "c", "d"]
+        weights = [self.HUGE, self.HUGE * 3, 0, 1]
+        for k in (1, 2, 3):
+            for seed in range(40):
+                idx = weighted_sample_indices(items, weights, k, seed)
+                # 零基、范围内、无重复、数量正确。
+                self.assertEqual(len(idx), k)
+                self.assertEqual(len(set(idx)), k)
+                self.assertTrue(all(0 <= i < 4 for i in idx))
+                # 零权重位置 (2) 永远不出现; 有正权重的位置才可能出现。
+                self.assertNotIn(2, idx)
+                # 相同 seed + 输入唯一确定。
+                self.assertEqual(
+                    idx, weighted_sample_indices(items, weights, k, seed)
+                )
+                # values 入口与 indices 入口逐项对应。
+                self.assertEqual(
+                    weighted_sample(items, weights, k, seed),
+                    [items[i] for i in idx],
+                )
+
+    def test_tiny_positive_weight_never_swallowed(self):
+        # 极端比例: 1 对 10**100。若经浮点, 微小方会被舍入吞掉; 精确路径
+        # 下它仍以精确比例 1/(10**100+1) 可被选中 —— 用穷举式 RNG 钩子
+        # 直接验证第一轮取 needle=0 时必定落到微小权重位置。
+        import app as _app
+
+        class _ScriptedRNG:
+            def __init__(self, needles):
+                self._needles = list(needles)
+
+            def getrandbits(self, bits):
+                return self._needles.pop(0)
+
+        items = ["huge", "tiny", "zero"]
+        weights = [self.HUGE, 1, 0]
+        # 第一轮 total = 10**100 + 1, needle = 10**100 (=total-1) -> 位置 1。
+        # 第二轮剩余 total = 10**100, needle=0 -> 位置 0。
+        chosen = _app._sample_indices_exact_integer(
+            list(range(3)), list(weights), 2, _ScriptedRNG([10 ** 100, 0])
+        )
+        self.assertEqual(chosen, [1, 0])
+
+    def test_tiny_weight_has_exact_probability_via_counts(self):
+        # 概率虽小, 但通过把微小权重放大到可统计而总量仍超 2**53 的比例
+        # 检验比例正确性: 两位置比例严格为 1 : 2。
+        base = 2 ** 52 + 7
+        weights = [base, 2 * base]
+        counts = [0, 0]
+        trials = 4000
+        for seed in range(trials):
+            i = weighted_sample_indices(["a", "b"], weights, 1, seed)[0]
+            counts[i] += 1
+        # 期望约 1/3 与 2/3, 留宽裕量。
+        self.assertAlmostEqual(counts[0] / trials, 1 / 3, delta=0.03)
+        self.assertAlmostEqual(counts[1] / trials, 2 / 3, delta=0.03)
+
+    def test_extreme_ratio_tiny_can_win(self):
+        # 比例 10**100 : 1, 借脚本化 RNG 令 needle 落入最后一个单位区间,
+        # 证明微小权重不会被吞且定位边界精确。
+        import app as _app
+
+        class _ScriptedRNG:
+            def getrandbits(self, bits):
+                # 直接返回 total-1 (在 [0,2**bits) 内, 必被接受)。
+                return (10 ** 100 + 1) - 1
+
+        chosen = _app._sample_indices_exact_integer(
+            list(range(2)), [10 ** 100, 1], 1, _ScriptedRNG()
+        )
+        self.assertEqual(chosen, [1])
+
+    def test_multi_round_proportions_change_after_removal(self):
+        # 多轮抽取: 每轮只在尚未选中的位置中抽取, 抽走后按剩余权重定位。
+        import app as _app
+
+        class _ScriptedRNG:
+            def __init__(self, needles):
+                self._needles = iter(needles)
+
+            def getrandbits(self, bits):
+                return next(self._needles)
+
+        # 第一轮 total=10**100+15: needle=10**100+10 落入权重 5 的位置(2)。
+        # 抽走后剩余 [10**100, 10, 0]: needle=10**100 落入权重 10 的位置(1)。
+        pool = [0, 1, 2, 3]
+        weights = [10 ** 100, 10, 5, 0]
+        chosen = _app._sample_indices_exact_integer(
+            pool, weights, 2, _ScriptedRNG([10 ** 100 + 10, 10 ** 100])
+        )
+        self.assertEqual(chosen, [2, 1])
+
+    def test_rejection_is_uniform_and_unbiased(self):
+        # 拒绝采样边界: total=3, bits=2, modulus=4, limit=3; needle=3 必须
+        # 被拒绝并重抽, 否则取模会把位置 0 的概率抬高。
+        import app as _app
+
+        class _ScriptedRNG:
+            def __init__(self):
+                self.stream = iter([3, 3, 2])  # 拒绝 3,3; 接受 2 -> 位置2
+
+            def getrandbits(self, bits):
+                return next(self.stream)
+
+        chosen = _app._sample_indices_exact_integer(
+            list(range(3)), [1, 1, 1], 1, _ScriptedRNG()
+        )
+        self.assertEqual(chosen, [2])
+
+    def test_power_of_two_total_no_rejection(self):
+        import app as _app
+
+        class _ScriptedRNG:
+            def getrandbits(self, bits):
+                assert bits == 4
+                return 15
+
+        chosen = _app._sample_indices_exact_integer(
+            list(range(2)), [8, 8], 1, _ScriptedRNG()
+        )
+        self.assertEqual(chosen, [1])
+
+    def test_no_positive_weight_raises_value_error_exact(self):
+        with self.assertRaises(ValueError):
+            weighted_sample_indices(["a", "b"], [10 ** 100, 0], 2, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_indices(["a"], [0], 1, 0)
+
+    def test_all_zero_total_with_huge_scale_validated(self):
+        with self.assertRaises(ValueError):
+            weighted_sample_indices(
+                ["a", "b", "c"], [0, 0, 0], 1, seed=7
+            )
+
+    def test_exact_path_inputs_not_mutated(self):
+        items = ["a", "b", "c"]
+        weights = [10 ** 100, 10 ** 99, 1]
+        items_snap = list(items)
+        weights_snap = list(weights)
+        weighted_sample(items, weights, 3, 11)
+        self.assertEqual(items, items_snap)
+        self.assertEqual(weights, weights_snap)
+
+    def test_threshold_boundary_keeps_baseline(self):
+        # 全量累计恰为 2**53: 仍走浮点路径, 与基线逐序列一致。
+        w = [2 ** 53 - 1, 1]
+        self.assertEqual(sum(w), 2 ** 53)
+        locked = {
+            s: weighted_sample_indices(["a", "b"], w, 2, s) for s in range(20)
+        }
+        import app as _app
+
+        for s in range(20):
+            pool, pw = [0, 1], list(w)
+            self.assertEqual(
+                _app._sample_indices_float(pool, pw, 2, __import__("random").Random(s)),
+                locked[s],
+            )
+
+    def test_above_threshold_uses_exact_and_differs_from_naive_float(self):
+        # 累计 = 2**53 + 1: 浮点无法精确表示, 必须走整数路径且仍确定。
+        w = [2 ** 53, 1]
+        idx = weighted_sample_indices(["a", "b"], w, 1, 5)
+        self.assertEqual(idx, weighted_sample_indices(["a", "b"], w, 1, 5))
+        self.assertIn(idx[0], (0, 1))
+
+    def test_float_weights_still_float_path_at_huge_scale(self):
+        # 非整数权重即便数值“很大”也继续按既有浮点规则工作, 不进整数路径。
+        w = [float(2 ** 60), 1.0]
+        out = weighted_sample(["p", "q"], w, 2, 3)
+        self.assertEqual(sorted(out), ["p", "q"])
+
+    def test_super_huge_weights_pass_validation(self):
+        # 10**400 转 float 会 OverflowError; 整数权重必须在不触发浮点转换
+        # 的前提下通过校验并正常精确抽取(回归: 校验阶段 math.isnan 溢出)。
+        w = [10 ** 400, 10 ** 400]
+        idx = weighted_sample_indices(["a", "b"], w, 2, 2026)
+        self.assertEqual(sorted(idx), [0, 1])
+        self.assertEqual(
+            idx, weighted_sample_indices(["a", "b"], w, 2, 2026)
+        )
+        # 负的超大整数仍按 ValueError 拒绝, 且不经过浮点。
+        with self.assertRaises(ValueError):
+            weighted_sample_indices(["a"], [-(10 ** 400)], 1, 0)
+
+    def test_seed_types_and_error_classes_unchanged(self):
+        w = [10 ** 100, 1]
+        # 合法 seed 类型均可工作且结果确定。
+        for good in (0, 1, True, 1.5, "s", b"s", bytearray(b"s"), None):
+            a = weighted_sample_indices(["a", "b"], w, 1, good)
+            b = weighted_sample_indices(["a", "b"], w, 1, good)
+            self.assertEqual(a, b)
+        # 既有分类不变。
+        with self.assertRaises(TypeError):
+            weighted_sample_indices(["a", "b"], w, 1, object())
+        with self.assertRaises(TypeError):
+            weighted_sample_indices(["a", "b"], w, True, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_indices(["a", "b"], [10 ** 100, -1], 1, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_indices(["a"], [10 ** 100], 2, 0)
+
+
 class SerializeMetricsTest(unittest.TestCase):
     def test_baseline_format_locked(self):
         text = serialize_metrics({"b": 1, "a": {"z": 2, "y": 3}})
