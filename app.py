@@ -6,6 +6,10 @@
     weighted_sample_indices(items, weights, k, seed=0)
         与 weighted_sample 同规则, 但返回按抽样先后排列的零基原始索引;
         items 中相等的值仍按不同位置独立处理。
+
+权重全部为非负整数且累计值大于 2**53 时, 抽样切换到任意精度整数
+路径, 按整数权重的精确比例决定, 不经过浮点, 与平台字长无关; 其余
+情况沿用既有浮点规则, 公开序列与 seed 语义保持不变。
     serialize_metrics(metrics)
         将指标树稳定序列化为紧凑 JSON 文本, 任意精度整数保持精确十进制。
 
@@ -66,6 +70,12 @@ def _validate_sample_inputs(items, weights, k, seed):
 
     # ---- 4. 权重取值: NaN / 无穷 / 负数 (ValueError) ----
     for index, w in enumerate(weights):
+        if isinstance(w, int):
+            # 任意精度整数必然有限且非 NaN; math.isnan/isinf 对超出
+            # float 上限的巨大 int 会抛 OverflowError, 必须绕开。
+            if w < 0:
+                raise ValueError("negative weight")
+            continue
         if math.isnan(w):
             raise ValueError("weight at index %d must not be NaN" % index)
         if math.isinf(w):
@@ -76,14 +86,17 @@ def _validate_sample_inputs(items, weights, k, seed):
     return n
 
 
-def weighted_sample_indices(items, weights, k, seed=0):
-    n = _validate_sample_inputs(items, weights, k, seed)
+# 整数权重累计值不超过 2**53 时, 浮点路径的累计与比较都是精确的,
+# 继续沿用既有公开序列; 超过该阈值(或累计值无法表示为有限浮点数,
+# 对整数而言等价于超过浮点最大精确整数)时切换到纯整数精确路径。
+_EXACT_INT_TOTAL_THRESHOLD = 1 << 53
 
-    # 以下为确定性的加权无放回抽取; 复制到本地池, 绝不修改入参。
-    pool = list(range(n))
+
+def _float_sample_indices(weights, k, rng):
+    """基线浮点路径: 与既有公开序列逐位一致, 不得改动。"""
+    pool = list(range(len(weights)))
     pool_weights = list(weights)
     indices = []
-    rng = random.Random(seed)
     for _ in range(k):
         total = sum(pool_weights)
         if total <= 0:
@@ -99,6 +112,49 @@ def weighted_sample_indices(items, weights, k, seed=0):
                 pool_weights.pop(i)  # 同一位置不可再次被选
                 break
     return indices
+
+
+def _exact_int_sample_indices(weights, k, rng):
+    """任意精度整数路径。
+
+    每轮以 rng.randrange(total) 取得 [0, total) 上的均匀整数针, 再按
+    累计整数权重定位; 全程只使用任意精度整数运算, 比例精确, 不经过
+    浮点, 因而不会溢出、不会因舍入吞掉微小正权重, 也与平台字长和
+    浮点实现无关。零权重位置使累计值原地踏步, 永远不会被命中。
+    """
+    pool = list(range(len(weights)))
+    pool_weights = list(weights)
+    indices = []
+    for _ in range(k):
+        total = sum(pool_weights)
+        if total <= 0:
+            # 仍有抽取请求, 但剩余权重没有正值。
+            raise ValueError("no positive weight")
+        needle = rng.randrange(total)
+        acc = 0
+        for i, w in enumerate(pool_weights):
+            acc += w
+            if needle < acc:
+                indices.append(pool[i])  # 记录原始零基位置
+                pool.pop(i)
+                pool_weights.pop(i)  # 同一位置不可再次被选
+                break
+    return indices
+
+
+def weighted_sample_indices(items, weights, k, seed=0):
+    _validate_sample_inputs(items, weights, k, seed)
+
+    # 以下为确定性的加权无放回抽取; 复制到本地池, 绝不修改入参。
+    rng = random.Random(seed)
+    if (
+        all(isinstance(w, int) for w in weights)
+        and sum(weights) > _EXACT_INT_TOTAL_THRESHOLD
+    ):
+        # 全部为非负整数(布尔权重已在校验阶段拒绝)且累计值超出浮点
+        # 精确范围: 按整数权重的精确比例抽取。
+        return _exact_int_sample_indices(weights, k, rng)
+    return _float_sample_indices(weights, k, rng)
 
 
 def weighted_sample(items, weights, k, seed=0):

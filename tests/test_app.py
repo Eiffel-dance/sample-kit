@@ -264,6 +264,114 @@ class WeightedSampleValidationTest(unittest.TestCase):
             weighted_sample(["a"], [True], 0, 0)
 
 
+class ExactBigIntSampleTest(unittest.TestCase):
+    """累计整数权重超过 2**53 时的任意精度精确路径。"""
+
+    BIG = 10 ** 100
+
+    def test_huge_weights_multiround(self):
+        items = ["a", "b", "c"]
+        weights = [self.BIG, 2 * self.BIG, 3 * self.BIG]
+        idx = weighted_sample_indices(items, weights, 3, 42)
+        self.assertEqual(sorted(idx), [0, 1, 2])
+        self.assertEqual(len(set(idx)), 3)
+        self.assertEqual(
+            weighted_sample(items, weights, 3, 42),
+            [items[i] for i in idx],
+        )
+        # 相同 seed 与输入 -> 唯一相同序列。
+        for _ in range(5):
+            self.assertEqual(
+                weighted_sample_indices(items, weights, 3, 42), idx
+            )
+
+    def test_extreme_disparity_tiny_weights_not_swallowed(self):
+        # 微小正权重相对 10**100 仍存在, 大权重被抽走后必被选中。
+        items = ["tiny1", "tiny2", "huge"]
+        weights = [1, 1, self.BIG]
+        for seed in range(30):
+            idx = weighted_sample_indices(items, weights, 3, seed)
+            self.assertEqual(sorted(idx), [0, 1, 2])
+            # 两个单位权重位置都必须出现在序列中。
+            self.assertIn(0, idx)
+            self.assertIn(1, idx)
+
+    def test_zero_weight_never_chosen_on_exact_path(self):
+        items = ["zero", "big", "zero2"]
+        weights = [0, self.BIG, 0]
+        for seed in range(50):
+            self.assertEqual(
+                weighted_sample_indices(items, weights, 1, seed), [1]
+            )
+        # 大权重被抽走后只剩零权重 -> 唯一结果 ValueError。
+        with self.assertRaises(ValueError):
+            weighted_sample_indices(items, weights, 2, 0)
+
+    def test_exact_path_engages_above_threshold(self):
+        # 总权重 2**54 > 2**53, 两个位置比例精确各半, 多种子下都能居首。
+        weights = [1 << 53, 1 << 53]
+        firsts = {
+            weighted_sample_indices(["a", "b"], weights, 1, seed)[0]
+            for seed in range(60)
+        }
+        self.assertEqual(firsts, {0, 1})
+
+    def test_at_threshold_keeps_baseline_float_path(self):
+        # 累计值恰为 2**53 时仍走基线浮点路径, 序列语义不变。
+        weights = [1 << 53, 1, 2]
+        out = weighted_sample(["a", "b", "c"], weights, 2, 7)
+        self.assertEqual(out, weighted_sample(["a", "b", "c"], weights, 2, 7))
+        self.assertEqual(len(out), 2)
+
+    def test_beyond_float_range_still_exact(self):
+        # 累计值无法转换为有限浮点数(超出 float 上限)也必须正常工作。
+        weights = [10 ** 400, 10 ** 400, 1]
+        idx = weighted_sample_indices(["x", "y", "z"], weights, 3, 5)
+        self.assertEqual(sorted(idx), [0, 1, 2])
+        self.assertEqual(
+            weighted_sample_indices(["x", "y", "z"], weights, 3, 5), idx
+        )
+
+    def test_k_zero_validates_then_returns_empty(self):
+        self.assertEqual(
+            weighted_sample_indices(["a", "b"], [self.BIG, 1], 0, 0), []
+        )
+        with self.assertRaises(ValueError):
+            weighted_sample_indices(["a"], [float("nan")], 0, 0)
+        with self.assertRaises(TypeError):
+            weighted_sample_indices(["a"], [True], 0, 0)
+
+    def test_inputs_not_mutated_on_exact_path(self):
+        items = ["a", "b", "c"]
+        weights = [self.BIG, 1, 0]
+        items_snapshot = list(items)
+        weights_snapshot = list(weights)
+        weighted_sample_indices(items, weights, 2, 9)
+        self.assertEqual(items, items_snapshot)
+        self.assertEqual(weights, weights_snapshot)
+
+    def test_indices_valid_and_match_values_entry(self):
+        items = list(range(6))
+        weights = [self.BIG, 1, 0, 3 * self.BIG, 7, 2]
+        for seed in range(20):
+            idx = weighted_sample_indices(items, weights, 4, seed)
+            self.assertEqual(len(idx), 4)
+            self.assertEqual(len(set(idx)), 4)
+            self.assertTrue(all(0 <= i < len(items) for i in idx))
+            self.assertNotIn(2, idx)  # 零权重位置
+            self.assertEqual(
+                [items[i] for i in idx],
+                weighted_sample(items, weights, 4, seed),
+            )
+
+    def test_mixed_int_float_weights_keep_float_rules(self):
+        # 含非整数权重时仍按既有浮点规则, 不进入精确路径。
+        weights = [self.BIG, 0.5]
+        out = weighted_sample(["a", "b"], weights, 1, 3)
+        self.assertEqual(out, ["a"])
+        self.assertEqual(weighted_sample(["a", "b"], weights, 1, 3), out)
+
+
 class SerializeMetricsTest(unittest.TestCase):
     def test_baseline_format_locked(self):
         text = serialize_metrics({"b": 1, "a": {"z": 2, "y": 3}})
