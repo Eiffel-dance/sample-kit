@@ -197,7 +197,8 @@ def weighted_sample(items, weights, k, seed=0):
 def _check_jsonable(value, on_path):
     """递归确认 value 可被 JSON 表示。
 
-    - 任意大小的 int 原样接受(由 json 以精确十进制输出, 不经过浮点);
+    - 任意大小的 int 原样接受(由 _int_to_decimal 以精确十进制输出, 全程
+      不经过浮点, 也不受运行时整数转文本位数限制);
     - NaN / Infinity 抛 ValueError;
     - 集合、循环引用及其他不可表示的值抛 TypeError。
     on_path 记录当前祖先容器的 id, 用于检出循环引用(兄弟节点共享同一
@@ -253,6 +254,40 @@ def _check_jsonable(value, on_path):
     raise TypeError("object is not JSON serializable: %s" % type(value).__name__)
 
 
+# 十进制分块转换的每块位数与模数。每块 < 10**18, 对块调用 str() 远低于
+# 运行时整数转文本限制(sys.get_int_max_str_digits), 因此任意精度整数
+# 都能在不触发该限制、不经过浮点的前提下得到精确十进制文本。
+_DECIMAL_CHUNK_DIGITS = 18
+_DECIMAL_CHUNK_MODULUS = 10 ** _DECIMAL_CHUNK_DIGITS
+
+
+def _int_to_decimal(value):
+    """把任意精度 int 转换为不带前导零的精确十进制文本。
+
+    不调用 str(value) / repr(value): 二者受运行时整数转文本位数限制,
+    位数超限会抛 ValueError。这里按 10**18 分块 divmod, 每块都是小整数,
+    符号、各位与零值均与原整数严格一致, 绝无科学计数法或截断。
+    调用方保证 value 是非 bool 的 int。
+    """
+    if value == 0:
+        return "0"
+    negative = value < 0
+    n = -value if negative else value
+    chunks = []
+    while n:
+        n, remainder = divmod(n, _DECIMAL_CHUNK_MODULUS)
+        chunks.append(remainder)
+    # 最高块不带前导零, 其余块一律补足固定宽度。
+    parts = [str(chunks[-1])]
+    parts.extend(
+        "%0*d" % (_DECIMAL_CHUNK_DIGITS, chunk)
+        for chunk in reversed(chunks[:-1])
+    )
+    if negative:
+        parts.insert(0, "-")
+    return "".join(parts)
+
+
 def _key_to_member_name(key):
     """把合法的 JSON 字典键转换为成员名文本。
 
@@ -268,7 +303,7 @@ def _key_to_member_name(key):
     if isinstance(key, bool):  # 必须在 int 之前判断
         return "true" if key else "false"
     if isinstance(key, int):
-        return str(key)
+        return _int_to_decimal(key)
     # 有限 float: 复用编码器对浮点值的数值文本规则。
     return json.dumps(key, allow_nan=False)
 
@@ -296,6 +331,38 @@ def _normalize_dict_keys(value):
     return value
 
 
+def _encode_json(value):
+    """把规范化后的指标树编码为紧凑 JSON 文本。
+
+    与 json.dumps(sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    allow_nan=False) 逐字等价, 唯一直接处理整数的环节换成
+    _int_to_decimal —— json 编码器内部对 int 走 repr, 会受运行时整数转
+    文本位数限制; 这里绕开该限制, 任意位数整数都输出精确十进制。
+    输入已通过 _check_jsonable 与 _normalize_dict_keys: 只含
+    None / bool / int / 有限 float / str / list / 键为 str 的 dict。
+    """
+    if value is None:
+        return "null"
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if isinstance(value, int):  # bool 已先行返回
+        return _int_to_decimal(value)
+    if isinstance(value, float):
+        # 有限浮点沿用编码器既有数值文本(-0.0、指数写法等保持一致)。
+        return json.dumps(value, allow_nan=False)
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, list):
+        return "[" + ",".join(_encode_json(e) for e in value) + "]"
+    # dict: 键已统一为 str, 按 Unicode 文本升序排列。
+    return "{" + ",".join(
+        json.dumps(key, ensure_ascii=False) + ":" + _encode_json(element)
+        for key, element in sorted(value.items())
+    ) + "}"
+
+
 def serialize_metrics(metrics):
     # 先做完整校验: 把循环引用(json 原生报 ValueError)等统一成 TypeError,
     # 保证任何非法输入都不会产出截断或近似文本。
@@ -304,10 +371,4 @@ def serialize_metrics(metrics):
     # 按键名的 Unicode 文本升序排列 —— 同一数据内容无论构造顺序如何
     # 都得到同一份文本。
     normalized = _normalize_dict_keys(metrics)
-    return json.dumps(
-        normalized,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        allow_nan=False,
-    )
+    return _encode_json(normalized)
