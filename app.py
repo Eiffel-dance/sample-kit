@@ -31,6 +31,7 @@ import math
 import numbers
 import random
 import sys
+from fractions import Fraction
 
 # 文本/字节类型虽然满足 Sequence 协议, 但不作为“元素序列”接受。
 _TEXT_TYPES = (str, bytes, bytearray)
@@ -218,7 +219,77 @@ def _use_exact_integer_path(pool_weights, k):
     return False
 
 
-def _draw_indices_once(n, pool_weights, k, rng, use_exact):
+def _float_total_overflows(weights):
+    """判断既有浮点路径的逐轮累计是否会溢出, 从而无法产生完整结果。
+
+    权重均已通过校验(非 bool 的有限非负实数)。全部为 int 时 sum 是精确
+    整数, 永不溢出(该情形由 _use_exact_integer_path 决定, 不会走到这里);
+    含浮点时 sum 经浮点累计: 总和超出双精度可表示范围得到 inf, 混合超大
+    整数(如 10**400)与浮点时 float(int) 转换直接抛 OverflowError。这两种
+    情况下基线浮点算法的 needle 会变成 inf/NaN 或累计中途溢出, 导致候选
+    定位失败、结果不完整, 必须切换到精确路径。
+    """
+    try:
+        total = sum(weights)
+    except OverflowError:
+        # 混合超大整数与浮点: 整数无法转换为有限浮点。
+        return True
+    try:
+        return math.isinf(total)
+    except OverflowError:
+        # 总和本身(如其他 Real 类型的精确累计)无法转为有限浮点。
+        return True
+
+
+def _sample_indices_robust_float(pool, weights, k, rng):
+    """有限实数权重的精确加权无放回抽样(总和浮点溢出时的兜底路径)。
+
+    把每个权重精确转换为 Fraction(int 原样, 有限 float 按其二进制原值),
+    再通分缩放为一组整数权重, 复用纯整数精确路径完成抽取。于是:
+
+    - 求和与累计全程为精确整数运算, 总和超出双精度可表示范围、混合超大
+      整数(如 10**400)与浮点都不会溢出, 候选定位不会失败, 结果长度恰为 k;
+    - 每个正权重位置按原始有限权重占剩余总和的精确比例参与抽取, 极端
+      相对比例(如 1 对 1e308)的微小正权重也不会被舍入吞掉;
+    - 零权重缩放后仍为零, 永不被选中; 正权重耗尽时与既有路径一样抛
+      ValueError("no positive weight")。
+    """
+    fracs = [Fraction(w) for w in weights]
+    # 所有分母的最小公倍数把权重通分为精确整数, 相对比例严格不变。
+    scale = 1
+    for f in fracs:
+        scale = math.lcm(scale, f.denominator)
+    int_weights = [int(f * scale) for f in fracs]
+    return _sample_indices_exact_integer(pool, int_weights, k, rng)
+
+
+# 抽样路径选择: 基线浮点 / 纯整数精确 / 有限实数精确(浮点总和溢出兜底)。
+_PATH_FLOAT = 0
+_PATH_EXACT_INTEGER = 1
+_PATH_ROBUST_FLOAT = 2
+
+
+def _choose_sample_path(pool_weights, k):
+    """为整次调用(含批量的全部轮次)选定唯一的抽样路径。
+
+    规则:
+    - 全部权重为 int 且累计超过 2**53 或无法转为有限浮点 -> 纯整数精确
+      路径(既有规则, 序列不变);
+    - 其余情形若浮点累计会溢出(inf 或 OverflowError) -> 有限实数精确
+      路径(仅影响原本会产生无效/不完整结果的极端输入);
+    - 否则保持基线浮点路径, 已锁定的公开序列逐字不变。
+
+    路径只依据完整权重列表判定一次, 保证单次入口与批量入口的所有轮次
+    走同一条路径, 相同 (输入, seed) 得到唯一序列。
+    """
+    if _use_exact_integer_path(pool_weights, k):
+        return _PATH_EXACT_INTEGER
+    if k > 0 and _float_total_overflows(pool_weights):
+        return _PATH_ROBUST_FLOAT
+    return _PATH_FLOAT
+
+
+def _draw_indices_once(n, pool_weights, k, rng, path):
     """从原始位置出发完成一轮抽样。
 
     每次调用都重建位置池并复制权重, 因此上一轮的抽走/弹出不会影响下一
@@ -227,8 +298,10 @@ def _draw_indices_once(n, pool_weights, k, rng, use_exact):
     """
     pool = list(range(n))
     weights = list(pool_weights)
-    if use_exact:
+    if path == _PATH_EXACT_INTEGER:
         return _sample_indices_exact_integer(pool, weights, k, rng)
+    if path == _PATH_ROBUST_FLOAT:
+        return _sample_indices_robust_float(pool, weights, k, rng)
     return _sample_indices_float(pool, weights, k, rng)
 
 
@@ -238,9 +311,9 @@ def weighted_sample_indices(items, weights, k, seed=0):
     # 复制到本地, 绝不修改入参。
     pool_weights = list(weights)
     rng = random.Random(seed)
-    use_exact = _use_exact_integer_path(pool_weights, k)
+    path = _choose_sample_path(pool_weights, k)
 
-    return _draw_indices_once(n, pool_weights, k, rng, use_exact)
+    return _draw_indices_once(n, pool_weights, k, rng, path)
 
 
 def weighted_sample(items, weights, k, seed=0):
@@ -268,12 +341,12 @@ def weighted_sample_many_indices(items, weights, k, draws, seed=0):
 
     pool_weights = list(weights)
     rng = random.Random(seed)
-    use_exact = _use_exact_integer_path(pool_weights, k)
+    path = _choose_sample_path(pool_weights, k)
 
     rounds = []
     for _ in range(draws):
         rounds.append(
-            _draw_indices_once(n, pool_weights, k, rng, use_exact)
+            _draw_indices_once(n, pool_weights, k, rng, path)
         )
     return rounds
 
