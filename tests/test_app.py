@@ -549,6 +549,84 @@ class SerializeMetricsTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             serialize_metrics({"ok": 1, "bad": [float("nan")]})
 
+    def test_heterogeneous_keys_converted_and_sorted_as_text(self):
+        # None/bool/int/float 键转换为成员名文本后按 Unicode 文本升序。
+        data = {None: 1, True: 2, False: 3, 7: 4, 1.5: 5, "s": 6}
+        self.assertEqual(
+            serialize_metrics(data),
+            '{"1.5":5,"7":4,"false":3,"null":1,"s":6,"true":2}',
+        )
+
+    def test_numeric_keys_sorted_by_member_name_not_value(self):
+        # 成员名按文本排序: "10" < "2", 而非数值 2 < 10。
+        self.assertEqual(
+            serialize_metrics({2: "a", 10: "b"}),
+            '{"10":"b","2":"a"}',
+        )
+
+    def test_mixed_key_order_irrelevant(self):
+        # 同一数据内容仅交换插入顺序, 输出逐字相同。
+        forward = {1: "a", "x": [2, {None: True}], 2.5: "b"}
+        backward = {2.5: "b", "x": [2, {None: True}], 1: "a"}
+        self.assertEqual(
+            serialize_metrics(forward), serialize_metrics(backward)
+        )
+        self.assertEqual(
+            serialize_metrics(forward),
+            '{"1":"a","2.5":"b","x":[2,{"null":true}]}',
+        )
+
+    def test_nested_heterogeneous_keys_follow_same_order(self):
+        data = {"outer": {10: 1, "a": {False: 0, 3: 1}}, 0: 2}
+        self.assertEqual(
+            serialize_metrics(data),
+            '{"0":2,"outer":{"10":1,"a":{"3":1,"false":0}}}',
+        )
+
+    def test_float_key_uses_encoder_number_text(self):
+        # 负零与指数表示沿用编码器既有规则。
+        self.assertEqual(serialize_metrics({-0.0: 1}), '{"-0.0":1}')
+        self.assertEqual(serialize_metrics({1e300: 1}), '{"1e+300":1}')
+        self.assertEqual(serialize_metrics({0.5: 1}), '{"0.5":1}')
+
+    def test_huge_integer_key_exact_decimal(self):
+        big = 10 ** 100
+        self.assertEqual(
+            serialize_metrics({big: 1}),
+            '{"1%s":1}' % ("0" * 100),
+        )
+
+    def test_colliding_member_names_raise_value_error(self):
+        # 不同原始键转换得到同一成员名 -> ValueError, 不得静默覆盖。
+        for bad in (
+            {1: "a", "1": "b"},
+            {None: "a", "null": "b"},
+            {True: "a", "true": "b"},
+            {False: "a", "false": "b"},
+            {1.5: "a", "1.5": "b"},
+            {"nested": {2: "a", "2": "b"}},
+        ):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    serialize_metrics(bad)
+
+    def test_key_type_and_value_errors_unchanged_with_heterogeneous_keys(self):
+        # 非法键类型仍 TypeError; 非有限浮点键仍 ValueError。
+        with self.assertRaises(TypeError):
+            serialize_metrics({(1, 2): "a"})
+        with self.assertRaises(TypeError):
+            serialize_metrics({b"k": "a"})
+        with self.assertRaises(ValueError):
+            serialize_metrics({float("nan"): "a"})
+        with self.assertRaises(ValueError):
+            serialize_metrics({float("inf"): "a"})
+
+    def test_heterogeneous_keys_input_not_mutated(self):
+        data = {1: "a", "x": [{None: True}], 2.5: {"y": 1}}
+        snapshot = repr(data)
+        serialize_metrics(data)
+        self.assertEqual(repr(data), snapshot)
+
 
 if __name__ == "__main__":
     unittest.main()

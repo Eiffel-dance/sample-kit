@@ -8,6 +8,9 @@
         items 中相等的值仍按不同位置独立处理。
     serialize_metrics(metrics)
         将指标树稳定序列化为紧凑 JSON 文本, 任意精度整数保持精确十进制。
+        字典键先统一转换为成员名文本(str 原样, None->null, bool->true/false,
+        int->十进制, 有限 float->编码器数值文本), 再按 Unicode 文本升序排列;
+        不同原始键转换得到同一成员名时抛 ValueError。
 
 两个函数都在产生任何结果/文本之前完成全部校验, 非法输入以稳定的
 TypeError / ValueError 告知调用方, 且不会修改入参。
@@ -250,12 +253,59 @@ def _check_jsonable(value, on_path):
     raise TypeError("object is not JSON serializable: %s" % type(value).__name__)
 
 
+def _key_to_member_name(key):
+    """把合法的 JSON 字典键转换为成员名文本。
+
+    转换必须先于最终编码完成, 这样混合键类型也有确定结果:
+    str 原样; None -> "null"; bool -> "true"/"false"; int -> 不带前导零的
+    十进制; 有限 float -> 当前 JSON 编码器产生的数值文本(保留 -0.0 与
+    指数表示)。调用前 key 已通过 _check_jsonable 校验。
+    """
+    if isinstance(key, str):
+        return key
+    if key is None:
+        return "null"
+    if isinstance(key, bool):  # 必须在 int 之前判断
+        return "true" if key else "false"
+    if isinstance(key, int):
+        return str(key)
+    # 有限 float: 复用编码器对浮点值的数值文本规则。
+    return json.dumps(key, allow_nan=False)
+
+
+def _normalize_dict_keys(value):
+    """递归构造新树, 把每层字典的键统一转换为字符串成员名。
+
+    不修改入参; 输入已通过 _check_jsonable 校验(键类型合法、浮点键有限、
+    无循环引用, 共享子对象在此重复展开即可)。两个不同的原始键转换后得到
+    同一成员名时抛 ValueError, 绝不静默覆盖或依赖插入顺序。
+    """
+    if isinstance(value, dict):
+        normalized = {}
+        for key, element in value.items():
+            name = _key_to_member_name(key)
+            if name in normalized:
+                raise ValueError(
+                    "dict keys collide after conversion to member name %r"
+                    % name
+                )
+            normalized[name] = _normalize_dict_keys(element)
+        return normalized
+    if isinstance(value, (list, tuple)):
+        return [_normalize_dict_keys(element) for element in value]
+    return value
+
+
 def serialize_metrics(metrics):
     # 先做完整校验: 把循环引用(json 原生报 ValueError)等统一成 TypeError,
     # 保证任何非法输入都不会产出截断或近似文本。
     _check_jsonable(metrics, set())
+    # 再把全部字典键转换为成员名文本(同时检出转换冲突), 最后编码时
+    # 按键名的 Unicode 文本升序排列 —— 同一数据内容无论构造顺序如何
+    # 都得到同一份文本。
+    normalized = _normalize_dict_keys(metrics)
     return json.dumps(
-        metrics,
+        normalized,
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,
