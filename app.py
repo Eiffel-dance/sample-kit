@@ -6,13 +6,22 @@
     weighted_sample_indices(items, weights, k, seed=0)
         与 weighted_sample 同规则, 但返回按抽样先后排列的零基原始索引;
         items 中相等的值仍按不同位置独立处理。
+    weighted_sample_many(items, weights, k, draws, seed=0)
+        weighted_sample 的批量入口: 一次调用按同一输入生成 draws 轮加权
+        无放回样本, 返回长度等于 draws 的外层序列, 每轮返回元素值。
+        每轮都从原始位置重新开始(同一轮内位置最多出现一次, 重复值按位置
+        区分, 轮次之间允许再次选中同一位置); 所有轮次共享同一个由 seed
+        初始化的随机流, 第一轮与 weighted_sample 逐项相同。
+    weighted_sample_many_indices(items, weights, k, draws, seed=0)
+        与 weighted_sample_many 同规则, 但每轮返回按抽样先后排列的零基
+        原始索引, 两个批量入口逐轮对应。
     serialize_metrics(metrics)
         将指标树稳定序列化为紧凑 JSON 文本, 任意精度整数保持精确十进制。
         字典键先统一转换为成员名文本(str 原样, None->null, bool->true/false,
         int->十进制, 有限 float->编码器数值文本), 再按 Unicode 文本升序排列;
         不同原始键转换得到同一成员名时抛 ValueError。
 
-两个函数都在产生任何结果/文本之前完成全部校验, 非法输入以稳定的
+这些函数都在产生任何结果/文本之前完成全部校验, 非法输入以稳定的
 TypeError / ValueError 告知调用方, 且不会修改入参。
 """
 
@@ -99,6 +108,31 @@ def _validate_sample_inputs(items, weights, k, seed):
     return n
 
 
+def _validate_draws(draws):
+    """批量入口的 draws 必须是非布尔非负整数 (TypeError / ValueError)。"""
+    if isinstance(draws, bool) or not isinstance(draws, int):
+        raise TypeError("draws must be a non-boolean integer")
+    if draws < 0:
+        raise ValueError("draws must be non-negative")
+
+
+def _count_positive_weights(weights):
+    """统计严格为正的权重个数。
+
+    整数直接判正负, 不经过浮点 —— 超大整数(如 10**400)也是合法有限值;
+    浮点 +0.0/-0.0 都不计入, 正的有限浮点才计入。调用前权重已通过
+    类型与取值校验(无 bool / NaN / 无穷 / 负数)。
+    """
+    count = 0
+    for w in weights:
+        if isinstance(w, int):
+            if w > 0:
+                count += 1
+        elif w > 0:
+            count += 1
+    return count
+
+
 def _sample_indices_float(pool, weights, k, rng):
     """基于 rng.random() 的经典浮点加权无放回抽样(基线算法)。
 
@@ -164,38 +198,93 @@ def _sample_indices_exact_integer(pool, weights, k, rng):
     return indices
 
 
-def weighted_sample_indices(items, weights, k, seed=0):
-    n = _validate_sample_inputs(items, weights, k, seed)
+def _use_exact_integer_path(pool_weights, k):
+    """决定整数权重是否走纯整数路径(规则与基线完全一致)。
 
-    # 复制到本地池, 绝不修改入参。
-    pool = list(range(n))
-    pool_weights = list(weights)
-    rng = random.Random(seed)
-
-    # 全部权重均为 int (bool 已在类型校验中拒绝) 时, 以全量累计权重决定
-    # 路径: 累计 > 2**53, 或累计无法转换为有限浮点(如 10**400,
-    # float() 抛 OverflowError)时走纯整数路径, 杜绝浮点溢出与舍入。
-    # 全量累计 <= 2**53 时, 任意子集累计同样 <= 2**53, 浮点路径逐轮
-    # 精确可表示, 基线锁定的公开序列因此保持不变。
-    use_exact = False
+    全部权重均为 int (bool 已在类型校验中拒绝) 时, 以全量累计权重决定:
+    累计 > 2**53, 或累计无法转换为有限浮点(如 10**400, float() 抛
+    OverflowError)时走纯整数路径, 杜绝浮点溢出与舍入。全量累计 <= 2**53
+    时, 任意子集累计同样 <= 2**53, 浮点路径逐轮精确可表示, 基线锁定的
+    公开序列因此保持不变。
+    """
     if k > 0 and all(isinstance(w, int) for w in pool_weights):
         total = sum(pool_weights)
         if total > _EXACT_INTEGER_THRESHOLD:
-            use_exact = True
-        else:
-            try:
-                float(total)
-            except OverflowError:
-                use_exact = True
+            return True
+        try:
+            float(total)
+        except OverflowError:
+            return True
+    return False
 
+
+def _draw_indices_once(n, pool_weights, k, rng, use_exact):
+    """从原始位置出发完成一轮抽样。
+
+    每次调用都重建位置池并复制权重, 因此上一轮的抽走/弹出不会影响下一
+    轮 —— 每轮都从全部原始位置重新开始; rng 由调用方共享, 多轮连续消耗
+    同一随机流。绝不修改入参 pool_weights。
+    """
+    pool = list(range(n))
+    weights = list(pool_weights)
     if use_exact:
-        return _sample_indices_exact_integer(pool, pool_weights, k, rng)
-    return _sample_indices_float(pool, pool_weights, k, rng)
+        return _sample_indices_exact_integer(pool, weights, k, rng)
+    return _sample_indices_float(pool, weights, k, rng)
+
+
+def weighted_sample_indices(items, weights, k, seed=0):
+    n = _validate_sample_inputs(items, weights, k, seed)
+
+    # 复制到本地, 绝不修改入参。
+    pool_weights = list(weights)
+    rng = random.Random(seed)
+    use_exact = _use_exact_integer_path(pool_weights, k)
+
+    return _draw_indices_once(n, pool_weights, k, rng, use_exact)
 
 
 def weighted_sample(items, weights, k, seed=0):
     indices = weighted_sample_indices(items, weights, k, seed)
     return [items[i] for i in indices]
+
+
+def weighted_sample_many_indices(items, weights, k, draws, seed=0):
+    """weighted_sample_indices 的批量入口: 一次调用生成 draws 轮样本。
+
+    返回长度等于 draws 的外层序列, 每个元素是一轮按抽样先后排列的零基
+    原始索引。每轮都从原始位置重新开始(同一轮内位置最多出现一次, 轮次
+    之间允许再次选中同一位置); 所有轮次共享同一个由 seed 初始化的随机
+    流, 第一轮与 weighted_sample_indices 逐项相同, 后续轮次继续消耗该
+    流, 相同调用下得到相同的嵌套序列。seed=None 保留现有随机语义。
+    """
+    n = _validate_sample_inputs(items, weights, k, seed)
+    _validate_draws(draws)
+
+    # 可行性前置检查: 每轮无放回抽取 k 个位置, 至少需要 k 个正权重位置
+    # (k=0 时即使权重全为零也合法)。在开始任何一轮抽样之前判定, 保证
+    # 非法调用确定抛 ValueError 且绝不返回部分外层结果。
+    if k > 0 and k > _count_positive_weights(weights):
+        raise ValueError("no positive weight")
+
+    pool_weights = list(weights)
+    rng = random.Random(seed)
+    use_exact = _use_exact_integer_path(pool_weights, k)
+
+    rounds = []
+    for _ in range(draws):
+        rounds.append(
+            _draw_indices_once(n, pool_weights, k, rng, use_exact)
+        )
+    return rounds
+
+
+def weighted_sample_many(items, weights, k, draws, seed=0):
+    """weighted_sample 的批量入口, 规则与 weighted_sample_many_indices
+    完全一致, 区别仅在于每轮返回元素值而非原始索引; 两个批量入口逐轮
+    逐项对应。
+    """
+    rounds = weighted_sample_many_indices(items, weights, k, draws, seed)
+    return [[items[i] for i in round_indices] for round_indices in rounds]
 
 
 # ---------------------------------------------------------------------------

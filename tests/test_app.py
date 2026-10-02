@@ -2,7 +2,13 @@ import math
 import unittest
 
 import app
-from app import weighted_sample, weighted_sample_indices, serialize_metrics
+from app import (
+    weighted_sample,
+    weighted_sample_indices,
+    weighted_sample_many,
+    weighted_sample_many_indices,
+    serialize_metrics,
+)
 
 
 class WeightedSampleDeterminismTest(unittest.TestCase):
@@ -471,6 +477,207 @@ class ExactIntegerSamplingTest(unittest.TestCase):
             weighted_sample_indices(["a", "b"], [10 ** 100, -1], 1, 0)
         with self.assertRaises(ValueError):
             weighted_sample_indices(["a"], [10 ** 100], 2, 0)
+
+
+class WeightedSampleManyTest(unittest.TestCase):
+    """批量入口 weighted_sample_many / weighted_sample_many_indices。"""
+
+    def test_outer_shape_and_round_lengths(self):
+        idx = weighted_sample_many_indices(["a", "b", "c", "d"], [1, 2, 3, 4], 3, 5, 42)
+        self.assertEqual(len(idx), 5)
+        self.assertTrue(all(len(rd) == 3 for rd in idx))
+        vals = weighted_sample_many(["a", "b", "c", "d"], [1, 2, 3, 4], 3, 5, 42)
+        self.assertEqual(len(vals), 5)
+        self.assertTrue(all(len(rd) == 3 for rd in vals))
+
+    def test_first_round_matches_single_entry(self):
+        # 第一轮必须与现有对应入口逐项相同。
+        cases = [
+            (list("abcdef"), [1, 3, 2, 5, 0, 2], 4),
+            (list(range(20)), [10 ** 80 + i for i in range(20)], 10),
+            (["p", "q"], [0.5, 1.5], 2),
+            ([], [], 0),
+            (list("xyz"), [10 ** 100, 1, 10 ** 50], 2),
+        ]
+        for items, weights, k in cases:
+            for seed in (0, 1, 42, -7, 1.5, "s", b"s", bytearray(b"s"), True):
+                with self.subTest(items=items, k=k, seed=seed):
+                    many_i = weighted_sample_many_indices(items, weights, k, 3, seed)
+                    self.assertEqual(
+                        many_i[0], weighted_sample_indices(items, weights, k, seed)
+                    )
+                    many_v = weighted_sample_many(items, weights, k, 3, seed)
+                    self.assertEqual(
+                        many_v[0], weighted_sample(items, weights, k, seed)
+                    )
+
+    def test_values_and_indices_entries_correspond_round_by_round(self):
+        cases = [
+            (list("abcdef"), [1, 3, 2, 5, 0, 2], 4),
+            (list(range(20)), [10 ** 80 + i for i in range(20)], 10),
+            (["p", "q"], [0.5, 1.5], 2),
+        ]
+        for items, weights, k in cases:
+            mi = weighted_sample_many_indices(items, weights, k, 4, 7)
+            mv = weighted_sample_many(items, weights, k, 4, 7)
+            self.assertEqual(
+                [[items[i] for i in rd] for rd in mi], mv
+            )
+
+    def test_rounds_share_one_seed_stream(self):
+        # 后续轮次继续消耗同一个由 seed 初始化的随机流: 用与实现相同的
+        # 共享 rng 手工连跑 draws 轮必须得到相同嵌套序列; 不同 draws 的
+        # 前缀逐轮相同。
+        import random as _random
+
+        items, weights, k = list("abcdef"), [10 ** 100, 1, 10 ** 90, 7, 0, 3], 4
+        for draws in (1, 2, 6):
+            rng = _random.Random(99)
+            manual = []
+            for _ in range(draws):
+                pool, pw = list(range(len(items))), list(weights)
+                manual.append(app._sample_indices_exact_integer(pool, pw, k, rng))
+            self.assertEqual(
+                weighted_sample_many_indices(items, weights, k, draws, 99),
+                manual,
+            )
+        full = weighted_sample_many_indices(items, weights, k, 8, 123)
+        head = weighted_sample_many_indices(items, weights, k, 3, 123)
+        self.assertEqual(full[:3], head)
+
+    def test_deterministic_nested_sequence(self):
+        args = (list("abcdef"), [10 ** 100, 1, 10 ** 90, 7, 0, 3], 4)
+        first = weighted_sample_many_indices(*args, draws=8, seed=123)
+        for _ in range(4):
+            self.assertEqual(
+                weighted_sample_many_indices(*args, draws=8, seed=123), first
+            )
+
+    def test_each_round_restarts_from_original_positions(self):
+        # 轮内索引在原始范围内且不重复; 零权重永不出现; 轮间允许再选同位置。
+        for seed in range(100):
+            rounds = weighted_sample_many_indices(
+                list(range(6)), [10 ** 100, 1, 10 ** 99, 3, 0, 5], 5, 7, seed
+            )
+            for rd in rounds:
+                self.assertEqual(len(rd), 5)
+                self.assertEqual(len(set(rd)), 5)
+                self.assertTrue(all(0 <= i < 6 for i in rd))
+                self.assertNotIn(4, rd)
+        # k=1 连抽多轮: 每轮独立, 允许(且高概率会)重复同一位置。
+        repeats = weighted_sample_many_indices(["a", "b"], [1, 1], 1, 12, 0)
+        self.assertTrue(all(rd == [0] or rd == [1] for rd in repeats))
+
+    def test_duplicate_values_distinct_positions(self):
+        idx = weighted_sample_many_indices([1, 1, 1], [1, 1, 1], 3, 2, 123)
+        vals = weighted_sample_many([1, 1, 1], [1, 1, 1], 3, 2, 123)
+        self.assertTrue(all(sorted(rd) == [0, 1, 2] for rd in idx))
+        self.assertEqual(vals, [[1, 1, 1], [1, 1, 1]])
+
+    def test_draws_zero_returns_empty_after_validation(self):
+        self.assertEqual(
+            weighted_sample_many_indices(["a", "b"], [1, 2], 2, 0, 0), []
+        )
+        self.assertEqual(weighted_sample_many(["a", "b"], [1, 2], 2, 0, 0), [])
+        # 即使 draws=0, 结构/范围/权重校验仍须先完成。
+        with self.assertRaises(TypeError):
+            weighted_sample_many_indices("ab", [1, 2], 1, 0, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_many_indices(["a", "b"], [1], 0, 0, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_many_indices(["a"], [float("nan")], 0, 0, 0)
+
+    def test_k_zero_returns_draws_empty_inner_rounds(self):
+        self.assertEqual(
+            weighted_sample_many_indices(["a", "b"], [0, 0], 0, 4, 0),
+            [[], [], [], []],
+        )
+        self.assertEqual(
+            weighted_sample_many(["a", "b"], [0, 0], 0, 3, 0),
+            [[], [], []],
+        )
+        self.assertEqual(weighted_sample_many_indices([], [], 0, 2, 0), [[], []])
+
+    def test_k_exceeding_positive_weights_raises_value_error(self):
+        # 每轮无放回抽取 k 个位置至少需要 k 个正权重位置; 在开始任何一轮
+        # 之前确定抛 ValueError, 绝不返回部分外层结果。
+        with self.assertRaises(ValueError):
+            weighted_sample_many_indices(["a", "b"], [1, 0], 2, 3, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_many_indices(["a"], [0], 1, 5, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_many_indices(["a", "b", "c"], [10 ** 100, 0, 1], 3, 2, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_many(["a", "b"], [1, 0], 2, 1000, 0)
+
+    def test_draws_must_be_non_boolean_non_negative_integer(self):
+        for bad in (True, False, 1.0, "2", None, [2], 1 + 0j):
+            with self.subTest(bad=bad):
+                with self.assertRaises(TypeError):
+                    weighted_sample_many_indices(["a"], [1], 0, bad, 0)
+                with self.assertRaises(TypeError):
+                    weighted_sample_many(["a"], [1], 0, bad, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_many_indices(["a"], [1], 0, -1, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_many(["a"], [1], 0, -1, 0)
+
+    def test_existing_validation_rules_unchanged(self):
+        def ve(fn):
+            with self.assertRaises(ValueError):
+                fn()
+
+        def te(fn):
+            with self.assertRaises(TypeError):
+                fn()
+
+        te(lambda: weighted_sample_many("ab", [1, 2], 1, 1, 0))
+        te(lambda: weighted_sample_many(["a", "b"], [1, "x"], 1, 1, 0))
+        te(lambda: weighted_sample_many(["a", "b"], [1, True], 1, 1, 0))
+        te(lambda: weighted_sample_many(["a"], [1], True, 1, 0))
+        te(lambda: weighted_sample_many(["a"], [1], 1, 1, object()))
+        ve(lambda: weighted_sample_many(["a", "b"], [1, -1], 1, 1, 0))
+        ve(lambda: weighted_sample_many(["a", "b"], [1, float("nan")], 1, 1, 0))
+        ve(lambda: weighted_sample_many(["a", "b"], [1, float("inf")], 1, 1, 0))
+        ve(lambda: weighted_sample_many(["a", "b"], [1], 1, 1, 0))
+        ve(lambda: weighted_sample_many(["a"], [1], 2, 1, 0))
+
+    def test_seed_none_keeps_random_semantics(self):
+        rounds = weighted_sample_many_indices(
+            list(range(50)), list(range(1, 51)), 10, 4, None
+        )
+        self.assertEqual(len(rounds), 4)
+        self.assertTrue(all(len(rd) == 10 for rd in rounds))
+        for rd in rounds:
+            self.assertEqual(len(set(rd)), 10)
+            self.assertTrue(all(0 <= i < 50 for i in rd))
+
+    def test_inputs_not_mutated(self):
+        items, weights = list("abc"), [10 ** 100, 10 ** 99, 1]
+        items_snap, weights_snap = list(items), list(weights)
+        weighted_sample_many(items, weights, 3, 5, 99)
+        weighted_sample_many_indices(items, weights, 2, 5, -3)
+        self.assertEqual(items, items_snap)
+        self.assertEqual(weights, weights_snap)
+
+    def test_huge_integer_weights_exact_and_deterministic(self):
+        items, weights = ["a", "b"], [10 ** 400, 10 ** 400]
+        rounds = weighted_sample_many_indices(items, weights, 2, 3, 2026)
+        self.assertTrue(all(sorted(rd) == [0, 1] for rd in rounds))
+        self.assertEqual(
+            rounds, weighted_sample_many_indices(items, weights, 2, 3, 2026)
+        )
+
+    def test_exact_path_proportions_in_first_round(self):
+        base = 2 ** 52 + 7
+        counts = [0, 0]
+        trials = 3000
+        for seed in range(trials):
+            counts[
+                weighted_sample_many_indices(["a", "b"], [base, 2 * base], 1, 1, seed)[0][0]
+            ] += 1
+        self.assertAlmostEqual(counts[0] / trials, 1 / 3, delta=0.04)
+        self.assertAlmostEqual(counts[1] / trials, 2 / 3, delta=0.04)
 
 
 class SerializeMetricsTest(unittest.TestCase):
