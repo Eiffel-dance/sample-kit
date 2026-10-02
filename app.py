@@ -15,6 +15,18 @@
     weighted_sample_many_indices(items, weights, k, draws, seed=0)
         与 weighted_sample_many 同规则, 但每轮返回按抽样先后排列的零基
         原始索引, 两个批量入口逐轮对应。
+    weighted_sample_stream_indices(items, weights, k, draws, seed=0)
+        weighted_sample_many_indices 的按需逐轮消费入口: 返回可迭代对象,
+        每次产出一轮按抽样先后排列的零基原始索引。抽样规则与随机流与
+        weighted_sample_many_indices 完全一致, 相同 (输入, seed) 下迭代
+        结果与 weighted_sample_many_indices 的全部轮次逐项相同, 第一轮
+        也等于 weighted_sample_indices; 区别仅在于轮次按需生成而非一次
+        性全部构造。全部校验在调用时(产出第一轮之前)同步完成, draws=0
+        返回不产出元素的可迭代对象, k=0 时每轮产出空列表。
+    weighted_sample_stream(items, weights, k, draws, seed=0)
+        与 weighted_sample_stream_indices 同规则, 但按相同索引逐轮产出
+        元素值列表; 与 weighted_sample_many 逐轮逐项对应, 第一轮等于
+        weighted_sample。
     serialize_metrics(metrics)
         将指标树稳定序列化为紧凑 JSON 文本, 任意精度整数保持精确十进制。
         字典键先统一转换为成员名文本(str 原样, None->null, bool->true/false,
@@ -369,6 +381,33 @@ def weighted_sample(items, weights, k, seed=0):
     return [items[i] for i in indices]
 
 
+def _prepare_round_sampling(items, weights, k, draws, seed):
+    """批量入口与流式入口共用的全部前置校验与抽样准备。
+
+    依次完成 _validate_sample_inputs 的单轮校验、draws 校验、正权重可行
+    性检查, 再复制权重、建立由 seed 初始化的共享随机流并选定抽样路径。
+    任何非法输入都在这里(调用方拿到结果之前)以稳定的 TypeError /
+    ValueError 抛出; 通过后返回 (n, pool_weights, rng, use_exact),
+    调用方可据此逐轮调用 _draw_indices_once —— 批量一次性构造与流式
+    按需消费走完全相同的准备与逐轮逻辑, 两个入口的轮次序列必然一致。
+    """
+    n = _validate_sample_inputs(items, weights, k, seed)
+    _validate_draws(draws)
+
+    # 可行性前置检查: 每轮无放回抽取 k 个位置, 至少需要 k 个正权重位置
+    # (k=0 时即使权重全为零也合法)。在开始任何一轮抽样之前判定, 保证
+    # 非法调用确定抛 ValueError 且绝不返回部分外层结果/先产出部分轮次。
+    if k > 0 and k > _count_positive_weights(weights):
+        raise ValueError("no positive weight")
+
+    # 复制到本地, 绝不修改入参; _draw_indices_once 每轮再复制一份,
+    # 准备得到的 pool_weights 在所有轮次中保持只读。
+    pool_weights = list(weights)
+    rng = random.Random(seed)
+    pool_weights, use_exact = _select_sampling_plan(pool_weights, k)
+    return n, pool_weights, rng, use_exact
+
+
 def weighted_sample_many_indices(items, weights, k, draws, seed=0):
     """weighted_sample_indices 的批量入口: 一次调用生成 draws 轮样本。
 
@@ -378,18 +417,9 @@ def weighted_sample_many_indices(items, weights, k, draws, seed=0):
     流, 第一轮与 weighted_sample_indices 逐项相同, 后续轮次继续消耗该
     流, 相同调用下得到相同的嵌套序列。seed=None 保留现有随机语义。
     """
-    n = _validate_sample_inputs(items, weights, k, seed)
-    _validate_draws(draws)
-
-    # 可行性前置检查: 每轮无放回抽取 k 个位置, 至少需要 k 个正权重位置
-    # (k=0 时即使权重全为零也合法)。在开始任何一轮抽样之前判定, 保证
-    # 非法调用确定抛 ValueError 且绝不返回部分外层结果。
-    if k > 0 and k > _count_positive_weights(weights):
-        raise ValueError("no positive weight")
-
-    pool_weights = list(weights)
-    rng = random.Random(seed)
-    pool_weights, use_exact = _select_sampling_plan(pool_weights, k)
+    n, pool_weights, rng, use_exact = _prepare_round_sampling(
+        items, weights, k, draws, seed
+    )
 
     rounds = []
     for _ in range(draws):
@@ -406,6 +436,47 @@ def weighted_sample_many(items, weights, k, draws, seed=0):
     """
     rounds = weighted_sample_many_indices(items, weights, k, draws, seed)
     return [[items[i] for i in round_indices] for round_indices in rounds]
+
+
+def weighted_sample_stream_indices(items, weights, k, draws, seed=0):
+    """weighted_sample_many_indices 的按需逐轮消费入口。
+
+    返回可迭代对象, 每次迭代产出一轮按抽样先后排列的零基原始索引列表。
+    抽样规则、可行性约束与由 seed 初始化的共享随机流都与
+    weighted_sample_many_indices 完全一致: 相同 (输入, seed) 下, 完整
+    迭代得到的轮次序列与 weighted_sample_many_indices 逐项相同, 第一轮
+    也等于 weighted_sample_indices; 每轮仍从原始位置重新开始, 轮内无
+    放回, 轮间允许再次选中同一位置, 重复值按位置区分。
+
+    与批量入口唯一的区别是轮次惰性生成, 长批次可由调用方逐轮取得。
+    全部校验(含 draws 与正权重可行性)在本函数调用时、产生第一轮之前
+    同步完成: 非法输入直接抛 TypeError / ValueError, 不会先返回迭代器
+    再在消费中途失败; draws=0 完成全部校验后返回不产出元素的可迭代
+    对象, k=0 时每轮产出空列表。绝不修改 items / weights。
+    """
+    n, pool_weights, rng, use_exact = _prepare_round_sampling(
+        items, weights, k, draws, seed
+    )
+
+    def _stream():
+        # 随机流与批量入口一样跨轮连续消耗; 每轮内部由
+        # _draw_indices_once 自行重建位置池与权重副本。
+        for _ in range(draws):
+            yield _draw_indices_once(n, pool_weights, k, rng, use_exact)
+
+    return _stream()
+
+
+def weighted_sample_stream(items, weights, k, draws, seed=0):
+    """weighted_sample 的按需逐轮消费入口, 规则与
+    weighted_sample_stream_indices 完全一致, 区别仅在于按相同索引逐轮
+    产出元素值列表而非原始索引; 完整迭代结果与 weighted_sample_many
+    逐轮逐项对应, 第一轮等于 weighted_sample。
+    """
+    rounds = weighted_sample_stream_indices(items, weights, k, draws, seed)
+    return (
+        [items[i] for i in round_indices] for round_indices in rounds
+    )
 
 
 # ---------------------------------------------------------------------------
