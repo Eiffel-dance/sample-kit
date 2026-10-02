@@ -20,6 +20,13 @@
         字典键先统一转换为成员名文本(str 原样, None->null, bool->true/false,
         int->十进制, 有限 float->编码器数值文本), 再按 Unicode 文本升序排列;
         不同原始键转换得到同一成员名时抛 ValueError。
+        值额外接受 decimal.Decimal 与 fractions.Fraction(递归适用于顶层、
+        字典值、列表、元组及其嵌套组合): 有限 Decimal 写成不带引号的合法
+        JSON 数字, 按 Decimal 自身的十进制表示保留精度、指数形式、尾随零
+        与负零符号; NaN / sNaN / 正负无穷统一抛 ValueError(decimal 的比较
+        异常不会泄漏)。Fraction 固定写成 [分子, 正分母] 二整数 JSON 数组,
+        分子分母均为精确整数(不约简为单元素、不经浮点)。Decimal 与
+        Fraction 仅作为值受支持, 不作为字典键。
 
 权重接受非布尔的 int / float / fractions.Fraction / decimal.Decimal, 并允许
 四种类型混合使用; 每个权重按自身精确数值参与抽样。float 必须有限非负;
@@ -451,6 +458,28 @@ def _int_to_decimal_text(value):
     return "-" + text if negative else text
 
 
+class _DecimalJSONNumber(int):
+    """携带 Decimal 精确十进制文本的 int 占位类型。
+
+    标准库编码器对 int 一律调用注入的 _intstr 取数值文本; 这里借该通道
+    把 Decimal 的十进制表示(指数形式、尾随零、负零符号均按 Decimal 自身
+    的 str 保留)原样写进输出, 整数值本身(0)不会被使用。仅在
+    _normalize_dict_keys 内部构造, 不会出现在调用方的数据里。
+    """
+
+    def __new__(cls, text):
+        self = int.__new__(cls)
+        self.text = text
+        return self
+
+
+def _json_number_text(value):
+    """编码器注入的 _intstr: 整数走精确十进制, Decimal 占位取自带文本。"""
+    if isinstance(value, _DecimalJSONNumber):
+        return value.text
+    return _int_to_decimal_text(value)
+
+
 class _ExactIntegerEncoder(json.JSONEncoder):
     """沿用标准库 JSON 编码器的全部规则, 只把整数数值文本替换为不受
     位数限制的精确十进制转换。
@@ -496,7 +525,7 @@ class _ExactIntegerEncoder(json.JSONEncoder):
         return json.encoder._make_iterencode(
             markers, self.default, encoder, indent, floatstr,
             self.key_separator, self.item_separator, self.sort_keys,
-            self.skipkeys, _one_shot, _intstr=_int_to_decimal_text,
+            self.skipkeys, _one_shot, _intstr=_json_number_text,
         )(o, 0)
 
 
@@ -504,7 +533,9 @@ def _check_jsonable(value, on_path):
     """递归确认 value 可被 JSON 表示。
 
     - 任意大小的 int 原样接受(由 json 以精确十进制输出, 不经过浮点);
-    - NaN / Infinity 抛 ValueError;
+    - 有限 Decimal 原样接受(按自身十进制表示输出为 JSON 数字);
+    - Fraction 原样接受(输出为 [分子, 正分母] 二整数数组);
+    - NaN / Infinity(含 Decimal 的 NaN、sNaN、正负无穷)抛 ValueError;
     - 集合、循环引用及其他不可表示的值抛 TypeError。
     on_path 记录当前祖先容器的 id, 用于检出循环引用(兄弟节点共享同一
     对象不属于循环, 不做标记)。
@@ -516,6 +547,20 @@ def _check_jsonable(value, on_path):
     if isinstance(value, float):
         if not math.isfinite(value):
             raise ValueError("NaN and Infinity are not JSON serializable")
+        return
+    if isinstance(value, Decimal):
+        # 必须在任何比较之前判定: NaN(含 sNaN)的有序比较会抛
+        # decimal.InvalidOperation, 该异常绝不能泄漏给调用方。is_nan()
+        # 同时覆盖静默 NaN 与 sNaN; is_infinite() 覆盖正负无穷。判定不
+        # 经过浮点, 超大指数(如 1E100000)也安全。
+        if value.is_nan() or value.is_infinite():
+            raise ValueError(
+                "NaN and Infinity are not JSON serializable"
+            )
+        return
+    if isinstance(value, Fraction):
+        # 精确有理数, 既不可能是 NaN 也不可能是无穷; 分子/分母都是精确
+        # int, 序列化为二整数数组时不经浮点。
         return
     if isinstance(value, str):
         return
@@ -601,6 +646,16 @@ def _normalize_dict_keys(value):
         return normalized
     if isinstance(value, (list, tuple)):
         return [_normalize_dict_keys(element) for element in value]
+    if isinstance(value, Decimal):
+        # Decimal(value) 剥除子类可能自定义的 __str__: 文本只取决于精确
+        # 十进制值。有限 Decimal 的 str 必为合法 JSON 数字, 且保留指数
+        # 形式、尾随零与负零符号(如 "1E+3"、"1.2300"、"-0")。
+        return _DecimalJSONNumber(str(Decimal(value)))
+    if isinstance(value, Fraction):
+        # 固定写成 [分子, 正分母] 二整数数组: Fraction 构造时已约分并把
+        # 符号归入分子, 整数值分数仍保留两个元素; 两个分量都是精确 int,
+        # 由编码器按任意精度整数输出, 不经浮点。
+        return [value.numerator, value.denominator]
     return value
 
 

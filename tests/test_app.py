@@ -1813,5 +1813,209 @@ class SerializeMetricsTest(unittest.TestCase):
         self.assertEqual(repr(data), snapshot)
 
 
+class SerializeMetricsExactNumberValuesTest(unittest.TestCase):
+    """serialize_metrics 对 Decimal / Fraction 指标值的精确序列化。"""
+
+    # ------------------------------------------------------------------
+    # Decimal: 按自身十进制表示写成不带引号的合法 JSON 数字
+    # ------------------------------------------------------------------
+    def test_decimal_plain_and_fractional_forms(self):
+        self.assertEqual(serialize_metrics(Decimal("1.5")), "1.5")
+        self.assertEqual(serialize_metrics(Decimal("123")), "123")
+        self.assertEqual(serialize_metrics(Decimal("0.001")), "0.001")
+        self.assertEqual(serialize_metrics(Decimal("-2.75")), "-2.75")
+
+    def test_decimal_exponent_form_preserved(self):
+        self.assertEqual(serialize_metrics(Decimal("1E+3")), "1E+3")
+        self.assertEqual(serialize_metrics(Decimal("1E-100")), "1E-100")
+        self.assertEqual(serialize_metrics(Decimal("-1.5E-7")), "-1.5E-7")
+        self.assertEqual(serialize_metrics(Decimal("0E-100")), "0E-100")
+        # 远超浮点范围的指数仍按原文输出, 不溢出、不近似。
+        self.assertEqual(
+            serialize_metrics(Decimal("1E100000")), "1E+100000"
+        )
+
+    def test_decimal_trailing_zeros_and_signed_zero_preserved(self):
+        self.assertEqual(serialize_metrics(Decimal("1.2300")), "1.2300")
+        self.assertEqual(serialize_metrics(Decimal("-0")), "-0")
+        self.assertEqual(serialize_metrics(Decimal("-0.00")), "-0.00")
+        self.assertEqual(serialize_metrics(Decimal("10.0")), "10.0")
+
+    def test_decimal_output_is_valid_unquoted_json_number(self):
+        import json as _json
+
+        for text in ("1.5", "1E+3", "1E-100", "-0", "1.2300", "1E+100000"):
+            out = serialize_metrics(Decimal(text))
+            self.assertNotIn('"', out)
+            # json 可解析, 且按 Decimal 解析回来数值与表示完全一致。
+            self.assertEqual(
+                _json.loads(out, parse_float=Decimal, parse_int=Decimal),
+                Decimal(text),
+            )
+            self.assertEqual(
+                str(_json.loads(out, parse_float=Decimal, parse_int=Decimal)),
+                str(Decimal(text)),
+            )
+
+    def test_decimal_subclass_str_ignored(self):
+        # 与 int 子类规则一致: 自定义 __str__ 不得影响数值文本。
+        class WeirdDecimal(Decimal):
+            def __str__(self):
+                return "not-a-number"
+
+        self.assertEqual(serialize_metrics(WeirdDecimal("2.5")), "2.5")
+
+    # ------------------------------------------------------------------
+    # Fraction: 固定 [分子, 正分母] 二整数数组
+    # ------------------------------------------------------------------
+    def test_fraction_basic_forms(self):
+        self.assertEqual(serialize_metrics(Fraction(3, 4)), "[3,4]")
+        self.assertEqual(serialize_metrics(Fraction(-10, 4)), "[-5,2]")
+        self.assertEqual(serialize_metrics(Fraction(0)), "[0,1]")
+        self.assertEqual(serialize_metrics(Fraction(7, 1)), "[7,1]")
+
+    def test_fraction_integer_valued_keeps_two_elements(self):
+        # 整数值的分数仍保留两个元素, 不约简为单个整数。
+        self.assertEqual(serialize_metrics(Fraction(6, 3)), "[2,1]")
+        self.assertEqual(serialize_metrics(Fraction(-8, 2)), "[-4,1]")
+
+    def test_fraction_denominator_always_positive(self):
+        # 符号归入分子, 分母恒正。
+        self.assertEqual(serialize_metrics(Fraction(3, -4)), "[-3,4]")
+        self.assertEqual(serialize_metrics(Fraction(-3, -4)), "[3,4]")
+
+    def test_fraction_huge_components_exact(self):
+        num = 10 ** 5000 + 7
+        den = 10 ** 5000 - 1
+        text = serialize_metrics(Fraction(num, den))
+        import sys
+
+        old = None
+        if hasattr(sys, "set_int_max_str_digits"):
+            old = sys.get_int_max_str_digits()
+            sys.set_int_max_str_digits(0)
+        try:
+            expected = "[%s,%s]" % (num, den)
+        finally:
+            if old is not None:
+                sys.set_int_max_str_digits(old)
+        self.assertEqual(text, expected)
+        # 不经浮点: 无指数、无小数点。
+        self.assertNotIn("e", text.lower())
+        self.assertNotIn(".", text)
+
+    def test_fraction_components_distinguishable_from_plain_number(self):
+        import json as _json
+
+        parsed = _json.loads(serialize_metrics(
+            {"n": 3, "f": Fraction(3, 4), "d": Decimal("0.75")}
+        ))
+        self.assertEqual(parsed["n"], 3)
+        self.assertEqual(parsed["f"], [3, 4])          # 二整数数组
+        self.assertIsInstance(parsed["f"], list)
+        self.assertEqual(parsed["d"], 0.75)            # 普通 JSON 数值
+
+    # ------------------------------------------------------------------
+    # 递归适用: 顶层 / 字典值 / 列表 / 元组 / 深层嵌套
+    # ------------------------------------------------------------------
+    def test_nested_combinations(self):
+        data = {
+            "d": [Decimal("2.5"), (Fraction(1, 3), {"x": Decimal("-0E+5")})],
+            "t": (Fraction(6, 3), Decimal("1E+3")),
+            "z": {"deep": [[Fraction(-10, 4)]]},
+        }
+        self.assertEqual(
+            serialize_metrics(data),
+            '{"d":[2.5,[[1,3],{"x":-0E+5}]],'
+            '"t":[[2,1],1E+3],'
+            '"z":{"deep":[[[-5,2]]]}}',
+        )
+
+    def test_top_level_scalar_values(self):
+        self.assertEqual(serialize_metrics(Decimal("0.1")), "0.1")
+        self.assertEqual(serialize_metrics(Fraction(2, 7)), "[2,7]")
+        self.assertEqual(
+            serialize_metrics((Decimal("0.1"), Fraction(2, 7))),
+            "[0.1,[2,7]]",
+        )
+
+    def test_mixed_with_existing_types_format_unchanged(self):
+        # 紧凑分隔符、Unicode 原文、成员名排序与既有类型共存时不变。
+        text = serialize_metrics(
+            {"名": Decimal("1.5"), "x": [Fraction(1, 2), 10 ** 100], "a": 1}
+        )
+        self.assertEqual(
+            text,
+            '{"a":1,"x":[[1,2],1%s],"名":1.5}' % ("0" * 100),
+        )
+
+    # ------------------------------------------------------------------
+    # 非有限 Decimal -> ValueError, 无 decimal 异常泄漏, 无部分输出
+    # ------------------------------------------------------------------
+    def test_non_finite_decimal_raises_value_error(self):
+        for bad in (
+            Decimal("NaN"),
+            Decimal("sNaN"),
+            Decimal("-NaN"),
+            Decimal("Infinity"),
+            Decimal("-Infinity"),
+        ):
+            with self.subTest(bad=str(bad)):
+                with self.assertRaises(ValueError):
+                    serialize_metrics(bad)
+                with self.assertRaises(ValueError):
+                    serialize_metrics({"ok": 1, "bad": [bad]})
+                with self.assertRaises(ValueError):
+                    serialize_metrics({"ok": 1, "bad": {"deep": (bad,)}})
+
+    def test_decimal_comparison_exception_does_not_leak(self):
+        import decimal
+
+        for bad in (Decimal("NaN"), Decimal("sNaN")):
+            try:
+                serialize_metrics([Decimal("1"), bad])
+            except ValueError:
+                pass
+            except decimal.InvalidOperation:
+                self.fail("decimal.InvalidOperation leaked")
+            else:
+                self.fail("no exception for %r" % bad)
+
+    # ------------------------------------------------------------------
+    # Decimal / Fraction 不作为字典键; 既有键规则与异常分类不变
+    # ------------------------------------------------------------------
+    def test_decimal_and_fraction_rejected_as_dict_keys(self):
+        for key in (Decimal("1"), Decimal("NaN"), Fraction(1, 2), Fraction(3)):
+            with self.subTest(key=repr(key)):
+                with self.assertRaises(TypeError):
+                    serialize_metrics({key: 1})
+
+    def test_existing_error_classes_unchanged_with_new_values(self):
+        with self.assertRaises(ValueError):
+            serialize_metrics([Decimal("1"), float("nan")])
+        with self.assertRaises(TypeError):
+            serialize_metrics([Fraction(1, 2), {1, 2}])
+        with self.assertRaises(TypeError):
+            serialize_metrics({"k": b"bytes", "d": Decimal("1")})
+        # 循环引用仍 TypeError。
+        a = [Decimal("1")]
+        a.append(a)
+        with self.assertRaises(TypeError):
+            serialize_metrics(a)
+        # 键冲突仍 ValueError。
+        with self.assertRaises(ValueError):
+            serialize_metrics({1: Decimal("1"), "1": Fraction(1, 2)})
+
+    def test_shared_reference_and_input_not_mutated(self):
+        child = {"v": Decimal("0.5")}
+        data = {"a": child, "b": child, "f": [Fraction(1, 3)]}
+        snapshot = repr(data)
+        self.assertEqual(
+            serialize_metrics(data),
+            '{"a":{"v":0.5},"b":{"v":0.5},"f":[[1,3]]}',
+        )
+        self.assertEqual(repr(data), snapshot)
+
+
 if __name__ == "__main__":
     unittest.main()
