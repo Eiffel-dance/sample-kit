@@ -6,6 +6,22 @@
     weighted_sample_indices(items, weights, k, seed=0)
         与 weighted_sample 同规则, 但返回按抽样先后排列的零基原始索引;
         items 中相等的值仍按不同位置独立处理。
+    weighted_sample_excluding_indices(items, weights, k, excluded=(), seed=0)
+        weighted_sample_indices 的排除位置变体: 先按现有采样入口完成
+        items、weights、k、seed 及权重有限性/非负性校验, 再校验 excluded
+        (非文本且长度可确定的序列, 成员为非布尔整数且处于 items 的零基
+        范围内; 结构/成员类型错误 TypeError, 越界 ValueError)。excluded
+        按集合语义解释, 重复位置与排列顺序不影响结果; 被排除的位置即使
+        权重为正也绝不出现, 未排除的零权重位置同样永不入选。随后在剩余
+        位置中按权重比例无放回抽取 k 个不同位置, 返回按抽样先后排列的
+        零基原始索引; 相同 (输入, excluded, seed) 给出完全一致的序列。
+        excluded 为空时结果与 weighted_sample_indices 逐项相同; k 超过
+        剩余有效正权重位置数时在产生任何结果前抛 ValueError; k=0 时仍
+        完成全部校验并返回空列表。
+    weighted_sample_excluding(items, weights, k, excluded=(), seed=0)
+        与 weighted_sample_excluding_indices 同规则、同校验顺序与异常
+        类别, 区别仅在于按相同索引返回元素值; 相同值的不同位置仍独立
+        处理, 返回值与索引入口逐项对应。
     weighted_sample_many(items, weights, k, draws, seed=0, start=0)
         weighted_sample 的批量入口: 一次调用按同一输入生成 draws 轮加权
         无放回样本, 返回长度等于 draws 的外层序列, 每轮返回元素值。
@@ -226,6 +242,30 @@ def _validate_start(start):
         raise ValueError("start must be non-negative")
 
 
+def _validate_excluded(excluded, n):
+    """排除位置入口的 excluded 校验, 返回去重后的位置集合。
+
+    excluded 必须是非文本且长度可确定的序列(与 items / weights 同一结构
+    规则), 成员必须是非布尔整数; 两类结构/类型问题统一抛 TypeError。
+    成员取值必须处于 items 的零基范围 [0, n) 内(负数不按 Python 负索引
+    解释), 越界统一抛 ValueError。与权重校验一样分两步完成: 先确认全部
+    成员类型, 再确认全部成员取值, 保证异常类别与检查顺序稳定。返回的
+    集合体现集合语义: 重复位置与排列顺序不影响后续抽样结果。
+    """
+    if not _is_length_determinable_sequence(excluded):
+        raise TypeError("excluded must be a length-determinable sequence")
+    for position, index in enumerate(excluded):
+        if isinstance(index, bool) or not isinstance(index, int):
+            raise TypeError(
+                "excluded index at position %d must be a non-boolean integer"
+                % position
+            )
+    for index in excluded:
+        if index < 0 or index >= n:
+            raise ValueError("excluded index out of range")
+    return frozenset(excluded)
+
+
 def _count_positive_weights(weights):
     """统计严格为正的权重个数。
 
@@ -434,6 +474,52 @@ def weighted_sample_indices(items, weights, k, seed=0):
 
 def weighted_sample(items, weights, k, seed=0):
     indices = weighted_sample_indices(items, weights, k, seed)
+    return [items[i] for i in indices]
+
+
+def weighted_sample_excluding_indices(items, weights, k, excluded=(), seed=0):
+    """weighted_sample_indices 的排除位置变体。
+
+    先完成与现有采样入口完全一致的全部校验(items、weights、k、seed 的
+    类型与取值、权重有限性与非负性), 再校验 excluded(非文本可定长序列,
+    成员为非布尔整数且在零基范围内)。excluded 按集合语义解释: 重复位置
+    与排列顺序不影响结果。随后在剩余位置中按权重比例无放回抽取 k 个
+    不同位置, 返回按抽样先后排列的零基原始索引; 被排除的位置即使权重
+    为正也绝不出现, 未排除的零权重位置同样永不入选。
+
+    抽样计划与随机流消耗规则与单轮入口相同, 只是排除位置的权重按零
+    参与; 因此 excluded 为空时结果与 weighted_sample_indices 逐项相同,
+    相同 (输入, excluded, seed) 给出完全一致的序列, 浮点基线及
+    Fraction / Decimal / 超大整数路径的确定性与比例规则原样保留。
+    k 超过剩余有效正权重位置数时在产生任何结果前抛 ValueError; k=0 时
+    仍完成全部校验并返回空列表。不修改入参。
+    """
+    n = _validate_sample_inputs(items, weights, k, seed)
+    excluded_set = _validate_excluded(excluded, n)
+
+    # 复制到本地并把排除位置的权重置零, 绝不修改入参; 置零后排除位置在
+    # 两条抽样路径上都与零权重位置一样永不入选, 其余位置的相对比例不变。
+    pool_weights = list(weights)
+    for index in excluded_set:
+        pool_weights[index] = 0
+
+    # 与批量入口相同的可行性前置检查: 在产生任何结果之前确定失败结果。
+    if k > 0 and k > _count_positive_weights(pool_weights):
+        raise ValueError("no positive weight")
+
+    rng = random.Random(seed)
+    pool_weights, use_exact = _select_sampling_plan(pool_weights, k)
+
+    return _draw_indices_once(n, pool_weights, k, rng, use_exact)
+
+
+def weighted_sample_excluding(items, weights, k, excluded=(), seed=0):
+    """weighted_sample 的排除位置变体, 规则与
+    weighted_sample_excluding_indices 完全一致(同一套校验顺序与异常
+    类别), 区别仅在于按相同索引返回元素值; 相同值的不同位置仍独立处理,
+    返回值与索引入口逐项对应。
+    """
+    indices = weighted_sample_excluding_indices(items, weights, k, excluded, seed)
     return [items[i] for i in indices]
 
 
