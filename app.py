@@ -69,6 +69,22 @@
         分数也保留两个元素), 分量不经过浮点。非有限 Decimal(NaN、sNaN、
         正负无穷)抛 ValueError; Decimal / Fraction 仅可作为值, 作为字典
         键按 TypeError 拒绝。
+    deserialize_metrics(text)
+        serialize_metrics 的逆方向入口: 把指标序列化文本(或任何合法 JSON
+        文本)还原为可继续计算的 Python 数据树, 供独立数值调用方核对序列化
+        前后的精确数值。参数只接受 str, 其他类型(含 bytes/bytearray)统一
+        抛 TypeError。null/布尔/字符串/数组/对象分别还原为 None/bool/str/
+        list/dict, 对象成员名保持文本形式(不排序、不改写)。数字解析完全
+        绕开浮点: 无小数点与指数标记的整数还原为任意精度 int(不受运行时
+        整数转文本位数限制); 带小数点或指数标记的有限数字还原为 Decimal,
+        即使数值恰为整数也保留正负号、刻度、指数与负零。Fraction 序列化
+        产生的二元素数组没有类型标签, 仍按普通 list 还原, 不按形状推断
+        类型。允许合法 JSON 的空白与 Unicode 转义; NaN、Infinity、
+        -Infinity、语法错误、重复对象成员名, 以及任何无法保持上述精度的
+        数字(如超出 Decimal 可表示范围的指数)统一抛 ValueError, 出错时
+        不返回任何部分结果。解析结果再次交给 serialize_metrics 时, int 与
+        Decimal 的十进制内容保持精确, 键排序、紧凑分隔符、Unicode 输出与
+        冲突检测规则继续生效。
 
 权重接受非布尔的 int / float / fractions.Fraction / decimal.Decimal, 并允许
 四种类型混合使用; 每个权重按自身精确数值参与抽样。float 必须有限非负;
@@ -82,6 +98,7 @@ TypeError / ValueError 告知调用方, 且不会修改入参。
 """
 
 import collections.abc
+import decimal
 import hashlib
 import hmac
 import json
@@ -1501,4 +1518,101 @@ def serialize_metrics(metrics):
             ensure_ascii=False,
             allow_nan=False,
         ).iterencode(normalized, _one_shot=False)
+    )
+
+
+# ---------------------------------------------------------------------------
+# 指标反序列化
+# ---------------------------------------------------------------------------
+
+def _integer_literal_to_int(text):
+    """把 JSON 整数字面量文本(可带前导 "-")精确转换为任意精度 int。
+
+    CPython 3.11+ 的 int(text) 与 str(int) 一样受可配置位数上限约束
+    (sys.set_int_max_str_digits, 最低 640 位), 超长整数字面量直接 int()
+    会抛 ValueError —— 但位数本身是合法输入, 不是错误条件。这里在位数
+    超限时把数字串切成严格短于上限的十进制块, 逐块 int() 后按
+    value * 10**width + chunk 组合, 任意位数都精确且不触发限制; 运行时
+    关闭限制(上限为 0)或解释器没有该限制时直接使用 int()。
+    调用前 text 已被 JSON 扫描器确认为合法整数字面量(无小数点/指数)。
+    """
+    negative = text.startswith("-")
+    digits = text[1:] if negative else text
+    limit = _GET_INT_MAX_STR_DIGITS() if _GET_INT_MAX_STR_DIGITS else 0
+    if not limit or len(digits) <= limit:
+        value = int(digits)
+    else:
+        # 块宽取上限减一(至少为 1), 保证每次 int(块) 都严格位于限制之内。
+        width = max(1, limit - 1)
+        base = 10 ** width
+        # 首块对齐到 width 的倍数, 后续每块恰好 width 位。
+        head = len(digits) % width
+        value = int(digits[:head]) if head else 0
+        for pos in range(head, len(digits), width):
+            value = value * base + int(digits[pos:pos + width])
+    return -value if negative else value
+
+
+def _decimal_literal_to_decimal(text):
+    """把带小数点或指数标记的 JSON 数字文本精确转换为 Decimal。
+
+    Decimal 的字符串构造不经过浮点, 完整保留正负号、系数刻度、指数形式
+    与负零(如 "-0.00"、"1E+2"、"1.50"), 且不受运行时整数转文本位数限制
+    影响(长系数、长指数串都能解析)。超出 Decimal 可表示范围的指数(如
+    1E1000000000000000000)无法保持精确十进制内容: decimal 抛出的
+    InvalidOperation 统一收敛为 ValueError; 若调用方改造了 decimal 上下
+    文使该信号不再抛出, 产生的非有限值同样按 ValueError 拒绝, 绝不把
+    Infinity/NaN 当作合法解析结果返回。
+    """
+    try:
+        value = Decimal(text)
+    except decimal.InvalidOperation as exc:
+        raise ValueError(
+            "number cannot be represented exactly: %r" % text
+        ) from exc
+    if not value.is_finite():
+        raise ValueError(
+            "number cannot be represented exactly: %r" % text
+        )
+    return value
+
+
+def _reject_json_constant(value):
+    """parse_constant 钩子: NaN / Infinity / -Infinity 统一抛 ValueError。"""
+    raise ValueError("non-finite number is not valid JSON: %s" % value)
+
+
+def _object_members_from_pairs(pairs):
+    """object_pairs_hook: 成员名保持文本形式, 重复成员名抛 ValueError。
+
+    不排序、不改写成员名; 重复名称(包括经 Unicode 转义后相同的名称)是
+    非法输入, 必须报错而不是静默覆盖先出现的值。
+    """
+    obj = {}
+    for name, value in pairs:
+        if name in obj:
+            raise ValueError("duplicate object member name: %r" % name)
+        obj[name] = value
+    return obj
+
+
+def deserialize_metrics(text):
+    """把指标序列化文本还原为可继续计算的 Python 数据树。
+
+    参数只接受 str; 其他类型(含 bytes / bytearray, 尽管 json.loads 本身
+    接受它们)统一抛 TypeError。数字解析完全绕开浮点: 无小数点与指数标记
+    的整数还原为任意精度 int; 带小数点或指数标记的有限数字还原为
+    Decimal, 保留正负号、刻度、指数与负零。NaN / Infinity / -Infinity、
+    语法错误(JSONDecodeError 本身是 ValueError)、重复对象成员名, 以及
+    任何无法保持精度的数字统一抛 ValueError; 解析要么完整返回数据树,
+    要么抛异常, 绝不返回部分结果。
+    """
+    if not isinstance(text, str):
+        raise TypeError("text must be a str, not %s" % type(text).__name__)
+    return json.loads(
+        text,
+        parse_int=_integer_literal_to_int,
+        parse_float=_decimal_literal_to_decimal,
+        parse_constant=_reject_json_constant,
+        object_pairs_hook=_object_members_from_pairs,
     )

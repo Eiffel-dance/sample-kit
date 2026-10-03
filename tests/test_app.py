@@ -16,6 +16,7 @@ from app import (
     weighted_sample_resume_indices,
     weighted_sample_resume,
     serialize_metrics,
+    deserialize_metrics,
 )
 
 
@@ -3127,6 +3128,249 @@ class ExactDecimalFractionSerializationTest(unittest.TestCase):
         self.assertIs(data["f"], tuple_before)
         self.assertEqual(str(data["d"][0]), "1.50")
         self.assertEqual(str(data["nested"]["x"]), "-0")
+
+
+class DeserializeMetricsTest(unittest.TestCase):
+    """deserialize_metrics: 指标序列化文本的精确逆解析。"""
+
+    # ------------------------------------------------------------------
+    # 参数类型: 只接受 str
+    # ------------------------------------------------------------------
+    def test_non_str_input_raises_type_error(self):
+        for bad in (None, 1, 1.5, True, [], {}, (), {1},
+                    b"{}", bytearray(b"{}"), object()):
+            with self.subTest(bad=type(bad).__name__):
+                with self.assertRaises(TypeError):
+                    deserialize_metrics(bad)
+
+    # ------------------------------------------------------------------
+    # JSON 结构还原: null / bool / str / list / dict / 空容器 / 深层嵌套
+    # ------------------------------------------------------------------
+    def test_scalars_restore_to_native_types(self):
+        self.assertIsNone(deserialize_metrics("null"))
+        self.assertIs(deserialize_metrics("true"), True)
+        self.assertIs(deserialize_metrics("false"), False)
+        self.assertEqual(deserialize_metrics('"abc"'), "abc")
+        self.assertIsInstance(deserialize_metrics('"abc"'), str)
+
+    def test_empty_object_and_array(self):
+        self.assertEqual(deserialize_metrics("{}"), {})
+        self.assertEqual(deserialize_metrics("[]"), [])
+        self.assertEqual(deserialize_metrics('{"a":{},"b":[[]]}'),
+                         {"a": {}, "b": [[]]})
+
+    def test_deeply_nested_arrays_and_objects(self):
+        text = '{"a":[{"b":[1,{"c":[null,[true]]}]}],"d":[[[{"e":[]}]]]}'
+        self.assertEqual(
+            deserialize_metrics(text),
+            {"a": [{"b": [1, {"c": [None, [True]]}]}],
+             "d": [[[{"e": []}]]]},
+        )
+
+    def test_duplicate_values_are_preserved(self):
+        self.assertEqual(deserialize_metrics("[1,1,1]"), [1, 1, 1])
+        self.assertEqual(
+            deserialize_metrics('{"x":[0,0],"y":[0,0]}'),
+            {"x": [0, 0], "y": [0, 0]},
+        )
+
+    def test_member_names_stay_textual(self):
+        # 成员名保持文本形式, 不转换、不排序; "10" 仍在 "2" 之前(文本序)。
+        parsed = deserialize_metrics('{"10":"b","2":"a","null":1,"true":2}')
+        self.assertEqual(list(parsed), ["10", "2", "null", "true"])
+        self.assertTrue(all(isinstance(k, str) for k in parsed))
+
+    def test_whitespace_and_unicode_escapes_allowed(self):
+        self.assertEqual(deserialize_metrics('  { "a" : [ 1 , 2 ] }  '),
+                         {"a": [1, 2]})
+        self.assertEqual(deserialize_metrics('"\\u0041\\u4e2d"'), "A中")
+        self.assertEqual(deserialize_metrics('{"\\u0061": 1}'), {"a": 1})
+
+    # ------------------------------------------------------------------
+    # 数字: 整数 -> 任意精度 int; 小数/指数 -> Decimal, 全程不经过浮点
+    # ------------------------------------------------------------------
+    def test_integer_literals_become_arbitrary_precision_int(self):
+        for text, expected in (
+            ("0", 0), ("-0", 0), ("1", 1), ("-1", -1),
+            ("9007199254740993", 9007199254740993),
+            ("-9007199254740993", -9007199254740993),
+        ):
+            with self.subTest(text=text):
+                value = deserialize_metrics(text)
+                self.assertIs(type(value), int)
+                self.assertEqual(value, expected)
+
+    def test_decimal_literals_preserve_sign_scale_exponent_signed_zero(self):
+        # 带小数点或指数标记的数字即使数值恰为整数, 也返回 Decimal 并保留
+        # 正负号、刻度、指数与负零。
+        for literal in (
+            "0.0", "-0.0", "-0.0000", "1.50", "100.0", "0.01",
+            "1E2", "1e2", "1E+2", "1E-2", "1E0", "-1E-100", "1.50E+2",
+            "123456789.987654321",
+        ):
+            with self.subTest(literal=literal):
+                value = deserialize_metrics(literal)
+                self.assertIs(type(value), Decimal)
+                # Decimal 构造保持同一十进制表示(指数记号大小写规范化)。
+                self.assertEqual(value, Decimal(literal))
+                self.assertEqual(str(value), str(Decimal(literal)))
+        neg_zero = deserialize_metrics("-0.00")
+        self.assertTrue(neg_zero.is_signed())
+        self.assertEqual(neg_zero.as_tuple().exponent, -2)
+
+    def test_huge_integer_beyond_digit_limit_exact(self):
+        import sys
+
+        if not hasattr(sys, "set_int_max_str_digits"):
+            self.skipTest("解释器没有可配置的整数转文本位数限制")
+        old = sys.get_int_max_str_digits()
+        self.addCleanup(sys.set_int_max_str_digits, old)
+        sys.set_int_max_str_digits(640)
+
+        big = 10 ** 5000 - 1
+        text = _unlimited_int_str(big)
+        value = deserialize_metrics(text)
+        self.assertIs(type(value), int)
+        self.assertEqual(value, big)
+        # 负数与嵌套位置同样精确。
+        self.assertEqual(deserialize_metrics("-" + text), -big)
+        self.assertEqual(
+            deserialize_metrics('{"n":[%s,-%s]}' % (text, text)),
+            {"n": [big, -big]},
+        )
+
+    def test_extreme_exponent_decimals_exact(self):
+        for literal in ("1E100000", "-1E-100000", "9.99E+99999"):
+            with self.subTest(literal=literal):
+                value = deserialize_metrics(literal)
+                self.assertIs(type(value), Decimal)
+                self.assertEqual(value, Decimal(literal))
+                self.assertTrue(value.is_finite())
+
+    def test_long_coefficient_decimal_exact(self):
+        literal = "9." + "9" * 5000
+        value = deserialize_metrics(literal)
+        self.assertIs(type(value), Decimal)
+        self.assertEqual(str(value), literal)
+
+    # ------------------------------------------------------------------
+    # 错误: NaN / Infinity / 语法错误 / 重复成员名 / 无法保持精度的数字
+    # ------------------------------------------------------------------
+    def test_non_finite_literals_raise_value_error(self):
+        for bad in ("NaN", "Infinity", "-Infinity",
+                    "[NaN]", '{"x": Infinity}', '{"x": -Infinity}'):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    deserialize_metrics(bad)
+
+    def test_syntax_errors_raise_value_error(self):
+        for bad in ("", " ", "{", "[1,", '{"a":}', "{'a':1}", "01", "+1",
+                    ".5", "1.", "1e", "--1", "1 2", '"\\x"', "tru", "nul"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    deserialize_metrics(bad)
+
+    def test_duplicate_member_names_raise_value_error(self):
+        for bad in ('{"a":1,"a":2}',
+                    '{"a":1,"\\u0061":2}',
+                    '{"x":{"b":1,"b":2}}',
+                    '[{"k":0,"k":1}]'):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    deserialize_metrics(bad)
+
+    def test_unrepresentable_exponent_raises_value_error(self):
+        # 超出 Decimal 可表示范围的指数无法保持精确十进制 -> ValueError。
+        for bad in ("1E999999999999999999999", "1E-999999999999999999999",
+                    "1E1000000000000000000", "[1E999999999999999999999]"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    deserialize_metrics(bad)
+
+    def test_no_partial_result_on_error(self):
+        # 深层非法内容同样整体失败, 调用方拿不到任何部分结果。
+        for bad in ('{"ok":1,"deep":{"bad":NaN}}',
+                    '[1,2,{"a":1,"a":2}]',
+                    '{"ok":1,"bad":[Infinity]}'):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    deserialize_metrics(bad)
+
+    # ------------------------------------------------------------------
+    # 与 serialize_metrics 的往返: int / Decimal 十进制内容精确
+    # ------------------------------------------------------------------
+    def test_roundtrip_int_and_decimal_exact(self):
+        tree = {
+            "big": 10 ** 100,
+            "neg": -(10 ** 99),
+            "dec": [Decimal("1.50"), Decimal("-0.00"), Decimal("1E+2"),
+                    Decimal("-1E-100")],
+            "nested": {"n": [0, -7, Decimal("9.99999999999999999999")]},
+        }
+        parsed = deserialize_metrics(serialize_metrics(tree))
+        self.assertEqual(parsed["big"], 10 ** 100)
+        self.assertIs(type(parsed["big"]), int)
+        self.assertEqual(parsed["neg"], -(10 ** 99))
+        for original, restored in zip(tree["dec"], parsed["dec"]):
+            self.assertIs(type(restored), Decimal)
+            self.assertEqual(str(restored), str(original))
+        # 再序列化: 文本逐字一致(键排序、紧凑、十进制内容精确)。
+        self.assertEqual(
+            serialize_metrics(parsed), serialize_metrics(tree)
+        )
+
+    def test_fraction_two_element_array_restores_as_plain_list(self):
+        # Fraction 的二元素数组没有类型标签, 按普通 list 还原, 不推断类型。
+        parsed = deserialize_metrics(serialize_metrics(Fraction(3, 4)))
+        self.assertEqual(parsed, [3, 4])
+        self.assertIs(type(parsed), list)
+        self.assertTrue(all(type(x) is int for x in parsed))
+        # 普通二元素数组与 Fraction 序列化结果无法区分, 同样按 list 还原。
+        self.assertEqual(deserialize_metrics("[3,4]"), [3, 4])
+
+    def test_consumes_checkpoint_state_text_and_interops(self):
+        # 直接消费 serialize_metrics 生成的 checkpoint 状态文本并继续恢复。
+        items, weights, k = list("abcd"), [1, 3, 2, 0], 3
+        state = weighted_sample_checkpoint(items, weights, k, 42, start=2)
+        parsed = deserialize_metrics(serialize_metrics(state))
+        rounds, next_state = weighted_sample_resume_indices(
+            items, weights, k, parsed, 3
+        )
+        self.assertEqual(
+            rounds,
+            weighted_sample_many_indices(items, weights, k, 3, 42, start=2),
+        )
+        # 与现有 JSON 原生状态互操作: 与 json.loads 解析结果逐项一致。
+        self.assertEqual(parsed, json.loads(serialize_metrics(state)))
+        # 解析出的下一状态再次序列化/解析后仍可继续推进。
+        again = deserialize_metrics(serialize_metrics(next_state))
+        more, _ = weighted_sample_resume_indices(items, weights, k, again, 2)
+        self.assertEqual(
+            more,
+            weighted_sample_many_indices(items, weights, k, 2, 42, start=5),
+        )
+
+    def test_roundtrip_through_json_native_state(self):
+        # json.dumps 产出的 JSON 原生文本同样可直接消费。
+        state = weighted_sample_checkpoint(["a", "b"], [1, 2], 1, 7, start=1)
+        parsed = deserialize_metrics(json.dumps(state))
+        rounds, _ = weighted_sample_resume_indices(["a", "b"], [1, 2], 1,
+                                                   parsed, 2)
+        self.assertEqual(
+            rounds, weighted_sample_many_indices(["a", "b"], [1, 2], 1, 2, 7,
+                                                 start=1)
+        )
+
+    def test_existing_serialize_behavior_unchanged(self):
+        # 新入口不影响既有序列化行为与采样序列。
+        self.assertEqual(
+            serialize_metrics({"名": "值", "x": [1, 2]}),
+            '{"x":[1,2],"名":"值"}',
+        )
+        self.assertEqual(
+            weighted_sample(["red", "green", "blue"], [1, 3, 2], 2, 42),
+            ["green", "red"],
+        )
 
 
 def _unlimited_int_str(value):
