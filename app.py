@@ -29,6 +29,26 @@
     weighted_sample_stream(items, weights, k, draws, seed=0, start=0)
         与 weighted_sample_stream_indices 同规则, 但每轮按相同索引产出
         元素值列表, 与 weighted_sample_many 逐轮对应。
+    weighted_sample_checkpoint(items, weights, k, seed=0, start=0)
+        为批量采样创建可暂停恢复的会话断点: 接受与批量入口相同的输入及
+        start(先从该 seed 对应的轮次流跳过 start 个完整轮次, 语义与批量
+        入口一致), 返回只含 JSON 原生值(str / int / float / bool / None
+        及由它们构成的列表 / 字典)的状态映射, 可直接交给
+        serialize_metrics, 经 json 解析后仍可恢复, 不依赖进程内对象身份。
+        状态携带版本、当前已完成轮次位置, 以及恢复时校验 items / weights
+        / k / seed 所需的信息(长度与内容指纹)。
+    weighted_sample_resume_indices(items, weights, k, state, draws)
+        从断点继续 weighted_sample_many_indices 的轮次流: 返回
+        (rounds, next_state) 二元组, rounds 为从断点开始连续 draws 轮、
+        每轮按抽样先后排列的零基原始索引, next_state 为完成这些轮次后的
+        新状态(规则同 weighted_sample_checkpoint)。逐轮结果与
+        weighted_sample_many_indices(items, weights, k,
+                                      位置+draws, seed, start=0)
+        对应区间逐项一致, 因此可多次分段恢复拼接出与一次性批量调用完全
+        相同的序列。state 必须与 items / weights / k / seed 匹配, 否则
+        ValueError; state 不是映射 -> TypeError; 非法状态 / 不支持的版本
+        -> ValueError。draws 为 0 时返回空轮次与未改变的状态; k 为 0 时
+        每轮返回空索引并推进位置。
     serialize_metrics(metrics)
         将指标树稳定序列化为紧凑 JSON 文本, 任意精度整数保持精确十进制。
         字典键先统一转换为成员名文本(str 原样, None->null, bool->true/false,
@@ -54,10 +74,12 @@ TypeError / ValueError 告知调用方, 且不会修改入参。
 """
 
 import collections.abc
+import base64
 import json
 import math
 import numbers
 import random
+import struct
 import sys
 from decimal import Decimal
 from fractions import Fraction
@@ -504,6 +526,538 @@ def weighted_sample_stream(items, weights, k, draws, seed=0, start=0):
         items, weights, k, draws, seed, start
     )
     return ([items[i] for i in round_indices] for round_indices in index_stream)
+
+
+# ---------------------------------------------------------------------------
+# 可暂停 / 恢复的采样会话
+# ---------------------------------------------------------------------------
+
+# 状态格式版本: 状态结构或字段含义发生不兼容变化时递增, 旧版本在恢复入口
+# 统一按 ValueError 拒绝。
+_CHECKPOINT_VERSION = 1
+
+# random.Random(Mersenne Twister)状态的固定结构: (version=3, 625 个
+# uint32 内部字, gauss 预生成标志)。只接受这一形状, 拒绝任何无法确定
+# 随机流位置的状态。
+_RNG_STATE_VERSION = 3
+_RNG_STATE_WORDS = 625
+_RNG_WORD_BITS = 32
+_RNG_WORD_MASK = (1 << _RNG_WORD_BITS) - 1
+
+# IEEE-754 双精度无符号 64 位位模式的取值范围。
+_FLOAT64_WORD_MASK = (1 << 64) - 1
+
+
+def _seed_fingerprint_material(seed):
+    """把支持的 seed 规范化为可 JSON 化的 (类型标签, 值) 对。
+
+    random.Random 的种子分派按类型区分(None 取系统熵; int/str/bytes 等
+    各有不同初始化), 因此指纹同时携带类型标签与原始值, 保证不同类型的
+    seed 不会被当成同一会话。值本身只使用 JSON 原生类型:
+    None/null、bool、int(含任意精度)、float、str、bytes/bytearray ->
+    base64 文本。
+    """
+    if seed is None:
+        return "null", None
+    if isinstance(seed, bool):
+        return "bool", bool(seed)
+    if isinstance(seed, int):
+        return "int", _jsonable_int(seed)
+    if isinstance(seed, float):
+        # 状态只允许 JSON 原生值且必须能直接交给 serialize_metrics;
+        # NaN / 无穷无法以合法 JSON 数值携带, 创建断点时按 ValueError
+        # 拒绝(普通采样入口仍保留 random.Random 对它们的既有行为)。
+        if not math.isfinite(seed):
+            raise ValueError("float seed for a checkpoint must be finite")
+        # 有限浮点以 IEEE-754 双精度的原始 64 位位模式保存为 JSON 整数:
+        # json 对浮点数走 repr 文本, 往返后值虽相等, 但位模式(如 -0.0
+        # 与 +0.0)信息可能丢失; 直接存整数保证逐位还原。
+        return "float", struct.unpack("<Q", struct.pack("<d", seed))[0]
+    if isinstance(seed, str):
+        return "str", seed
+    # bytes / bytearray: 原始字节不经过任何文本解码, 直接 base64(字母表对
+    # 字节序列是一一对应的, 恢复时还原出逐字节相同的 seed)。
+    return "bytes", base64.b64encode(bytes(seed)).decode("ascii")
+
+
+def _restore_seed_from_fingerprint(kind, value):
+    """_seed_fingerprint_material 的逆操作, 还原出逐值相同的 seed。"""
+    if kind == "null":
+        if value is not None:
+            raise ValueError("invalid checkpoint state: corrupted seed")
+        return None
+    if kind == "bool":
+        if not isinstance(value, bool):
+            raise ValueError("invalid checkpoint state: corrupted seed")
+        return value
+    if kind == "int":
+        # 常规位数为 JSON 裸整数; 超过运行时转换上限的整数以带标记的
+        # 十进制文本携带(见 _jsonable_int / _int_from_json)。
+        return _int_from_json(value)
+    if kind == "float":
+        # 指纹中是 IEEE-754 双精度的 64 位无符号位模式(JSON 整数, 最多
+        # 20 位十进制, 不触上限); 逐项校验范围后逐位还原 float(含 -0.0)。
+        bits = _int_from_json(value)
+        if not 0 <= bits <= _FLOAT64_WORD_MASK:
+            raise ValueError("invalid checkpoint state: corrupted seed")
+        seed = struct.unpack("<d", struct.pack("<Q", bits))[0]
+        if not math.isfinite(seed):
+            raise ValueError("invalid checkpoint state: corrupted seed")
+        return seed
+    if kind == "str":
+        if not isinstance(value, str):
+            raise ValueError("invalid checkpoint state: corrupted seed")
+        return value
+    if kind == "bytes":
+        if not isinstance(value, str):
+            raise ValueError("invalid checkpoint state: corrupted seed")
+        try:
+            return base64.b64decode(value.encode("ascii"), validate=True)
+        except Exception:
+            raise ValueError("invalid checkpoint state: corrupted seed")
+    raise ValueError("invalid checkpoint state: unsupported seed kind")
+
+
+def _rng_state_to_jsonable(rng):
+    """把 random.Random 的内部状态导出为只含 JSON 原生值的映射。
+
+    MT 状态为 (3, 625 个 uint32 字, gauss 预生成标志)。直接保存 625 个
+    大整数(每个 < 2**32, JSON 精确整数)与标志位, 不依赖进程内对象身份;
+    gauss_next 恒为 None(采样只用 random()/getrandbits, 不触发正态预生成),
+    仍原样记录以便状态完整。
+    """
+    version, words, gauss_next = rng.getstate()
+    if (
+        version != _RNG_STATE_VERSION
+        or not isinstance(words, tuple)
+        or len(words) != _RNG_STATE_WORDS
+    ):
+        # 当前解释器的 random.Random 应始终给出该形状; 不满足时无法给出
+        # 可移植状态。
+        raise ValueError("unsupported random generator state")
+    checked = []
+    for word in words:
+        if (
+            isinstance(word, bool)
+            or not isinstance(word, int)
+            or not 0 <= word <= _RNG_WORD_MASK
+        ):
+            raise ValueError("unsupported random generator state")
+        checked.append(word)
+    if gauss_next is not None:
+        if not isinstance(gauss_next, float) or not math.isfinite(gauss_next):
+            raise ValueError("unsupported random generator state")
+    return {"v": version, "w": checked, "g": gauss_next}
+
+
+def _rng_state_from_jsonable(data):
+    """把状态映射中的随机流描述还原为可 setstate 的随机发生器状态。
+
+    经 JSON 往返后字序列成为 list, setstate 要求内部字为 tuple, 这里逐项
+    校验后重建; 每个字必须是 [0, 2**32) 内的非布尔整数。
+    """
+    if not isinstance(data, collections.abc.Mapping):
+        raise ValueError("invalid checkpoint state: missing random stream")
+    version = data.get("v")
+    words = data.get("w")
+    gauss_next = data.get("g")
+    if version != _RNG_STATE_VERSION:
+        raise ValueError("invalid checkpoint state: unsupported rng version")
+    if not isinstance(words, list) or len(words) != _RNG_STATE_WORDS:
+        raise ValueError("invalid checkpoint state: corrupted random stream")
+    restored_words = []
+    for word in words:
+        if (
+            isinstance(word, bool)
+            or not isinstance(word, int)
+            or not 0 <= word <= _RNG_WORD_MASK
+        ):
+            raise ValueError("invalid checkpoint state: corrupted random stream")
+        restored_words.append(word)
+    if gauss_next is not None:
+        if isinstance(gauss_next, bool) or not isinstance(gauss_next, (int, float)):
+            raise ValueError(
+                "invalid checkpoint state: corrupted random stream"
+            )
+        try:
+            gauss_next = float(gauss_next)
+        except OverflowError:
+            # 手构造状态给出超出浮点范围的整数时, float() 会抛
+            # OverflowError; 统一折叠为状态非法的 ValueError。
+            raise ValueError(
+                "invalid checkpoint state: corrupted random stream"
+            )
+        if not math.isfinite(gauss_next):
+            raise ValueError(
+                "invalid checkpoint state: corrupted random stream"
+            )
+    return _RNG_STATE_VERSION, tuple(restored_words), gauss_next
+
+
+def _int_from_decimal_text(text):
+    """_int_to_decimal_text 的逆操作: 十进制文本 -> int, 不触发位数上限。
+
+    CPython 3.11+ 直接 int(text) 在位数超限时抛 ValueError; 这里按固定
+    宽度十进制块从高位向低位重组(value = value * 10**width + chunk),
+    每个块的位数严格位于运行时上限以内, 故对任意位数都给出与
+    int(text) 相同的值(支持前导 "-")。
+    """
+    if _GET_INT_MAX_STR_DIGITS is None:
+        return int(text)
+    limit = _GET_INT_MAX_STR_DIGITS()
+    if limit == 0:
+        return int(text)
+    negative = text.startswith("-")
+    digits = text[1:] if negative else text
+    width = limit - 1
+    base = _INT_DECIMAL_CHUNK_BASES.get(width)
+    if base is None:
+        base = 10 ** width
+        _INT_DECIMAL_CHUNK_BASES[width] = base
+    value = 0
+    for i in range(0, len(digits), width):
+        value = value * base + int(digits[i:i + width])
+    return -value if negative else value
+
+
+# 超大整数指纹的字符串标记前缀: 普通 JSON 整数在位数超过运行时转换上限
+# (CPython 3.11+, 默认约 4300 位)时无法被 json.loads 解析, 这类整数改以
+# 带标记的精确十进制文本携带; 标记含 NUL, 不会与 Decimal 文本或任何经
+# 整数通道的值冲突(用户字符串种子走独立的 "str" 通道, 不经此解码)。
+_BIGINT_MARKER = "\x00bigint\x00"
+
+
+def _jsonable_int(value):
+    """把 int 指纹值编码为可经 json 往返的值。
+
+    位数在运行时整数转换上限以内时保持 JSON 裸整数; 超过上限(如
+    10**5000 权重、超大 seed)时编码为带 _BIGINT_MARKER 前缀的精确十进制
+    文本, 保证 json.dumps/json.loads 不报错、值不丢精。
+    """
+    value = int(value)
+    if _GET_INT_MAX_STR_DIGITS is None:
+        return value
+    limit = _GET_INT_MAX_STR_DIGITS()
+    if limit == 0:
+        return value
+    # 负数的位数按绝对值计; 符号额外占一个字符不影响数字位数限制。
+    digits = len(_int_to_decimal_text(abs(value)))
+    if digits < limit:
+        return value
+    return _BIGINT_MARKER + _int_to_decimal_text(value)
+
+
+def _int_from_json(value):
+    """_jsonable_int 的逆操作; 非法形状统一抛 ValueError。"""
+    if isinstance(value, bool):
+        raise ValueError("invalid checkpoint state: expected integer")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.startswith(_BIGINT_MARKER):
+        try:
+            return _int_from_decimal_text(value[len(_BIGINT_MARKER):])
+        except ValueError:
+            raise ValueError("invalid checkpoint state: corrupted big integer")
+    raise ValueError("invalid checkpoint state: expected integer")
+
+
+def _canonical_weight(weight):
+    """把单个已通过取值校验的权重规范化为可 JSON 化的 (类型标签, 值)。
+
+    类型标签参与指纹: 数学值相同但类型不同(如 1 与 1.0 与 Fraction(1))
+    也按不同输入处理, 因为不同类型可能走不同抽样路径; 恢复入口要求传入
+    与创建时同一批权重。int 与 Fraction 分量在常规位数下为 JSON 裸整数,
+    超过运行时整数转换上限时改为带标记的精确十进制文本; Decimal 用其
+    精确十进制文本(逐字保留指数形式与尾随零, 保证 Decimal('1.5') 与
+    Decimal('1.50') 不混淆)。
+    """
+    if isinstance(weight, bool):  # 布尔权重已在输入校验阶段拒绝
+        raise TypeError("weight must be a real number, not bool")
+    if isinstance(weight, Fraction):
+        return "fraction", [
+            _jsonable_int(weight.numerator),
+            _jsonable_int(weight.denominator),
+        ]
+    if isinstance(weight, Decimal):
+        return "decimal", str(Decimal(weight))
+    if isinstance(weight, int):
+        return "int", _jsonable_int(weight)
+    if isinstance(weight, float):
+        return "float", weight
+    raise TypeError("weight must be a real number, not %s"
+                    % type(weight).__name__)
+
+
+def _build_input_fingerprint(n, weights, k, seed):
+    """构造恢复时核对采样输入所需的全部信息(只含 JSON 原生值)。"""
+    weight_kinds = []
+    weight_values = []
+    for weight in weights:
+        kind, value = _canonical_weight(weight)
+        weight_kinds.append(kind)
+        weight_values.append(value)
+    seed_kind, seed_value = _seed_fingerprint_material(seed)
+    return {
+        "n": n,
+        "k": k,
+        "weight_kinds": weight_kinds,
+        "weights": weight_values,
+        "seed_kind": seed_kind,
+        "seed": seed_value,
+    }
+
+
+def _checkpoint_state(position, rng, fingerprint):
+    """组装一份只含 JSON 原生值的状态映射。"""
+    return {
+        "version": _CHECKPOINT_VERSION,
+        "position": position,
+        "rng": _rng_state_to_jsonable(rng),
+        "input": fingerprint,
+    }
+
+
+def weighted_sample_checkpoint(items, weights, k, seed=0, start=0):
+    """创建可暂停恢复的采样会话断点。
+
+    输入与校验规则与 weighted_sample_many_indices 完全相同(含 start
+    窗口语义): items / weights / k / seed 沿用同一套类型与取值规则
+    (布尔不能冒充整数; 负权重、NaN、无穷、长度不一致、k 越界、正权重
+    不足分别按既有 TypeError / ValueError 处理), start 只接受非布尔
+    非负整数。校验顺序也与批量入口一致: 先 items / weights / k / seed,
+    再 start, 然后才做正权重可行性检查与抽样计划; 全部校验先于状态构造
+    完成。
+
+    返回只含 JSON 原生值的状态映射: 携带版本号、当前位置(已完成的轮次
+    数, 创建时即等于 start)、随机流在该位置的完整内部状态, 以及校验
+    items / weights / k / seed 所需的长度与逐权重内容指纹。该映射可直接
+    交给 serialize_metrics, 经 json.dumps / json.loads 往返后仍能被
+    weighted_sample_resume_indices 恢复, 调用方不持有任何进程内对象。
+    不修改入参。
+    """
+    n = _validate_sample_inputs(items, weights, k, seed)
+    _validate_start(start)
+
+    # 与批量入口相同的可行性前置检查: 即使不实际产生任何轮次(创建断点),
+    # 正权重不足也必须在返回状态前以 ValueError 告知。
+    if k > 0 and k > _count_positive_weights(weights):
+        raise ValueError("no positive weight")
+
+    pool_weights = list(weights)
+    pool_weights, use_exact = _select_sampling_plan(pool_weights, k)
+    fingerprint = _build_input_fingerprint(n, weights, k, seed)
+
+    rng = random.Random(seed)
+    # 先把随机流推进到 start 位置, 与批量入口的跳过完全一致(同一条确定
+    # 性随机流)。k=0 的轮次不消耗随机流, 无需空转。
+    if k > 0:
+        for _ in range(start):
+            _draw_indices_once(n, pool_weights, k, rng, use_exact)
+
+    return _checkpoint_state(start, rng, fingerprint)
+
+
+def _require_mapping_state(state):
+    """状态必须是映射(dict 子类也算), 否则 TypeError。"""
+    if not isinstance(state, collections.abc.Mapping):
+        raise TypeError("checkpoint state must be a mapping")
+
+
+def _read_checkpoint_state(state):
+    """读取并逐项校验断点状态, 返回 (position, rng_state, fingerprint)。
+
+    任何结构缺失、类型错误、不支持的版本都统一抛 ValueError; 调用方应
+    已确认 state 是映射(TypeError 边界在更外层)。
+    """
+    version = state.get("version")
+    if (
+        isinstance(version, bool)
+        or not isinstance(version, int)
+        or version != _CHECKPOINT_VERSION
+    ):
+        raise ValueError("invalid checkpoint state: unsupported version")
+
+    position = state.get("position")
+    if (
+        isinstance(position, bool)
+        or not isinstance(position, int)
+        or position < 0
+    ):
+        raise ValueError("invalid checkpoint state: invalid position")
+
+    rng_state = _rng_state_from_jsonable(state.get("rng"))
+
+    fingerprint = state.get("input")
+    if not isinstance(fingerprint, collections.abc.Mapping):
+        raise ValueError("invalid checkpoint state: missing input fingerprint")
+
+    return position, rng_state, fingerprint
+
+
+def _read_fingerprint(fingerprint):
+    """校验指纹结构并返回 (n, k, seed, 规范化权重描述列表)。"""
+    n = fingerprint.get("n")
+    k = fingerprint.get("k")
+    if isinstance(n, bool) or not isinstance(n, int) or n < 0:
+        raise ValueError("invalid checkpoint state: corrupted input fingerprint")
+    if isinstance(k, bool) or not isinstance(k, int) or not 0 <= k <= n:
+        raise ValueError("invalid checkpoint state: corrupted input fingerprint")
+
+    weight_kinds = fingerprint.get("weight_kinds")
+    weight_values = fingerprint.get("weights")
+    if (
+        not isinstance(weight_kinds, list)
+        or not isinstance(weight_values, list)
+        or len(weight_kinds) != n
+        or len(weight_values) != n
+    ):
+        raise ValueError("invalid checkpoint state: corrupted input fingerprint")
+    allowed_kinds = {"int", "float", "fraction", "decimal"}
+    canonical = []
+    for kind, value in zip(weight_kinds, weight_values):
+        if not isinstance(kind, str) or kind not in allowed_kinds:
+            raise ValueError(
+                "invalid checkpoint state: corrupted input fingerprint"
+            )
+        if kind in ("int",):
+            try:
+                value = _int_from_json(value)
+            except ValueError:
+                raise ValueError(
+                    "invalid checkpoint state: corrupted input fingerprint"
+                )
+        elif kind == "float":
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(
+                    "invalid checkpoint state: corrupted input fingerprint"
+                )
+            try:
+                value = float(value)
+            except OverflowError:
+                # 手构造状态给出超出浮点范围的整数时统一折叠为状态非法。
+                raise ValueError(
+                    "invalid checkpoint state: corrupted input fingerprint"
+                )
+            if not math.isfinite(value):
+                # 合法权重指纹只可能含有限浮点(创建时已校验); NaN / 无穷
+                # 只可能来自损坏或伪造状态。
+                raise ValueError(
+                    "invalid checkpoint state: corrupted input fingerprint"
+                )
+        elif kind == "fraction":
+            if not isinstance(value, list) or len(value) != 2:
+                raise ValueError(
+                    "invalid checkpoint state: corrupted input fingerprint"
+                )
+            try:
+                numerator = _int_from_json(value[0])
+                denominator = _int_from_json(value[1])
+            except ValueError:
+                raise ValueError(
+                    "invalid checkpoint state: corrupted input fingerprint"
+                )
+            if denominator <= 0:
+                raise ValueError(
+                    "invalid checkpoint state: corrupted input fingerprint"
+                )
+            value = [numerator, denominator]
+        else:  # decimal
+            if not isinstance(value, str):
+                raise ValueError(
+                    "invalid checkpoint state: corrupted input fingerprint"
+                )
+        canonical.append((kind, value))
+
+    seed = _restore_seed_from_fingerprint(
+        fingerprint.get("seed_kind"), fingerprint.get("seed")
+    )
+    return n, k, seed, canonical
+
+
+def _canonical_weight_for_comparison(weight):
+    """与 _read_fingerprint 解码后的形式一致的 (类型标签, 值) 对。
+
+    int / Fraction 分量解码为真实 Python 整数(超大整数的带标记文本同样
+    解码), 便于与从状态读出的指纹直接比较。
+    """
+    kind, value = _canonical_weight(weight)
+    if kind == "int":
+        return kind, _int_from_json(value)
+    if kind == "fraction":
+        return kind, [_int_from_json(value[0]), _int_from_json(value[1])]
+    return kind, value
+
+
+def _check_fingerprint_matches(saved_n, saved_weights, n, weights):
+    """核对当前调用的 items/weights 与断点指纹逐项一致。
+
+    items 只通过长度 n 参与采样(抽样从不读取元素值), 故长度一致即为
+    匹配; weights 逐位置比较类型标签与精确值。任何不一致统一抛
+    ValueError。k 在调用处单独比较; seed 不在这里比较: 恢复调用不单独
+    接收 seed, 它直接取自状态指纹。
+    """
+    if saved_n != n:
+        raise ValueError("checkpoint state does not match items, weights or k")
+    for index, (saved_kind, saved_value) in enumerate(saved_weights):
+        kind, value = _canonical_weight_for_comparison(weights[index])
+        if kind != saved_kind or value != saved_value:
+            raise ValueError("checkpoint state does not match items, weights or k")
+
+
+def weighted_sample_resume_indices(items, weights, k, state, draws):
+    """从断点继续产生索引轮次, 返回 (rounds, next_state)。
+
+    校验顺序与异常边界:
+      1. state 不是映射 -> TypeError(无法从非映射读取任何会话信息);
+      2. draws 沿用批量入口规则: 非布尔整数否则 TypeError, 负数
+         ValueError —— 紧接映射检查, 使 draws 的参数错误不被状态内容
+         掩盖;
+      3. 状态结构 / 版本 / 随机流 / 指纹非法或版本不支持 -> ValueError,
+         同时从指纹还原该会话的 seed;
+      4. items / weights / k 以状态中的 seed 完成与创建/批量入口完全
+         相同的类型与取值校验(布尔不能冒充整数, 负权重、NaN、无穷、
+         长度不一致、k 越界分别处理), 并做正权重可行性检查;
+      5. 状态与 items / weights / k 不匹配 -> ValueError。
+    全部校验先于任何轮次产生, 失败时绝不返回部分轮次。
+
+    draws=0 时完成全部校验后返回 ([], 未改变的状态); k=0 时每轮返回
+    空索引并把位置推进一轮(空轮不消耗随机流)。返回的 next_state 与
+    weighted_sample_checkpoint 的状态同构, 可再次恢复或经 JSON 序列化
+    往返后恢复。不修改入参(含 state)。
+    """
+    _require_mapping_state(state)
+    _validate_draws(draws)
+
+    # 先完整读取并校验状态, 同时取出会话记录的 seed; 状态损坏时后续
+    # 一切都无从谈起。
+    position, rng_state, fingerprint = _read_checkpoint_state(state)
+    saved_n, saved_k, seed, saved_weights = _read_fingerprint(fingerprint)
+
+    # 以会话 seed 完成与现有采样入口一致的全部输入校验与可行性检查。
+    n = _validate_sample_inputs(items, weights, k, seed)
+    if k > 0 and k > _count_positive_weights(weights):
+        raise ValueError("no positive weight")
+
+    if saved_k != k:
+        raise ValueError("checkpoint state does not match items, weights or k")
+    _check_fingerprint_matches(saved_n, saved_weights, n, weights)
+
+    pool_weights = list(weights)
+    pool_weights, use_exact = _select_sampling_plan(pool_weights, k)
+
+    rng = random.Random()
+    rng.setstate(rng_state)
+
+    rounds = []
+    for _ in range(draws):
+        rounds.append(
+            _draw_indices_once(n, pool_weights, k, rng, use_exact)
+        )
+
+    next_state = _checkpoint_state(
+        position + draws, rng, _build_input_fingerprint(n, weights, k, seed)
+    )
+    return rounds, next_state
 
 
 # ---------------------------------------------------------------------------

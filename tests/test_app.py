@@ -12,6 +12,8 @@ from app import (
     weighted_sample_many_indices,
     weighted_sample_stream,
     weighted_sample_stream_indices,
+    weighted_sample_checkpoint,
+    weighted_sample_resume_indices,
     serialize_metrics,
 )
 
@@ -1776,6 +1778,480 @@ class DecimalWeightSamplingTest(unittest.TestCase):
         self.assertEqual(
             serialize_metrics({"n": 10 ** 100}),
             '{"n":1%s}' % ("0" * 100),
+        )
+
+
+class WeightedSampleCheckpointTest(unittest.TestCase):
+    """可暂停 / 恢复会话 weighted_sample_checkpoint 与
+    weighted_sample_resume_indices。"""
+
+    # 覆盖两种抽样路径与四种权重类型的配置。
+    CONFIGS = [
+        (list("abcdefgh"), [1, 3, 2, 0, 5, 2, 1, 4], 4),
+        (list(range(6)), [10 ** 100, 1, 2, 0, 10 ** 80, 3], 5),
+        (["p", "q", "r"], [2, Fraction(1), 0.5], 3),
+        (["d1", "d2", "d3", "d4"],
+         [Decimal("1.50"), Decimal("0"), Decimal("2.25"), Decimal("1E-100")], 3),
+        (["a", "b"], [1e308, 1e308], 2),
+        (["a", "b", "c"], [10 ** 400, Fraction(1, 10 ** 100), 0.0], 1),
+        (["x"], [0], 0),
+        ([], [], 0),
+    ]
+    SEEDS = [0, 1, 42, -7, 1.5, -0.0, 3.14159, "seed", b"bytes",
+             bytearray(b"ba"), True, False, None]
+    # 可复现 seed(seed=None 取系统熵, 不能与另一次独立批量调用比较)。
+    DETERMINISTIC_SEEDS = [s for s in SEEDS if s is not None]
+
+    def test_state_contains_version_position_and_fingerprint(self):
+        items, weights, k = self.CONFIGS[0]
+        state = weighted_sample_checkpoint(items, weights, k, 42, start=3)
+        self.assertIsInstance(state, dict)
+        self.assertEqual(state["version"], 1)
+        self.assertEqual(state["position"], 3)
+        self.assertEqual(set(state), {"version", "position", "rng", "input"})
+        fp = state["input"]
+        self.assertEqual(fp["n"], len(items))
+        self.assertEqual(fp["k"], k)
+        self.assertEqual(len(fp["weights"]), len(items))
+        self.assertEqual(len(fp["weight_kinds"]), len(items))
+        self.assertIn("seed_kind", fp)
+        self.assertIn("seed", fp)
+        self.assertEqual(set(state["rng"]), {"v", "w", "g"})
+        self.assertEqual(len(state["rng"]["w"]), 625)
+
+    def test_state_is_json_native(self):
+        # 整个状态必须由 JSON 原生值构成: json.dumps/loads 往返后逐项相等。
+        for items, weights, k in self.CONFIGS:
+            for seed in self.SEEDS:
+                with self.subTest(k=k, seed=seed):
+                    state = weighted_sample_checkpoint(items, weights, k, seed)
+                    restored = json.loads(json.dumps(state, ensure_ascii=False))
+                    self.assertEqual(restored, state)
+
+    def test_state_serializes_via_serialize_metrics(self):
+        items, weights, k = self.CONFIGS[3]
+        state = weighted_sample_checkpoint(items, weights, k, "あ")
+        text = serialize_metrics(state)  # 不得抛异常, 紧凑且键排序
+        self.assertIsInstance(text, str)
+        restored = json.loads(text)
+        self.assertEqual(restored, state)
+        rounds, next_state = weighted_sample_resume_indices(
+            items, weights, k, restored, 4
+        )
+        self.assertEqual(
+            rounds, weighted_sample_many_indices(items, weights, k, 4, "あ")
+        )
+        self.assertEqual(next_state["position"], 4)
+
+    def test_chunked_resume_equals_batch_slice(self):
+        for items, weights, k in self.CONFIGS:
+            for seed in self.DETERMINISTIC_SEEDS:
+                with self.subTest(k=k, seed=seed):
+                    total = 13
+                    full = weighted_sample_many_indices(
+                        items, weights, k, total, seed
+                    )
+                    state = weighted_sample_checkpoint(
+                        items, weights, k, seed, start=2
+                    )
+                    r1, state = weighted_sample_resume_indices(
+                        items, weights, k, state, 4
+                    )
+                    # 分段之间插入 JSON 往返, 恢复不得依赖进程内对象身份。
+                    state = json.loads(serialize_metrics(state))
+                    r2, state = weighted_sample_resume_indices(
+                        items, weights, k, state, 3
+                    )
+                    r3, state = weighted_sample_resume_indices(
+                        items, weights, k, state, 4
+                    )
+                    self.assertEqual(r1, full[2:6])
+                    self.assertEqual(r2, full[6:9])
+                    self.assertEqual(r3, full[9:13])
+                    self.assertEqual(r1 + r2 + r3, full[2:])
+                    self.assertEqual(state["position"], total)
+
+    def test_resume_rounds_extend_beyond_initial_batch(self):
+        items, weights, k = self.CONFIGS[1]
+        full = weighted_sample_many_indices(items, weights, k, 25, 7)
+        state = weighted_sample_checkpoint(items, weights, k, 7)
+        collected = []
+        for take in (10, 10, 5):
+            rounds, state = weighted_sample_resume_indices(
+                items, weights, k, state, take
+            )
+            collected.extend(rounds)
+        self.assertEqual(collected, full)
+
+    def test_resumed_state_equals_fresh_checkpoint_at_position(self):
+        items, weights, k = self.CONFIGS[0]
+        state = weighted_sample_checkpoint(items, weights, k, 9, start=2)
+        _, state = weighted_sample_resume_indices(items, weights, k, state, 3)
+        direct = weighted_sample_checkpoint(items, weights, k, 9, start=5)
+        self.assertEqual(state, direct)
+
+    def test_draws_zero_returns_empty_and_unchanged_state(self):
+        for items, weights, k in self.CONFIGS:
+            state = weighted_sample_checkpoint(items, weights, k, 11, start=4)
+            snapshot = json.loads(json.dumps(state))
+            rounds, next_state = weighted_sample_resume_indices(
+                items, weights, k, state, 0
+            )
+            self.assertEqual(rounds, [])
+            self.assertEqual(next_state, snapshot)
+            self.assertEqual(next_state["position"], 4)
+            # 原状态不被修改。
+            self.assertEqual(state, snapshot)
+
+    def test_k_zero_advances_position_without_rng_consumption(self):
+        items, weights = list("abcde"), [1, 2, 3, 4, 5]
+        state = weighted_sample_checkpoint(items, weights, 0, 3, start=2)
+        r1, s1 = weighted_sample_resume_indices(items, weights, 0, state, 3)
+        self.assertEqual(r1, [[], [], []])
+        self.assertEqual(s1["position"], 5)
+        # k=0 的轮次不消耗随机流。
+        self.assertEqual(s1["rng"], state["rng"])
+        r2, s2 = weighted_sample_resume_indices(items, weights, 0, s1, 2)
+        self.assertEqual(r2, [[], []])
+        self.assertEqual(s2["position"], 7)
+        self.assertEqual(s2["rng"], state["rng"])
+        # 与批量入口的空轮序列一致。
+        self.assertEqual(
+            weighted_sample_many_indices(items, weights, 0, 5, 3, start=2),
+            [[], [], [], [], []],
+        )
+
+    def test_within_round_without_replacement_zero_weight_excluded(self):
+        items = list(range(10))
+        weights = [5, 0, 3, 0, 2, 7, 0, 1, 4, 0]
+        positive = {0, 2, 4, 5, 7, 8}
+        state = weighted_sample_checkpoint(items, weights, 6, 5)
+        rounds = []
+        for _ in range(40):
+            chunk, state = weighted_sample_resume_indices(
+                items, weights, 6, state, 1
+            )
+            rounds.extend(chunk)
+        for rd in rounds:
+            self.assertEqual(len(rd), 6)
+            self.assertEqual(len(set(rd)), 6)
+            self.assertTrue(all(i in positive for i in rd))
+        self.assertEqual(
+            rounds, weighted_sample_many_indices(items, weights, 6, 40, 5)
+        )
+
+    def test_duplicate_values_distinguished_by_position(self):
+        # 重复值按位置区分: 恢复序列与批量序列逐轮一致即证明按位置处理。
+        items = [1, 1, 1, 1]
+        weights = [1, 2, 3, 4]
+        full = weighted_sample_many_indices(items, weights, 4, 20, 8)
+        state = weighted_sample_checkpoint(items, weights, 4, 8)
+        collected = []
+        for i in range(0, 20, 7):
+            take = min(7, 20 - i)
+            rounds, state = weighted_sample_resume_indices(
+                items, weights, 4, state, take
+            )
+            collected.extend(rounds)
+        self.assertEqual(collected, full)
+
+    def test_same_seed_stream_consistency_across_resumes(self):
+        items, weights, k = list("abcdef"), [3, 1, 4, 1, 5, 9], 4
+        first_state = weighted_sample_checkpoint(items, weights, k, 123)
+        r_a, _ = weighted_sample_resume_indices(
+            items, weights, k, json.loads(json.dumps(first_state)), 6
+        )
+        r_b, _ = weighted_sample_resume_indices(
+            items, weights, k, json.loads(json.dumps(first_state)), 6
+        )
+        self.assertEqual(r_a, r_b)
+        self.assertEqual(
+            r_a, weighted_sample_many_indices(items, weights, k, 6, 123)
+        )
+
+    def test_seed_none_resume_is_pinned_by_snapshot(self):
+        # seed=None 创建时取系统熵, 但同一状态的多次恢复必须逐轮相同。
+        import copy
+        items, weights, k = list("abcdef"), [1, 2, 3, 4, 5, 6], 3
+        state = weighted_sample_checkpoint(items, weights, k, None)
+        r_a, _ = weighted_sample_resume_indices(
+            items, weights, k, copy.deepcopy(state), 4
+        )
+        r_b, _ = weighted_sample_resume_indices(
+            items, weights, k, copy.deepcopy(state), 4
+        )
+        self.assertEqual(r_a, r_b)
+
+    # -- 状态相关异常 -----------------------------------------------------
+
+    def test_state_not_mapping_raises_type_error(self):
+        items, weights, k = self.CONFIGS[0]
+        for bad in (None, 42, 1.0, "state", [1, 2], (), True, object()):
+            with self.subTest(bad=bad):
+                with self.assertRaises(TypeError):
+                    weighted_sample_resume_indices(items, weights, k, bad, 1)
+
+    def test_unsupported_version_raises_value_error(self):
+        items, weights, k = self.CONFIGS[0]
+        state = weighted_sample_checkpoint(items, weights, k, 0)
+        for bad_version in (0, 2, -1, "1", 1.0, True, None, []):
+            with self.subTest(bad_version=bad_version):
+                corrupt = json.loads(json.dumps(state))
+                corrupt["version"] = bad_version
+                with self.assertRaises(ValueError):
+                    weighted_sample_resume_indices(
+                        items, weights, k, corrupt, 1
+                    )
+
+    def test_corrupt_state_structure_raises_value_error(self):
+        items, weights, k = self.CONFIGS[0]
+        state = weighted_sample_checkpoint(items, weights, k, 0)
+
+        def corrupt(fn):
+            data = json.loads(json.dumps(state))
+            fn(data)
+            return data
+
+        bad_states = [
+            corrupt(lambda d: d.pop("position")),
+            corrupt(lambda d: d.pop("rng")),
+            corrupt(lambda d: d.pop("input")),
+            corrupt(lambda d: d.update(position=-1)),
+            corrupt(lambda d: d.update(position="2")),
+            corrupt(lambda d: d.update(position=True)),
+            corrupt(lambda d: d.update(rng={})),
+            corrupt(lambda d: d["rng"].__setitem__("v", 2)),
+            corrupt(lambda d: d["rng"]["w"].pop()),
+            corrupt(lambda d: d["rng"]["w"].__setitem__(0, 2 ** 32)),
+            corrupt(lambda d: d["rng"]["w"].__setitem__(0, -1)),
+            corrupt(lambda d: d["rng"]["w"].__setitem__(0, True)),
+            corrupt(lambda d: d["rng"].__setitem__("g", "x")),
+            corrupt(lambda d: d["input"].__setitem__("n", 99)),
+            corrupt(lambda d: d["input"].__setitem__("k", 2)),
+            corrupt(lambda d: d["input"]["weights"].__setitem__(0, 999)),
+            corrupt(lambda d: d["input"]["weight_kinds"].__setitem__(0, "float")),
+            corrupt(lambda d: d["input"].__setitem__("seed_kind", "bogus")),
+            corrupt(lambda d: d.update(input=[])),
+        ]
+        for bad in bad_states:
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    weighted_sample_resume_indices(items, weights, k, bad, 1)
+
+    def test_state_input_mismatch_raises_value_error(self):
+        items, weights, k = self.CONFIGS[0]
+        state = weighted_sample_checkpoint(items, weights, k, 5)
+        with self.assertRaises(ValueError):
+            weighted_sample_resume_indices(
+                items + ["extra"], weights, k, state, 1
+            )
+        with self.assertRaises(ValueError):
+            weighted_sample_resume_indices(
+                items, [w + 1 for w in weights], k, state, 1
+            )
+        with self.assertRaises(ValueError):
+            # 数学值相同但类型标签不同: 1 (int) vs 1.0 (float)。
+            alt = [float(w) for w in weights]
+            weighted_sample_resume_indices(items, alt, k, state, 1)
+        with self.assertRaises(ValueError):
+            weighted_sample_resume_indices(items, weights, k - 1, state, 1)
+        # items 长度相同但内容任意都可恢复(采样从不读取元素值)。
+        rounds, _ = weighted_sample_resume_indices(
+            ["z"] * len(items), weights, k, state, 1
+        )
+        self.assertEqual(len(rounds), 1)
+
+    # -- 输入校验沿用既有规则 ---------------------------------------------
+
+    def test_draws_validation(self):
+        items, weights, k = self.CONFIGS[0]
+        state = weighted_sample_checkpoint(items, weights, k, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_resume_indices(items, weights, k, state, -1)
+        for bad in (True, 1.0, "2", None, 2 + 0j):
+            with self.subTest(bad=bad):
+                with self.assertRaises(TypeError):
+                    weighted_sample_resume_indices(items, weights, k, state, bad)
+
+    def test_resume_input_validation_matches_sampling_rules(self):
+        items, weights, k = self.CONFIGS[0]
+        state = weighted_sample_checkpoint(items, weights, k, 0)
+
+        def resume(items_=items, weights_=weights, k_=k, state_=state, draws_=1):
+            weighted_sample_resume_indices(items_, weights_, k_, state_, draws_)
+
+        with self.assertRaises(TypeError):
+            resume(items_="abcdefgh")
+        with self.assertRaises(TypeError):
+            resume(weights_=[1, True, 2, 0, 5, 2, 1, 4])
+        with self.assertRaises(TypeError):
+            resume(k_=True)
+        with self.assertRaises(ValueError):
+            resume(weights_=[1, -2, 2, 0, 5, 2, 1, 4])
+        with self.assertRaises(ValueError):
+            resume(weights_=[1, float("nan"), 2, 0, 5, 2, 1, 4])
+        with self.assertRaises(ValueError):
+            resume(weights_=[1, float("inf"), 2, 0, 5, 2, 1, 4])
+        with self.assertRaises(ValueError):
+            resume(weights_=[1, 2, 3])
+        with self.assertRaises(ValueError):
+            resume(k_=9)
+        with self.assertRaises(ValueError):
+            resume(items_=["a", "b"], weights_=[1, 0], k_=2)
+        # draws=0 也必须先完成全部校验。
+        with self.assertRaises(ValueError):
+            resume(weights_=[float("nan")] * 8, draws_=0)
+
+    def test_checkpoint_input_validation_matches_batch_rules(self):
+        items, weights, k = self.CONFIGS[0]
+        with self.assertRaises(TypeError):
+            weighted_sample_checkpoint("abcdefgh", weights, k, 0)
+        with self.assertRaises(TypeError):
+            weighted_sample_checkpoint(items, [1, True, 2, 0, 5, 2, 1, 4], k, 0)
+        with self.assertRaises(TypeError):
+            weighted_sample_checkpoint(items, weights, k, object())
+        with self.assertRaises(TypeError):
+            weighted_sample_checkpoint(items, weights, k, 0, start=True)
+        with self.assertRaises(ValueError):
+            weighted_sample_checkpoint(items, [1, -2, 2, 0, 5, 2, 1, 4], k, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_checkpoint(items, weights, 9, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_checkpoint(items, weights, k, 0, start=-1)
+        with self.assertRaises(ValueError):
+            weighted_sample_checkpoint(["a", "b"], [1, 0], 2, 0)
+        # k=0 仍先校验权重取值。
+        with self.assertRaises(ValueError):
+            weighted_sample_checkpoint(items, [float("nan")] * 8, 0, 0)
+
+    def test_checkpoint_rejects_non_finite_float_seed(self):
+        items, weights, k = self.CONFIGS[0]
+        with self.assertRaises(ValueError):
+            weighted_sample_checkpoint(items, weights, k, float("nan"))
+        with self.assertRaises(ValueError):
+            weighted_sample_checkpoint(items, weights, k, float("inf"))
+
+    def test_finite_float_seed_bits_roundtrip_including_signed_zero(self):
+        items, weights, k = self.CONFIGS[0]
+        for seed in (-0.0, 0.0, 1.5, -3.25, 1e308, 5e-324):
+            state = weighted_sample_checkpoint(items, weights, k, seed)
+            restored = json.loads(serialize_metrics(state))
+            rounds, _ = weighted_sample_resume_indices(
+                items, weights, k, restored, 3
+            )
+            self.assertEqual(
+                rounds,
+                weighted_sample_many_indices(items, weights, k, 3, seed),
+            )
+
+    def test_oversized_integers_roundtrip_through_stock_json(self):
+        # 超过运行时整数文本转换上限(CPython 3.11+, 默认 4300 位)的权重、
+        # Fraction 分量与 seed 仍必须能 json.loads 后精确恢复。
+        import sys
+        if not hasattr(sys, "get_int_max_str_digits"):
+            self.skipTest("解释器没有整数文本位数限制")
+        cases = [
+            (["a", "b", "c", "d"], [10 ** 5000, 1, 10 ** 3000, 0], 2, 3),
+            (["a", "b", "c"],
+             [Fraction(10 ** 6000, 7), Fraction(1, 10 ** 6000), 1], 2, 2),
+        ]
+        for c_items, c_weights, c_k, c_seed in cases:
+            state = weighted_sample_checkpoint(
+                c_items, c_weights, c_k, c_seed
+            )
+            restored = json.loads(serialize_metrics(state))
+            rounds, _ = weighted_sample_resume_indices(
+                c_items, c_weights, c_k, restored, 3
+            )
+            self.assertEqual(
+                rounds,
+                weighted_sample_many_indices(
+                    c_items, c_weights, c_k, 3, c_seed
+                ),
+            )
+        # 超大整数 seed 同样往返。
+        items, weights, k = self.CONFIGS[0]
+        for seed in (10 ** 7000 - 1, -(10 ** 7000)):
+            state = weighted_sample_checkpoint(items, weights, k, seed)
+            restored = json.loads(serialize_metrics(state))
+            rounds, _ = weighted_sample_resume_indices(
+                items, weights, k, restored, 2
+            )
+            self.assertEqual(
+                rounds,
+                weighted_sample_many_indices(items, weights, k, 2, seed),
+            )
+
+    def test_normal_integers_remain_bare_json_numbers(self):
+        state = weighted_sample_checkpoint(
+            ["a", "b", "c"], [1, 2, 3], 2, 7
+        )
+        text = serialize_metrics(state)
+        self.assertIn('"weights":[1,2,3]', text)
+        self.assertIn('"n":3', text)
+
+    def test_corrupt_big_integer_marker_raises_value_error(self):
+        items, weights, k = ["a", "b", "c", "d"], [10 ** 5000, 1, 10 ** 3000, 0], 2
+        state = weighted_sample_checkpoint(items, weights, k, 3)
+        corrupt = json.loads(serialize_metrics(state))
+        corrupt["input"]["weights"][0] = "\x00bigint\x00not-a-number"
+        with self.assertRaises(ValueError):
+            weighted_sample_resume_indices(items, weights, k, corrupt, 1)
+
+    def test_no_partial_rounds_on_error(self):
+        # 非法输入在任何轮次产生前抛出; 调用方拿不到二元组, 也无部分结果。
+        items, weights, k = self.CONFIGS[0]
+        state = weighted_sample_checkpoint(items, weights, k, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_resume_indices(
+                items, [w + 1 for w in weights], k, state, 1000
+            )
+        corrupt = json.loads(json.dumps(state))
+        corrupt["version"] = 2
+        with self.assertRaises(ValueError):
+            weighted_sample_resume_indices(items, weights, k, corrupt, 1000)
+
+    def test_inputs_and_state_not_mutated(self):
+        import copy
+        items, weights, k = list("abcdef"), [3, Fraction(1, 2), Decimal("1.5"),
+                                             0, 2, 1], 4
+        items_snapshot = list(items)
+        weights_snapshot = list(weights)
+        state = weighted_sample_checkpoint(items, weights, k, 11, start=3)
+        state_snapshot = copy.deepcopy(state)
+        weighted_sample_resume_indices(items, weights, k, state, 5)
+        self.assertEqual(items, items_snapshot)
+        self.assertEqual(weights, weights_snapshot)
+        self.assertEqual(state, state_snapshot)
+
+    def test_start_window_matches_batch_slice(self):
+        for items, weights, k in self.CONFIGS[:6]:
+            for seed in (0, 7, 1.5, "s"):
+                full = weighted_sample_many_indices(items, weights, k, 12, seed)
+                state = weighted_sample_checkpoint(
+                    items, weights, k, seed, start=6
+                )
+                self.assertEqual(state["position"], 6)
+                rounds, next_state = weighted_sample_resume_indices(
+                    items, weights, k, state, 6
+                )
+                self.assertEqual(rounds, full[6:12])
+                self.assertEqual(next_state["position"], 12)
+
+    def test_existing_entries_default_results_unchanged(self):
+        # 新入口不改变任何现有默认结果。
+        items, weights = ["red", "green", "blue"], [1, 3, 2]
+        self.assertEqual(weighted_sample(items, weights, 2, 42), ["green", "red"])
+        self.assertEqual(
+            weighted_sample_indices(items, weights, 3, 7), [1, 0, 2]
+        )
+        self.assertEqual(
+            weighted_sample_many_indices(items, weights, 3, 4, 42),
+            weighted_sample_many_indices(items, weights, 3, 4, 42),
+        )
+        self.assertEqual(
+            list(weighted_sample_stream_indices(items, weights, 3, 4, 42)),
+            weighted_sample_many_indices(items, weights, 3, 4, 42),
         )
 
 
