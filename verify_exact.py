@@ -551,6 +551,139 @@ check(cp_ok, "checkpoint 状态经 serialize/deserialize 还原后可断点续�
 
 
 # ---------------------------------------------------------------------------
+# 12. 带原始位置排除集合的批量/流式入口
+# ---------------------------------------------------------------------------
+section("排除位置的批量/流式入口")
+
+ex_items = list("abcdef")
+ex_weights = [HUGE, 1, HUGE * 2, 7, 0, 3]
+excluded = (0, 4)
+
+# 12.1 start=0 第一轮逐项等于单轮排除入口; 流式与批量逐轮一致; values 与
+#   indices 逐轮对应; excluded 为空时与既有 many/stream 逐轮一致。
+ex_rounds_ok = True
+for seed in (0, 1, 42, -7, 1.5, "s", b"s", True):
+    many_i = app.weighted_sample_many_excluding_indices(
+        ex_items, ex_weights, 3, excluded, 5, seed)
+    many_v = app.weighted_sample_many_excluding(
+        ex_items, ex_weights, 3, excluded, 5, seed)
+    stream_i = list(app.weighted_sample_stream_excluding_indices(
+        ex_items, ex_weights, 3, excluded, 5, seed))
+    stream_v = list(app.weighted_sample_stream_excluding(
+        ex_items, ex_weights, 3, excluded, 5, seed))
+    single_i = app.weighted_sample_excluding_indices(
+        ex_items, ex_weights, 3, excluded, seed)
+    if many_i[0] != single_i or stream_i != many_i or stream_v != many_v:
+        ex_rounds_ok = False
+    if many_v != [[ex_items[i] for i in rd] for rd in many_i]:
+        ex_rounds_ok = False
+    if app.weighted_sample_many_excluding_indices(
+            ex_items, ex_weights, 3, (), 5, seed) != \
+            app.weighted_sample_many_indices(ex_items, ex_weights, 3, 5, seed):
+        ex_rounds_ok = False
+    if list(app.weighted_sample_stream_excluding_indices(
+            ex_items, ex_weights, 3, (), 5, seed)) != \
+            list(app.weighted_sample_stream_indices(
+                ex_items, ex_weights, 3, 5, seed)):
+        ex_rounds_ok = False
+    for rd in many_i:
+        if len(rd) != 3 or len(set(rd)) != 3 or any(i in excluded for i in rd):
+            ex_rounds_ok = False
+check(ex_rounds_ok,
+      "首轮=单轮排除入口, 流式=批量, values<->indices 逐轮对应, 排除位置不出现")
+
+# 12.2 共享随机流 + start 窗口: 区间切片逐项一致; k=0 跳过不消耗随机流。
+full = app.weighted_sample_many_excluding_indices(
+    ex_items, ex_weights, 3, excluded, 12, 99)
+window_ok = all(
+    app.weighted_sample_many_excluding_indices(
+        ex_items, ex_weights, 3, excluded, 12 - s, 99, start=s) == full[s:]
+    and list(app.weighted_sample_stream_excluding_indices(
+        ex_items, ex_weights, 3, excluded, 12 - s, 99, start=s)) == full[s:]
+    for s in (0, 1, 5, 11)
+)
+check(window_ok, "start 只跳过轮次: 批量/流式结果等于完整序列的区间切片")
+kzero = app.weighted_sample_many_excluding_indices(
+    ex_items, ex_weights, 0, excluded, 3, 7, start=10 ** 9)
+check(kzero == [[], [], []], "k=0 每轮为空且跳过不消耗随机流")
+
+# 12.3 集合语义: 重复成员与排列顺序忽略。
+base = app.weighted_sample_many_excluding_indices(
+    ex_items, ex_weights, 3, (1, 3), 4, 7)
+set_ok = all(
+    app.weighted_sample_many_excluding_indices(
+        ex_items, ex_weights, 3, ex2, 4, 7) == base
+    for ex2 in ((3, 1), (1, 1, 3), [3, 1, 1, 3])
+)
+check(set_ok, "excluded 按集合语义解释(重复与顺序忽略)")
+
+# 12.4 校验顺序与异常分类: 先采样输入, 再 excluded, 再 draws/start; 流式
+#   入口在创建时抛出全部错误; draws=0 也完成全部校验。
+raises(TypeError,
+       lambda: app.weighted_sample_many_excluding_indices(
+           "ab", [1, 2], 1, (9,), 1, 0),
+       "批量排除: items 错误先于 excluded 越界 -> TypeError")
+raises(ValueError,
+       lambda: app.weighted_sample_many_excluding_indices(
+           ex_items, ex_weights, 3, (9,), 1, 0),
+       "批量排除: excluded 越界 -> ValueError")
+raises(TypeError,
+       lambda: app.weighted_sample_many_excluding_indices(
+           ex_items, ex_weights, 3, (True,), 1, 0),
+       "批量排除: 布尔成员 -> TypeError")
+raises(TypeError,
+       lambda: app.weighted_sample_many_excluding_indices(
+           ex_items, ex_weights, 3, excluded, True, 0),
+       "批量排除: 布尔 draws -> TypeError")
+raises(ValueError,
+       lambda: app.weighted_sample_many_excluding_indices(
+           ex_items, ex_weights, 3, excluded, -1, 0),
+       "批量排除: 负 draws -> ValueError")
+raises(TypeError,
+       lambda: app.weighted_sample_stream_excluding_indices(
+           ex_items, ex_weights, 3, excluded, 1, 0, start=1.0),
+       "流式排除: start 类型错误在创建时 -> TypeError")
+raises(ValueError,
+       lambda: app.weighted_sample_stream_excluding(
+           ["a", "b"], [1, 0], 1, (0,), 3, 0),
+       "流式排除: 正权重不足在创建时 -> ValueError")
+raises(ValueError,
+       lambda: app.weighted_sample_many_excluding_indices(
+           ex_items, ex_weights, 3, (9,), 0, 0),
+       "批量排除: draws=0 仍先校验 excluded -> ValueError")
+raises(ValueError,
+       lambda: app.weighted_sample_many_excluding_indices(
+           ["a", "b"], [1, 0], 2, (1,), 0, 0),
+       "批量排除: draws=0 仍先做正权重可行性检查 -> ValueError")
+check(app.weighted_sample_many_excluding_indices(
+    ex_items, ex_weights, 3, excluded, 0, 0) == [],
+    "批量排除: draws=0 且合法 -> []")
+
+# 12.5 精确权重路径下仍确定, 且输出可直接精确序列化。
+ex_dec_rounds = app.weighted_sample_many_excluding_indices(
+    ["H", "t", "z"], [HUGE, _Decimal("1E-100"), _Decimal("-0")], 1, (0,), 3, 7)
+check(ex_dec_rounds == [[1], [1], [1]]
+      and list(app.weighted_sample_stream_excluding_indices(
+          ["H", "t", "z"], [HUGE, _Decimal("1E-100"), _Decimal("-0")],
+          1, (0,), 3, 7)) == ex_dec_rounds,
+      "排除入口下 Decimal 极小正权重/带符号零仍走精确路径")
+serialized = app.serialize_metrics({"rounds": app.weighted_sample_many_excluding_indices(
+    list(range(6)), [HUGE, 1, 2, 3, 4, 5], 3, (0,), 4, 42)})
+check(app.deserialize_metrics(serialized)["rounds"]
+      == app.weighted_sample_many_excluding_indices(
+          list(range(6)), [HUGE, 1, 2, 3, 4, 5], 3, (0,), 4, 42),
+      "排除批量索引轮次可直接 serialize_metrics 并精确往返")
+
+# 12.6 入参不被修改。
+ex_snap = (list(ex_items), list(ex_weights), list(excluded))
+app.weighted_sample_many_excluding_indices(ex_items, ex_weights, 3, excluded, 4, 5)
+list(app.weighted_sample_stream_excluding(ex_items, ex_weights, 2, excluded, 4, 5))
+check((ex_items, ex_weights, list(excluded)) ==
+      (ex_snap[0], ex_snap[1], list(ex_snap[2])),
+      "排除批量/流式入口不修改 items / weights / excluded")
+
+
+# ---------------------------------------------------------------------------
 print()
 if _FAILURES:
     print("结果: %d 项失败" % len(_FAILURES))
