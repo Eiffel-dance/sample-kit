@@ -45,6 +45,14 @@
         的状态; k=0 时每轮为空索引列表且位置照常推进。状态不是映射抛
         TypeError; 状态结构非法、版本不支持或与 items/weights/k 不匹配
         统一抛 ValueError; 其余输入错误沿用既有 TypeError / ValueError。
+    weighted_sample_resume(items, weights, k, state, draws)
+        与 weighted_sample_resume_indices 同规则的按元素值入口: 接受
+        断点创建时相同的 items、weights、k、state 与 draws, 返回
+        (轮次列表, 下一状态), 其中每轮是按相同原始位置回取 items 得到
+        的元素值列表, 与 weighted_sample_resume_indices 返回的每轮
+        零基索引逐项映射一致 —— 相同值的不同位置分别消耗、互不重复。
+        校验、异常类别、draws=0 / k=0 语义与状态推进规则和按索引入口
+        完全相同; 下一状态可继续传给本入口或按索引入口。
     serialize_metrics(metrics)
         将指标树稳定序列化为紧凑 JSON 文本, 任意精度整数保持精确十进制。
         字典键先统一转换为成员名文本(str 原样, None->null, bool->true/false,
@@ -935,6 +943,28 @@ def weighted_sample_resume_indices(items, weights, k, state, draws):
         planned_exact, next_rng_payload,
     )
     return rounds, next_state
+
+
+def weighted_sample_resume(items, weights, k, state, draws):
+    """weighted_sample_resume_indices 的按元素值入口。
+
+    参数、校验规则、异常类别与状态推进语义和
+    weighted_sample_resume_indices 完全一致: 调用时先完成全部校验
+    (任一失败都在产生任何轮次前以既有 TypeError / ValueError 告知),
+    再从断点位置继续产出 draws 轮。区别仅在于返回的每轮是按相同原始
+    位置回取 items 得到的元素值列表, 与按索引入口返回的每轮零基索引
+    逐项映射一致 —— 相同值的不同位置分别消耗、互不重复。draws=0 时
+    返回空轮次与位置、随机状态不变的状态副本; k=0 时每轮为空列表且
+    位置照常推进、不消耗随机流。下一状态与按索引入口返回的状态相同,
+    可继续传给本入口或 weighted_sample_resume_indices。不修改入参,
+    也不修改传入的状态映射。
+    """
+    index_rounds, next_state = weighted_sample_resume_indices(
+        items, weights, k, state, draws
+    )
+    return [
+        [items[i] for i in round_indices] for round_indices in index_rounds
+    ], next_state
 
 
 # ---------------------------------------------------------------------------
