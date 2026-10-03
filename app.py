@@ -45,6 +45,18 @@
         的状态; k=0 时每轮为空索引列表且位置照常推进。状态不是映射抛
         TypeError; 状态结构非法、版本不支持或与 items/weights/k 不匹配
         统一抛 ValueError; 其余输入错误沿用既有 TypeError / ValueError。
+    weighted_sample_resume(items, weights, k, state, draws)
+        按元素值恢复的公开入口, 规则与 weighted_sample_resume_indices
+        完全一致(同一套 items/weights/k 采样入口校验、state 恢复入口校验
+        与异常类别; weights 不足仍是 ValueError): 传入与创建断点时相同的
+        items、weights、k 与状态, 返回 (轮次列表, 下一状态)。每轮是元素值
+        列表, 其顺序与内容等于按索引恢复返回的每轮原始位置逐项映射
+        (round_values[j] == items[round_indices[j]]), 因此相同值的不同位置
+        分别消耗, 轮内绝不出现重复位置。返回的下一状态与按索引入口返回的
+        完全相同(position、RNG 快照、digest 一致), 可再次传入本入口(或按
+        索引入口)继续推进; draws=0 时返回空轮次与未改变的状态副本, k=0 时
+        生成 draws 个空列表并按轮数推进 position、不消耗随机流。不修改入参,
+        也不修改传入的状态映射。
     serialize_metrics(metrics)
         将指标树稳定序列化为紧凑 JSON 文本, 任意精度整数保持精确十进制。
         字典键先统一转换为成员名文本(str 原样, None->null, bool->true/false,
@@ -860,28 +872,18 @@ def _validate_checkpoint_state(state):
     return position, k, n, state["exact"], seed, rng_state
 
 
-def weighted_sample_resume_indices(items, weights, k, state, draws):
-    """从断点继续产出索引轮次, 返回 (轮次列表, 下一状态)。
+def _resume_rounds_indices(items, weights, k, state, draws):
+    """两个恢复入口共用的已校验核心: 只产出索引轮次与下一状态。
 
-    第一轮从断点记录的位置开始; 逐轮结果与
-    weighted_sample_many_indices(items, weights, k, draws, seed,
-    start=position) 完全一致, 即等于 start=0 完整批量序列的零基区间
-    [position, position+draws)。返回前完成与采样入口一致的全部输入
-    校验, 并核对状态与 items、weights、k 及 (seed, 位置, RNG 快照)的
-    自洽性: 状态不是映射抛 TypeError; 非法状态、不支持的版本、状态与
-    输入不匹配统一抛 ValueError; items/weights/k/draws 的错误沿用既有
-    TypeError / ValueError。所有失败都在任何轮次物化之前确定, 绝不返回
-    部分轮次。draws=0 返回空轮次与位置不变的新状态; k=0 时每轮为空
-    列表, 位置仍逐轮加一。不修改入参, 也不修改传入的状态映射。
+    校验顺序按恢复入口约定固定: 先确认 state 是映射(否则 TypeError),
+    再按既有规则校验 draws; 然后校验状态本身的结构/版本/摘要, 用状态携带
+    的 seed 完成 items、weights、k 的采样入口校验; 最后核对状态与当前输入
+    的绑定(k/n、items 指纹、weights 指纹、抽样计划)。任一失败都在物化任何
+    轮次之前抛出既有 TypeError / ValueError(正权重可行性失败同样是
+    ValueError); JSON / Decimal / random 层面的意外异常统一收敛为
+    ValueError, 绝不以其他类型泄漏。全部通过后直接从 RNG 快照续接, 返回
+    (索引轮次, 下一状态); 不修改入参, 也不修改传入的状态映射。
     """
-    # 状态不是映射: TypeError(文档约定的明确分类)。映射前提下的一切
-    # 结构/版本/摘要问题在 _validate_checkpoint_state 中统一为 ValueError。
-    if not isinstance(state, collections.abc.Mapping):
-        raise TypeError("checkpoint state must be a mapping")
-    # draws 的类型/取值规则独立于状态, 先按既有规则校验(TypeError /
-    # ValueError), 再解析状态。
-    _validate_draws(draws)
-
     # 状态结构与版本先校验(ValueError), 取出的 seed 再用于采样输入校验,
     # 保证 _validate_sample_inputs 的 seed 类型规则同样被执行。
     position, state_k, state_n, use_exact, seed, rng_state = (
@@ -934,6 +936,78 @@ def weighted_sample_resume_indices(items, weights, k, state, draws):
         state["items_digest"], state["weights_digest"],
         planned_exact, next_rng_payload,
     )
+    return rounds, next_state
+
+
+def weighted_sample_resume_indices(items, weights, k, state, draws):
+    """从断点继续产出索引轮次, 返回 (轮次列表, 下一状态)。
+
+    第一轮从断点记录的位置开始; 逐轮结果与
+    weighted_sample_many_indices(items, weights, k, draws, seed,
+    start=position) 完全一致, 即等于 start=0 完整批量序列的零基区间
+    [position, position+draws)。返回前完成与采样入口一致的全部输入
+    校验, 并核对状态与 items、weights、k 及 (seed, 位置, RNG 快照)的
+    自洽性: 状态不是映射抛 TypeError; 非法状态、不支持的版本、状态与
+    输入不匹配统一抛 ValueError; items/weights/k/draws 的错误沿用既有
+    TypeError / ValueError。所有失败都在任何轮次物化之前确定, 绝不返回
+    部分轮次。draws=0 返回空轮次与位置不变的新状态; k=0 时每轮为空
+    列表, 位置仍逐轮加一。不修改入参, 也不修改传入的状态映射。
+    """
+    # 状态不是映射: TypeError(文档约定的明确分类)。映射前提下的一切
+    # 结构/版本/摘要问题在 _validate_checkpoint_state 中统一为 ValueError。
+    if not isinstance(state, collections.abc.Mapping):
+        raise TypeError("checkpoint state must be a mapping")
+    # draws 的类型/取值规则独立于状态, 先按既有规则校验(TypeError /
+    # ValueError), 再解析状态。
+    _validate_draws(draws)
+    return _resume_rounds_indices(items, weights, k, state, draws)
+
+
+def weighted_sample_resume(items, weights, k, state, draws):
+    """按元素值从断点继续, 返回 (元素值轮次列表, 下一状态)。
+
+    校验顺序按恢复入口约定固定: 调用开始先按现有采样入口完成 items、
+    weights、k 的结构、长度、权重取值与范围校验(这部分与 seed 无关;
+    state 携带的 seed 其标签化编码与既有种子类型语义随后随 state 一并
+    校验), 再按现有恢复入口校验 state 的映射类型、版本、字段集合、摘要、
+    随机数状态以及 state 与当前输入的绑定, draws 必须是非布尔非负整数。
+    状态不是映射抛 TypeError; 非法状态、版本不支持、状态与输入不匹配、
+    正权重不足等一律抛 ValueError; 其余输入错误沿用既有 TypeError /
+    ValueError。所有失败都在产生任何轮次之前确定, JSON / Decimal /
+    random 的异常不会以其他类型泄漏。
+
+    每轮返回元素值列表, 与 weighted_sample_resume_indices 返回的每轮
+    原始位置逐项对应(第 j 个值恰为 items[第 j 个索引]): 相同值的不同
+    位置分别消耗, 轮内不会出现重复位置。返回的下一状态与按索引入口产出
+    的完全相同(position、RNG 快照、digest 一致), 只含 JSON 原生值,
+    可直接再次传入本入口, 或经 serialize_metrics 与 json 解析后继续
+    恢复。draws=0 返回空轮次与位置、随机状态不变的状态副本; k=0 时生成
+    draws 个空列表并按轮数推进 position, 不消耗随机流。不修改入参,
+    也不修改传入的状态映射。
+    """
+    # 第一步: 先按现有采样入口完成 items、weights、k 的结构、长度、权重
+    # 取值与范围校验。这些检查只用到 seed 的类型(0 恒为合法种子), 与
+    # seed 的具体值无关; state 中携带的 seed 其编码与类型在下一步状态
+    # 校验时由 _tagged_value_to_seed 按既有种子语义核对。因此即使 state
+    # 本身已损坏, 非法 items/weights/k 仍优先以采样入口的异常类别报告。
+    _validate_sample_inputs(items, weights, k, 0)
+
+    # 第二步: 恢复入口的映射类型检查与 draws 规则(TypeError / ValueError)。
+    if not isinstance(state, collections.abc.Mapping):
+        raise TypeError("checkpoint state must be a mapping")
+    _validate_draws(draws)
+
+    # 第三步: 状态结构/版本/字段/摘要/RNG、state 与输入绑定(含从状态
+    # 解出的 seed 再跑一次采样入口校验)、正权重可行性与抽样计划核对,
+    # 全部通过后从 RNG 快照续接产出索引轮次。与按索引入口共用同一个
+    # 已校验核心, 因此轮次内容、下一状态、异常类别与其逐项一致;
+    # JSON / Decimal / random 异常同样统一收敛为 ValueError。
+    index_rounds, next_state = _resume_rounds_indices(
+        items, weights, k, state, draws
+    )
+    # 按每轮原始位置逐项映射为元素值: 相同值的不同位置各自独立映射,
+    # 轮内不重复位置这一性质随索引结果原样保留。只读取 items, 不修改入参。
+    rounds = [[items[i] for i in round_indices] for round_indices in index_rounds]
     return rounds, next_state
 
 
