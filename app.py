@@ -29,6 +29,22 @@
     weighted_sample_stream(items, weights, k, draws, seed=0, start=0)
         与 weighted_sample_stream_indices 同规则, 但每轮按相同索引产出
         元素值列表, 与 weighted_sample_many 逐轮对应。
+    weighted_sample_checkpoint(items, weights, k, seed=0, start=0)
+        创建可暂停/恢复的采样会话断点: 接受与批量入口相同的输入及 start,
+        在完成与批量入口一致的全部校验(含正权重可行性)后, 把随机流推进到
+        "已完成 start 轮"的位置并快照, 返回只含 JSON 原生值的状态映射。
+        状态携带版本、当前位置(已完成轮次)、k/n、校验 items 与 weights
+        所需的指纹、标签化 seed 以及 RNG 内部状态; 可直接交给
+        serialize_metrics, 经 json 序列化/解析(甚至跨进程)后仍可恢复,
+        调用方不依赖任何进程内对象身份。
+    weighted_sample_resume_indices(items, weights, k, state, draws)
+        从断点继续: 传入与创建断点时相同的 items、weights、k 与状态,
+        返回 (轮次列表, 下一状态)。第一轮从断点位置开始, 逐轮等于
+        weighted_sample_many_indices 对应零基区间 [pos, pos+draws);
+        下一状态可再次传入本入口继续推进。draws=0 时返回空轮次与未改变
+        的状态; k=0 时每轮为空索引列表且位置照常推进。状态不是映射抛
+        TypeError; 状态结构非法、版本不支持或与 items/weights/k 不匹配
+        统一抛 ValueError; 其余输入错误沿用既有 TypeError / ValueError。
     serialize_metrics(metrics)
         将指标树稳定序列化为紧凑 JSON 文本, 任意精度整数保持精确十进制。
         字典键先统一转换为成员名文本(str 原样, None->null, bool->true/false,
@@ -54,6 +70,8 @@ TypeError / ValueError 告知调用方, 且不会修改入参。
 """
 
 import collections.abc
+import hashlib
+import hmac
 import json
 import math
 import numbers
@@ -504,6 +522,419 @@ def weighted_sample_stream(items, weights, k, draws, seed=0, start=0):
         items, weights, k, draws, seed, start
     )
     return ([items[i] for i in round_indices] for round_indices in index_stream)
+
+
+# ---------------------------------------------------------------------------
+# 可暂停 / 恢复的采样会话
+# ---------------------------------------------------------------------------
+
+# 状态格式版本: 状态结构发生不兼容变化时递增; 恢复时只接受当前版本。
+_CHECKPOINT_VERSION = 1
+
+
+def _hash_text(text):
+    """对文本取 sha256, 返回与 json.loads 往返一致的 hexdigest 字符串。"""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _weight_fingerprint_text(index, weight):
+    """把单个权重规范化为参与指纹计算的文本行。
+
+    行首的类型标签保证不同类型的同值权重(如 1 与 1.0、Decimal('1') 与
+    Fraction(1, 1))不被视为同一输入 —— 它们可能走不同抽样路径; 同类型
+    同值才逐字相同。判定只针对已通过 _validate_sample_inputs 的权重
+    (非 bool、int/float/Fraction/Decimal、有限非负), 不会触发 decimal
+    比较异常; Fraction 与大整数全程按精确有理值/十进制值处理, 不经过
+    浮点, 超大 Decimal 指数同样安全。
+    """
+    if isinstance(weight, bool):  # 防御性: bool 已在输入校验中拒绝
+        return "%d:b:%d" % (index, int(weight))
+    if isinstance(weight, int):
+        return "%d:i:%s" % (index, _int_to_decimal_text(weight))
+    if isinstance(weight, Fraction):
+        return "%d:f:%s/%s" % (
+            index,
+            _int_to_decimal_text(weight.numerator),
+            _int_to_decimal_text(weight.denominator),
+        )
+    if isinstance(weight, Decimal):
+        return "%d:d:%s" % (index, str(Decimal(weight)))
+    # 有限非负 float: repr 文本对 -0.0 保留符号, 且 repr/eval 往返精确
+    # 还原同一二进制浮点值。
+    return "%d:r:%s" % (index, float.__repr__(weight))
+
+
+def _weights_fingerprint(weights):
+    """对整个权重序列取指纹: 逐位置规范化后整体 sha256。"""
+    body = "\n".join(
+        _weight_fingerprint_text(i, w) for i, w in enumerate(weights)
+    )
+    return _hash_text(body)
+
+
+def _items_fingerprint(items):
+    """对 items 取指纹。
+
+    items 的元素类型不受采样入口约束(可以是任意对象), 故不能假定其可
+    JSON 化; 指纹用于检测传入 items 是否与创建断点时逐位置一致(类型与
+    值的 repr 均参与), 跨进程恢复时调用方须自行保证传入相同 items —
+    状态本身不承载 items 内容。
+    """
+    digest = hashlib.sha256()
+    for i, item in enumerate(items):
+        digest.update(
+            ("%d:%s:%r\n" % (i, type(item).__qualname__, item)).encode(
+                "utf-8", "backslashreplace"
+            )
+        )
+    return digest.hexdigest()
+
+
+def _seed_to_tagged_value(seed):
+    """把支持的 seed 类型编码为只含 JSON 原生值的标签化结构。
+
+    标签: n=None; i=int(含 bool, 用第三元素 true 单独标记以免被 int
+    吞掉); f=float; s=str; b=bytes; y=bytearray。float 的 NaN / ±Inf
+    不是合法 JSON 值, 用文本 nan/inf/-inf 保留; -0.0 直接以 JSON 数值
+    -0.0 保留符号。bytes/bytearray 用 latin-1 对 0..255 双向无损编码。
+    """
+    if seed is None:
+        return ["n", None]
+    if isinstance(seed, bool):
+        return ["i", 1 if seed else 0, True]
+    if isinstance(seed, int):
+        return ["i", seed]
+    if isinstance(seed, float):
+        if math.isnan(seed):
+            return ["f", "nan"]
+        if math.isinf(seed):
+            return ["f", "inf" if seed > 0 else "-inf"]
+        return ["f", seed]
+    if isinstance(seed, str):
+        return ["s", seed]
+    if isinstance(seed, bytes):
+        return ["b", seed.decode("latin-1")]
+    # bytearray
+    return ["y", bytes(seed).decode("latin-1")]
+
+
+def _tagged_value_to_seed(value):
+    """_seed_to_tagged_value 的逆运算; 非法结构统一抛 ValueError。"""
+    if not isinstance(value, list) or not value \
+            or not isinstance(value[0], str):
+        raise ValueError("invalid checkpoint seed encoding")
+    tag = value[0]
+    if tag == "n":
+        if len(value) != 2 or value[1] is not None:
+            raise ValueError("invalid checkpoint seed encoding")
+        return None
+    if tag == "i":
+        number = value[1] if len(value) in (2, 3) else None
+        if isinstance(number, bool) or not isinstance(number, int):
+            raise ValueError("invalid checkpoint seed encoding")
+        if len(value) == 2:
+            return number
+        if len(value) == 3 and value[2] is True and number in (0, 1):
+            return bool(number)
+        raise ValueError("invalid checkpoint seed encoding")
+    if tag == "f":
+        if len(value) != 2:
+            raise ValueError("invalid checkpoint seed encoding")
+        payload = value[1]
+        if payload == "nan":
+            return float("nan")
+        if payload == "inf":
+            return float("inf")
+        if payload == "-inf":
+            return float("-inf")
+        if isinstance(payload, bool) or not isinstance(payload, (int, float)):
+            raise ValueError("invalid checkpoint seed encoding")
+        return float(payload)
+    if tag == "s":
+        if len(value) != 2 or not isinstance(value[1], str):
+            raise ValueError("invalid checkpoint seed encoding")
+        return value[1]
+    if tag in ("b", "y"):
+        if len(value) != 2 or not isinstance(value[1], str):
+            raise ValueError("invalid checkpoint seed encoding")
+        try:
+            raw = value[1].encode("latin-1")
+        except UnicodeEncodeError:
+            raise ValueError("invalid checkpoint seed encoding")
+        return raw if tag == "b" else bytearray(raw)
+    raise ValueError("invalid checkpoint seed encoding")
+
+
+def _rng_state_to_jsonable(state):
+    """把 random.Random.getstate() 三元组编码为 JSON 原生结构。
+
+    CPython 的 MT19937 状态为 (3, 625 个整数组成的元组, gauss 缓存):
+    缓存为 None 或一个 float。整数(含 32 位无符号值)原样保留, 经
+    serialize_metrics 仍是精确十进制; None/有限 float 分别标签化。
+    """
+    if (not isinstance(state, tuple) or len(state) != 3
+            or state[0] != 3 or not isinstance(state[1], tuple)
+            or len(state[1]) != 625):
+        raise ValueError("invalid checkpoint RNG state")
+    if any(isinstance(x, bool) or not isinstance(x, int) for x in state[1]):
+        raise ValueError("invalid checkpoint RNG state")
+    cached = state[2]
+    if cached is None:
+        cache = ["n", None]
+    elif isinstance(cached, bool) or not isinstance(cached, float):
+        raise ValueError("invalid checkpoint RNG state")
+    elif not math.isfinite(cached):
+        raise ValueError("invalid checkpoint RNG state")
+    else:
+        cache = ["f", cached]
+    return {"v": 3, "mt": list(state[1]), "cached": cache}
+
+
+def _rng_state_from_jsonable(payload):
+    """_rng_state_to_jsonable 的逆运算; 非法结构统一抛 ValueError。"""
+    if not isinstance(payload, dict) or set(payload) != {"v", "mt", "cached"}:
+        raise ValueError("invalid checkpoint RNG state")
+    if payload["v"] != 3 or not isinstance(payload["mt"], list) \
+            or len(payload["mt"]) != 625:
+        raise ValueError("invalid checkpoint RNG state")
+    mt = []
+    # MT19937: 前 624 项是 32 位无符号状态字, 末项是下一个位置索引
+    # (0..624)。显式校验取值范围, 使被篡改(即使重算了摘要)的越界状态
+    # 统一抛 ValueError, 而不是在 random.setstate 中泄漏 OverflowError。
+    for pos, x in enumerate(payload["mt"]):
+        if isinstance(x, bool) or not isinstance(x, int):
+            raise ValueError("invalid checkpoint RNG state")
+        if pos < 624:
+            if not 0 <= x < (1 << 32):
+                raise ValueError("invalid checkpoint RNG state")
+        elif not 0 <= x <= 624:
+            raise ValueError("invalid checkpoint RNG state")
+        mt.append(x)
+    encoded = payload["cached"]
+    if not isinstance(encoded, list) or len(encoded) != 2:
+        raise ValueError("invalid checkpoint RNG state")
+    label, raw = encoded
+    if label == "n":
+        if raw is not None:
+            raise ValueError("invalid checkpoint RNG state")
+        cached = None
+    elif label == "f":
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            raise ValueError("invalid checkpoint RNG state")
+        cached = float(raw)
+        if not math.isfinite(cached):
+            raise ValueError("invalid checkpoint RNG state")
+    else:
+        raise ValueError("invalid checkpoint RNG state")
+    return (3, tuple(mt), cached)
+
+
+def _checkpoint_binding_digest(seed_tagged, position, k, n,
+                               items_digest, weights_digest, exact, rng_payload):
+    """把断点各字段绑定为一个防篡改摘要。
+
+    用 serialize_metrics 对字段集合做规范化(键排序、紧凑、任意精度
+    整数精确十进制)后再 sha256: 任意对 position / seed / RNG 快照 /
+    指纹 / exact 的改动若不重算摘要, 恢复时都会被发现。校验为 O(状态
+    大小), 恢复长批次无需从头重放随机流。
+    """
+    return _hash_text(serialize_metrics({
+        "seed": seed_tagged,
+        "position": position,
+        "k": k,
+        "n": n,
+        "items_digest": items_digest,
+        "weights_digest": weights_digest,
+        "exact": exact,
+        "rng": rng_payload,
+    }))
+
+
+def _prepare_validated_session(items, weights, k, seed, start):
+    """断点入口共用的前置准备: 与批量入口一致的校验、可行性检查与跳轮。
+
+    返回 (n, planned_weights, use_exact, rng): rng 已由 seed 初始化并
+    先消耗 start 个完整轮次(k=0 的轮次不消耗随机流), 其内部状态恰好
+    对应批量序列中 "start 轮已完成" 的断点。planned_weights 是按抽样
+    计划(可能经过精确放大)复制出的本地权重, 绝不修改入参。
+    """
+    n = _validate_sample_inputs(items, weights, k, seed)
+    _validate_start(start)
+
+    # 与批量入口相同的可行性前置检查: 即使只是创建断点, k 超过有效正
+    # 权重个数也必须在返回任何状态前确定抛 ValueError。
+    if k > 0 and k > _count_positive_weights(weights):
+        raise ValueError("no positive weight")
+
+    pool_weights = list(weights)
+    rng = random.Random(seed)
+    planned_weights, use_exact = _select_sampling_plan(pool_weights, k)
+
+    # 与 weighted_sample_many_indices 的跳过逻辑一致: k=0 不消耗随机流。
+    if k > 0:
+        for _ in range(start):
+            _draw_indices_once(n, planned_weights, k, rng, use_exact)
+    return n, planned_weights, use_exact, rng
+
+
+def weighted_sample_checkpoint(items, weights, k, seed=0, start=0):
+    """创建采样会话断点(只含 JSON 原生值的状态映射)。
+
+    校验规则与 weighted_sample_many_indices 完全一致(items、weights、
+    k、seed、start 的类型与取值, 以及正权重可行性), 全部通过后把随机
+    流推进到已完成 start 轮的位置并快照。返回的状态只含 str/int/bool/
+    None/float/list/dict 等 JSON 原生值, 可直接交给 serialize_metrics,
+    也可经 json 文本落盘后在另一进程中交给
+    weighted_sample_resume_indices 恢复; 不依赖任何进程内对象身份。
+    不修改入参。
+    """
+    n, planned_weights, use_exact, rng = _prepare_validated_session(
+        items, weights, k, seed, start
+    )
+    seed_tagged = _seed_to_tagged_value(seed)
+    rng_payload = _rng_state_to_jsonable(rng.getstate())
+    items_digest = _items_fingerprint(items)
+    weights_digest = _weights_fingerprint(weights)
+    state = {
+        "version": _CHECKPOINT_VERSION,
+        "position": start,
+        "k": k,
+        "n": n,
+        "items_digest": items_digest,
+        "weights_digest": weights_digest,
+        "seed": seed_tagged,
+        "exact": bool(use_exact),
+        "rng": rng_payload,
+    }
+    state["digest"] = _checkpoint_binding_digest(
+        seed_tagged, start, k, n, items_digest, weights_digest,
+        bool(use_exact), rng_payload,
+    )
+    return state
+
+
+def _validate_checkpoint_state(state):
+    """校验状态本身的结构与版本, 返回规范化字段。
+
+    调用前须已确认 state 是映射(否则 TypeError 在外层抛出)。字段缺失、
+    类型错误、非法取值、版本不支持、多余字段等一切结构问题统一抛
+    ValueError。
+    """
+    required = ("version", "position", "k", "n", "items_digest",
+                "weights_digest", "seed", "exact", "rng", "digest")
+    if not all(key in state for key in required):
+        raise ValueError("invalid checkpoint state: missing fields")
+    if set(state) != set(required):
+        raise ValueError("invalid checkpoint state: unexpected fields")
+
+    version = state["version"]
+    if (isinstance(version, bool) or not isinstance(version, int)
+            or version != _CHECKPOINT_VERSION):
+        raise ValueError("unsupported checkpoint version: %r" % (version,))
+    position = state["position"]
+    k = state["k"]
+    n = state["n"]
+    for name, value in (("position", position), ("k", k), ("n", n)):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError("invalid checkpoint state: %s" % name)
+    if k > n:
+        raise ValueError("invalid checkpoint state: k exceeds n")
+    if not isinstance(state["exact"], bool):
+        raise ValueError("invalid checkpoint state: exact")
+    for name in ("items_digest", "weights_digest", "digest"):
+        if not isinstance(state[name], str):
+            raise ValueError("invalid checkpoint state: %s" % name)
+
+    # 两个逆运算对内部结构问题统一抛 ValueError。
+    seed = _tagged_value_to_seed(state["seed"])
+    rng_state = _rng_state_from_jsonable(state["rng"])
+
+    # 绑定摘要: 任何对字段的篡改(位置、seed、RNG 快照、指纹、exact)若不
+    # 附带重算的摘要, 都会在这里被发现 —— 因此恢复时不必从头重放随机流。
+    expected_digest = _checkpoint_binding_digest(
+        state["seed"], position, k, n, state["items_digest"],
+        state["weights_digest"], state["exact"], state["rng"],
+    )
+    if not hmac.compare_digest(expected_digest, state["digest"]):
+        raise ValueError("invalid checkpoint state: digest mismatch")
+    return position, k, n, state["exact"], seed, rng_state
+
+
+def weighted_sample_resume_indices(items, weights, k, state, draws):
+    """从断点继续产出索引轮次, 返回 (轮次列表, 下一状态)。
+
+    第一轮从断点记录的位置开始; 逐轮结果与
+    weighted_sample_many_indices(items, weights, k, draws, seed,
+    start=position) 完全一致, 即等于 start=0 完整批量序列的零基区间
+    [position, position+draws)。返回前完成与采样入口一致的全部输入
+    校验, 并核对状态与 items、weights、k 及 (seed, 位置, RNG 快照)的
+    自洽性: 状态不是映射抛 TypeError; 非法状态、不支持的版本、状态与
+    输入不匹配统一抛 ValueError; items/weights/k/draws 的错误沿用既有
+    TypeError / ValueError。所有失败都在任何轮次物化之前确定, 绝不返回
+    部分轮次。draws=0 返回空轮次与位置不变的新状态; k=0 时每轮为空
+    列表, 位置仍逐轮加一。不修改入参, 也不修改传入的状态映射。
+    """
+    # 状态不是映射: TypeError(文档约定的明确分类)。映射前提下的一切
+    # 结构/版本/摘要问题在 _validate_checkpoint_state 中统一为 ValueError。
+    if not isinstance(state, collections.abc.Mapping):
+        raise TypeError("checkpoint state must be a mapping")
+    # draws 的类型/取值规则独立于状态, 先按既有规则校验(TypeError /
+    # ValueError), 再解析状态。
+    _validate_draws(draws)
+
+    # 状态结构与版本先校验(ValueError), 取出的 seed 再用于采样输入校验,
+    # 保证 _validate_sample_inputs 的 seed 类型规则同样被执行。
+    position, state_k, state_n, use_exact, seed, rng_state = (
+        _validate_checkpoint_state(state)
+    )
+    n = _validate_sample_inputs(items, weights, k, seed)
+
+    # 状态与当前采样输入的一致性。
+    if state_k != k or state_n != n:
+        raise ValueError("checkpoint state does not match items/weights/k")
+    if state["items_digest"] != _items_fingerprint(items):
+        raise ValueError("checkpoint state does not match items")
+    if state["weights_digest"] != _weights_fingerprint(weights):
+        raise ValueError("checkpoint state does not match weights")
+
+    # 正权重可行性与抽样计划必须与创建断点时一致; 权重已逐位置指纹核对,
+    # 这里重建计划并比对 exact 标志。RNG 快照与 (seed, position) 的绑定
+    # 已由状态摘要保证未被篡改, 故恢复直接从快照继续, 无需从头重放。
+    if k > 0 and k > _count_positive_weights(weights):
+        raise ValueError("no positive weight")
+    planned_weights, planned_exact = _select_sampling_plan(list(weights), k)
+    if planned_exact != use_exact:
+        raise ValueError("invalid checkpoint state: sampling plan mismatch")
+
+    # 全部校验通过后才物化轮次: 直接从快照状态继续, 与批量区间逐轮一致。
+    rng = random.Random()
+    try:
+        rng.setstate(rng_state)
+    except ValueError:
+        raise
+    except Exception as exc:
+        # 结构与取值范围已在上游校验; 任何解释器层面的额外拒绝都统一成
+        # ValueError, 绝不泄漏其他异常类型, 也不会已产出部分轮次。
+        raise ValueError("invalid checkpoint RNG state") from exc
+    rounds = []
+    for _ in range(draws):
+        rounds.append(
+            _draw_indices_once(n, planned_weights, k, rng, planned_exact)
+        )
+
+    next_state = dict(state)
+    next_rng_payload = _rng_state_to_jsonable(rng.getstate())
+    next_position = position + draws
+    next_state["position"] = next_position
+    next_state["rng"] = next_rng_payload
+    # 摘要必须随 position / RNG 一并刷新, 否则链式再恢复时会因摘要失配
+    # 而失败(其余字段与原状态相同)。
+    next_state["digest"] = _checkpoint_binding_digest(
+        state["seed"], next_position, k, n,
+        state["items_digest"], state["weights_digest"],
+        planned_exact, next_rng_payload,
+    )
+    return rounds, next_state
 
 
 # ---------------------------------------------------------------------------
