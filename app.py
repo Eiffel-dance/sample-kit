@@ -43,6 +43,41 @@
     weighted_sample_stream(items, weights, k, draws, seed=0, start=0)
         与 weighted_sample_stream_indices 同规则, 但每轮按相同索引产出
         元素值列表, 与 weighted_sample_many 逐轮对应。
+    weighted_sample_many_excluding_indices(items, weights, k, draws,
+                                           excluded=(), seed=0, start=0)
+        带原始位置排除集合的 weighted_sample_many_indices: 一次调用生成
+        draws 轮样本, 每轮是一份按抽样先后排列的零基原始索引列表。校验
+        顺序为 items、weights、k、seed(含权重有限性/非负性), 然后
+        excluded, 最后 draws、start; excluded 与单轮排除入口同一套结构/
+        成员类型(TypeError)与越界(ValueError)规则, 重复成员与排列顺序
+        按集合语义忽略。每轮只从未排除且权重为正的位置中按现有无放回
+        精确规则抽取, 轮次之间恢复全部未排除位置重新开始, 所有轮次共享
+        由 seed 初始化的同一条随机流; start 只跳过前 start 个完整轮次
+        (只消耗该随机流), 返回值与 start=0 的完整调用按零基区间
+        [start, start+draws) 切片逐项一致。start=0 的首轮逐项等于
+        weighted_sample_excluding_indices; excluded 为空时与
+        weighted_sample_many_indices 逐轮一致。draws=0 完成全部校验后
+        返回空列表; k=0 时每轮为空列表且跳过/产出轮次都不消耗随机流;
+        未排除位置中的正权重不足 k 时在输出任何一轮前抛 ValueError,
+        失败绝不返回部分结果。不修改入参。
+    weighted_sample_many_excluding(items, weights, k, draws,
+                                   excluded=(), seed=0, start=0)
+        weighted_sample_many_excluding_indices 的元素值入口: 规则、校验
+        顺序与异常类别完全一致, 每轮按相同索引映射 items 返回元素值列表,
+        两个批量入口逐轮逐项对应。
+    weighted_sample_stream_excluding_indices(items, weights, k, draws,
+                                             excluded=(), seed=0, start=0)
+        weighted_sample_many_excluding_indices 的按需逐轮入口: 返回可迭代
+        对象, 逐轮取得与批量入口完全一致的索引轮次, 不必一次物化全部
+        draws 轮; start 语义与批量入口相同(迭代时先按需跳过 start 个完整
+        轮次)。轮次虽按需产出, 但全部参数与可行性错误都在创建迭代对象时
+        抛出稳定的 TypeError / ValueError, 绝不延迟到产出部分轮次之后;
+        draws=0 仍完成全部校验并返回不产出元素的迭代对象。
+    weighted_sample_stream_excluding(items, weights, k, draws,
+                                     excluded=(), seed=0, start=0)
+        与 weighted_sample_stream_excluding_indices 同规则(含校验时机与
+        start 窗口语义), 但每轮按相同索引产出元素值列表, 与
+        weighted_sample_many_excluding 逐轮对应。
     weighted_sample_checkpoint(items, weights, k, seed=0, start=0)
         创建可暂停/恢复的采样会话断点: 接受与批量入口相同的输入及 start,
         在完成与批量入口一致的全部校验(含正权重可行性)后, 把随机流推进到
@@ -446,18 +481,34 @@ def _select_sampling_plan(pool_weights, k):
     return pool_weights, False
 
 
-def _draw_indices_once(n, pool_weights, k, rng, use_exact):
-    """从原始位置出发完成一轮抽样。
+def _draw_pool_indices_once(pool, pool_weights, k, rng, use_exact):
+    """从给定的保留原始位置池出发完成一轮抽样。
 
-    每次调用都重建位置池并复制权重, 因此上一轮的抽走/弹出不会影响下一
-    轮 —— 每轮都从全部原始位置重新开始; rng 由调用方共享, 多轮连续消耗
-    同一随机流。绝不修改入参 pool_weights。
+    每次调用都复制位置池与权重, 因此上一轮的抽走/弹出不会影响下一轮
+    —— 每轮都从同一组保留位置重新开始(同一轮内位置最多出现一次); rng
+    由调用方共享, 多轮连续消耗同一随机流。绝不修改入参 pool / pool_weights。
+    pool 中的位置即抽样器记录并返回的原始零基索引, 因而同时服务于“全部
+    位置”(range(n))与“剔除 excluded 后的位置”两种入口, 两条路径的随机流
+    消耗逐轮一致。
     """
-    pool = list(range(n))
-    weights = list(pool_weights)
+    round_pool = list(pool)
+    round_weights = list(pool_weights)
     if use_exact:
-        return _sample_indices_exact_integer(pool, weights, k, rng)
-    return _sample_indices_float(pool, weights, k, rng)
+        return _sample_indices_exact_integer(
+            round_pool, round_weights, k, rng
+        )
+    return _sample_indices_float(round_pool, round_weights, k, rng)
+
+
+def _draw_indices_once(n, pool_weights, k, rng, use_exact):
+    """从全部原始位置出发完成一轮抽样。
+
+    薄封装: 保留位置池即 range(n), 其余规则与
+    _draw_pool_indices_once 完全一致。
+    """
+    return _draw_pool_indices_once(
+        list(range(n)), pool_weights, k, rng, use_exact
+    )
 
 
 def weighted_sample_indices(items, weights, k, seed=0):
@@ -636,6 +687,152 @@ def weighted_sample_stream(items, weights, k, draws, seed=0, start=0):
     """
     index_stream = weighted_sample_stream_indices(
         items, weights, k, draws, seed, start
+    )
+    return ([items[i] for i in round_indices] for round_indices in index_stream)
+
+
+def _prepare_excluded_rounds(items, weights, k, excluded, seed, draws, start):
+    """带位置排除的批量/流式入口共用的全部前置校验与抽样准备。
+
+    校验顺序固定: 先按现有采样入口校验 items、weights、k、seed, 再校验
+    excluded(非文本可确定长度序列, 成员为非布尔整数且在 items 零基范围
+    内), 然后才校验 draws 与 start; 结构或成员类型错误抛 TypeError, 长度
+    不符、越界、负权重/非有限权重、正权重不足等抛 ValueError。可行性检查
+    针对未排除位置中的正权重个数, 在任何一轮抽样之前完成。
+
+    全部通过后返回 (pool, planned_weights, use_exact, rng): pool 是剔除
+    excluded 后仍保留原始零基索引的位置池, planned_weights 是按抽样计划
+    (可能经过精确放大)复制出的对应权重, rng 已由 seed 初始化但尚未消耗
+    (跳过 start 轮由调用方按需进行); excluded 为空时 pool 即 range(n)、
+    planned_weights 与非排除批量入口的计划完全一致。绝不修改入参。
+    """
+    n = _validate_sample_inputs(items, weights, k, seed)
+    excluded_set = _validate_excluded_positions(excluded, n)
+    _validate_draws(draws)
+    _validate_start(start)
+
+    # 复制到本地并剔除被排除的位置, 绝不修改入参; 保留位置仍携带原始
+    # 零基索引, 抽样器记录的 pool[i] 即为返回给调用方的原始位置。
+    pool = [i for i in range(n) if i not in excluded_set]
+    pool_weights = [weights[i] for i in pool]
+
+    # 可行性前置检查与单轮排除入口一致: k>0 时未排除位置中的正权重个数
+    # 必须不少于 k; 在产生任何一轮之前确定, 非法调用绝不返回部分外层结果。
+    if k > 0 and k > _count_positive_weights(pool_weights):
+        raise ValueError("no positive weight")
+
+    rng = random.Random(seed)
+    # 抽样计划在“未排除位置”的权重上选择, 与 weighted_sample_excluding_
+    # indices 完全一致: 首轮因此逐项等于单轮排除入口; excluded 为空时
+    # pool_weights 即权重复制, 计划与非排除批量/流式入口相同。
+    planned_weights, use_exact = _select_sampling_plan(pool_weights, k)
+    return pool, planned_weights, use_exact, rng
+
+
+def weighted_sample_many_excluding_indices(items, weights, k, draws,
+                                           excluded=(), seed=0, start=0):
+    """带原始位置排除集合的 weighted_sample_many_indices: 一次调用生成
+    draws 轮样本, 每轮是一份按抽样先后排列的零基原始索引列表。
+
+    校验在任何一轮物化之前全部完成, 顺序为 items、weights、k、seed 与
+    权重有限性/非负性, 然后 excluded(非文本可确定长度序列, 成员为非布尔
+    整数且在 items 零基范围内; 结构或成员类型错误抛 TypeError, 越界位置
+    抛 ValueError; 重复成员与排列顺序按集合语义忽略), 最后 draws、start
+    (非布尔非负整数, 否则分别按 TypeError / ValueError 处理)。长度不符、
+    k 越界、负数或非有限权重、未排除位置中正权重不足 k 统一抛 ValueError,
+    失败绝不返回部分结果。
+
+    每轮只从未排除且权重为正的位置中按现有无放回精确规则抽取 k 个不同
+    位置: 被排除位置即使权重为正也绝不出现, 未排除的零权重位置永不入选;
+    轮次之间恢复全部未排除位置重新开始(轮内不放回, 轮间允许同一位置再次
+    出现), 重复值的不同位置仍各自独立。所有轮次共用同一个由 seed 初始化
+    的随机流(seed=None 保留现有随机语义); start(默认 0)只表示先跳过前
+    start 个完整轮次(跳过只消耗同一条确定性随机流), 返回结果与 start=0
+    的完整调用按零基区间 [start, start+draws) 切片逐项一致。start=0 时
+    首轮逐项等于 weighted_sample_excluding_indices; excluded 为空时与
+    weighted_sample_many_indices 逐轮一致。draws=0 完成全部校验后返回空
+    列表; k=0 时每轮为空列表且跳过/产出的轮次都不消耗随机流。不修改入参。
+    """
+    pool, planned_weights, use_exact, rng = _prepare_excluded_rounds(
+        items, weights, k, excluded, seed, draws, start
+    )
+
+    # 跳过条件与 weighted_sample_many_indices 完全一致: k=0 的轮次不消耗
+    # 随机流, draws=0 时结果必为空也无需空转。
+    if k > 0 and draws > 0:
+        for _ in range(start):
+            _draw_pool_indices_once(
+                pool, planned_weights, k, rng, use_exact
+            )
+
+    rounds = []
+    for _ in range(draws):
+        rounds.append(
+            _draw_pool_indices_once(pool, planned_weights, k, rng, use_exact)
+        )
+    return rounds
+
+
+def weighted_sample_many_excluding(items, weights, k, draws,
+                                   excluded=(), seed=0, start=0):
+    """weighted_sample_many_excluding_indices 的元素值入口: 规则、校验
+    顺序与异常类别完全一致, 区别仅在于每轮按相同索引映射 items 返回元素
+    值列表, 两个批量入口逐轮逐项对应(相同值的不同位置仍按位置独立处理)。
+    """
+    rounds = weighted_sample_many_excluding_indices(
+        items, weights, k, draws, excluded, seed, start
+    )
+    return [[items[i] for i in round_indices] for round_indices in rounds]
+
+
+def weighted_sample_stream_excluding_indices(items, weights, k, draws,
+                                             excluded=(), seed=0, start=0):
+    """weighted_sample_many_excluding_indices 的按需逐轮入口。
+
+    返回一个可迭代对象, 每次迭代产出一轮按抽样先后排列的零基原始索引
+    列表, 共 draws 轮; 对相同输入、excluded 与种子, 逐轮结果与
+    weighted_sample_many_excluding_indices 的全部轮次完全一致
+    (start=0 时首轮同样与 weighted_sample_excluding_indices 逐项相同;
+    excluded 为空时与 weighted_sample_stream_indices 逐轮一致)。每轮都
+    从全部未排除位置重新开始, 轮内不放回, 重复值按位置区分; start 语义
+    与批量入口相同: 迭代时先按需跳过 start 个完整轮次, 只消耗同一条
+    确定性随机流。
+
+    轮次虽在调用方消费时才逐轮生成, 但全部参数与可行性错误(items、
+    weights、k、seed、excluded、draws、start 的类型与取值, 以及未排除
+    位置正权重不足)都在创建迭代对象时当场抛出稳定的 TypeError /
+    ValueError, 绝不延迟到已经产出部分轮次之后。draws=0 时仍完成全部
+    校验并返回不产出元素的迭代对象; k=0 时每轮产出空列表且不消耗随机
+    流。不修改入参。
+    """
+    pool, planned_weights, use_exact, rng = _prepare_excluded_rounds(
+        items, weights, k, excluded, seed, draws, start
+    )
+
+    def _rounds():
+        # 按需跳过 start 个完整轮次: 与批量入口消耗同一条确定性随机流。
+        if k > 0 and draws > 0:
+            for _ in range(start):
+                _draw_pool_indices_once(
+                    pool, planned_weights, k, rng, use_exact
+                )
+        for _ in range(draws):
+            yield _draw_pool_indices_once(
+                pool, planned_weights, k, rng, use_exact
+            )
+
+    return _rounds()
+
+
+def weighted_sample_stream_excluding(items, weights, k, draws,
+                                     excluded=(), seed=0, start=0):
+    """weighted_sample 的带位置排除按需逐轮入口, 规则与
+    weighted_sample_stream_excluding_indices 完全一致(含校验时机与
+    start 窗口语义), 区别仅在于每轮按相同索引产出元素值列表; 与
+    weighted_sample_many_excluding 的逐轮结果完全一致。
+    """
+    index_stream = weighted_sample_stream_excluding_indices(
+        items, weights, k, draws, excluded, seed, start
     )
     return ([items[i] for i in round_indices] for round_indices in index_stream)
 
