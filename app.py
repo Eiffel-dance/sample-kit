@@ -69,6 +69,22 @@
         分数也保留两个元素), 分量不经过浮点。非有限 Decimal(NaN、sNaN、
         正负无穷)抛 ValueError; Decimal / Fraction 仅可作为值, 作为字典
         键按 TypeError 拒绝。
+    deserialize_metrics(text)
+        serialize_metrics 的逆入口: 把指标序列化文本还原为可继续计算的
+        Python 数据树, 供独立数值调用方核对序列化前后的精确数值。只接受
+        str(其他类型统一 TypeError); null、布尔值、字符串、数组和对象分别
+        还原为 None、bool、str、list 和 dict, 对象成员名保持文本形式与
+        文本中的先后次序, 不因排序改变含义。数字解析完全绕开浮点转换:
+        没有小数点或指数标记的数字还原为任意精度 int; 带小数点或指数标记
+        的有限数字还原为 Decimal —— 即使数值恰好为整数, 也保留正负号、
+        刻度、指数与负零。超长整数、极大或极小指数在解释器整数转文本限制
+        较低时仍成功并保持精确十进制。serialize_metrics 对 Fraction 产生
+        的二元素数组在没有类型标签的现有格式下按普通 list 还原, 不根据
+        形状推断类型。允许合法 JSON 的空白与 Unicode 转义; NaN、Infinity、
+        -Infinity、语法错误、重复对象成员名, 以及任何无法保持上述精度的
+        数字统一抛 ValueError, 错误时不返回部分结果。还原后的数据再次交给
+        serialize_metrics 时, 整数和 Decimal 的十进制内容保持精确, 键排序、
+        紧凑分隔符、Unicode 输出及既有冲突检测规则继续生效。
 
 权重接受非布尔的 int / float / fractions.Fraction / decimal.Decimal, 并允许
 四种类型混合使用; 每个权重按自身精确数值参与抽样。float 必须有限非负;
@@ -89,7 +105,7 @@ import math
 import numbers
 import random
 import sys
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from fractions import Fraction
 
 # 文本/字节类型虽然满足 Sequence 协议, 但不作为“元素序列”接受。
@@ -825,6 +841,43 @@ def weighted_sample_checkpoint(items, weights, k, seed=0, start=0):
     return state
 
 
+def _normalize_checkpoint_numbers(value):
+    """递归把状态 seed/rng 载荷中的 Decimal 替换为等值 float。
+
+    断点状态经 serialize_metrics 序列化后再由 deserialize_metrics 还原时,
+    带小数点或指数标记的数字(创建断点时只可能是 float 载荷, 如浮点 seed
+    或 RNG 高斯缓存)以 Decimal 出现; serialize_metrics 写出的浮点文本是
+    该浮点值的精确十进制表示, float() 往返得到同一二进制浮点值, 因此还原
+    后的状态与 json 文本路径解析出的状态可互换。不含 Decimal 时返回原
+    对象本身(零开销); 含 Decimal 时构造新结构, 绝不修改入参。Decimal 若
+    出现在非法位置, 下游结构化校验仍按既有规则统一抛 ValueError。
+    """
+    if isinstance(value, Decimal):
+        # 有限 Decimal -> float; 超出浮点范围的值(如 1E999)得到 inf, 后续
+        # 摘要规范化(serialize_metrics 拒绝非有限浮点)或结构校验会以
+        # ValueError 拒绝, 不会泄漏其他异常类型。
+        return float(value)
+    if isinstance(value, list):
+        normalized = None
+        for index, element in enumerate(value):
+            new_element = _normalize_checkpoint_numbers(element)
+            if new_element is not element:
+                if normalized is None:
+                    normalized = list(value)
+                normalized[index] = new_element
+        return value if normalized is None else normalized
+    if isinstance(value, dict):
+        normalized = None
+        for key, element in value.items():
+            new_element = _normalize_checkpoint_numbers(element)
+            if new_element is not element:
+                if normalized is None:
+                    normalized = dict(value)
+                normalized[key] = new_element
+        return value if normalized is None else normalized
+    return value
+
+
 def _validate_checkpoint_state(state):
     """校验状态本身的结构与版本, 返回规范化字段。
 
@@ -857,19 +910,25 @@ def _validate_checkpoint_state(state):
         if not isinstance(state[name], str):
             raise ValueError("invalid checkpoint state: %s" % name)
 
+    # 状态可能经 serialize_metrics + deserialize_metrics 还原: 其中的
+    # Decimal 载荷先还原为创建时的等值 float, 再解码与核对摘要 —— 两条
+    # 文本路径(json / serialize_metrics)解析出的状态因此可互换恢复。
+    seed_payload = _normalize_checkpoint_numbers(state["seed"])
+    rng_payload = _normalize_checkpoint_numbers(state["rng"])
+
     # 两个逆运算对内部结构问题统一抛 ValueError。
-    seed = _tagged_value_to_seed(state["seed"])
-    rng_state = _rng_state_from_jsonable(state["rng"])
+    seed = _tagged_value_to_seed(seed_payload)
+    rng_state = _rng_state_from_jsonable(rng_payload)
 
     # 绑定摘要: 任何对字段的篡改(位置、seed、RNG 快照、指纹、exact)若不
     # 附带重算的摘要, 都会在这里被发现 —— 因此恢复时不必从头重放随机流。
     expected_digest = _checkpoint_binding_digest(
-        state["seed"], position, k, n, state["items_digest"],
-        state["weights_digest"], state["exact"], state["rng"],
+        seed_payload, position, k, n, state["items_digest"],
+        state["weights_digest"], state["exact"], rng_payload,
     )
     if not hmac.compare_digest(expected_digest, state["digest"]):
         raise ValueError("invalid checkpoint state: digest mismatch")
-    return position, k, n, state["exact"], seed, rng_state
+    return position, k, n, state["exact"], seed, rng_state, seed_payload
 
 
 def _resume_rounds_indices(items, weights, k, state, draws):
@@ -886,7 +945,7 @@ def _resume_rounds_indices(items, weights, k, state, draws):
     """
     # 状态结构与版本先校验(ValueError), 取出的 seed 再用于采样输入校验,
     # 保证 _validate_sample_inputs 的 seed 类型规则同样被执行。
-    position, state_k, state_n, use_exact, seed, rng_state = (
+    position, state_k, state_n, use_exact, seed, rng_state, seed_payload = (
         _validate_checkpoint_state(state)
     )
     n = _validate_sample_inputs(items, weights, k, seed)
@@ -929,10 +988,14 @@ def _resume_rounds_indices(items, weights, k, state, draws):
     next_position = position + draws
     next_state["position"] = next_position
     next_state["rng"] = next_rng_payload
+    # seed 载荷使用校验时规范化后的形式: 经 deserialize_metrics 还原的
+    # 状态其 Decimal 已回到等值 float, 下一状态因此与 JSON 原生状态链
+    # 逐字段一致, 可继续经任一文本路径序列化/解析后再恢复。
+    next_state["seed"] = seed_payload
     # 摘要必须随 position / RNG 一并刷新, 否则链式再恢复时会因摘要失配
     # 而失败(其余字段与原状态相同)。
     next_state["digest"] = _checkpoint_binding_digest(
-        state["seed"], next_position, k, n,
+        seed_payload, next_position, k, n,
         state["items_digest"], state["weights_digest"],
         planned_exact, next_rng_payload,
     )
@@ -1501,4 +1564,107 @@ def serialize_metrics(metrics):
             ensure_ascii=False,
             allow_nan=False,
         ).iterencode(normalized, _one_shot=False)
+    )
+
+
+# ---------------------------------------------------------------------------
+# 指标反序列化
+# ---------------------------------------------------------------------------
+
+def _decimal_text_to_exact_int(text):
+    """把 JSON 整数文本精确转换为任意精度 int, 全程不经过浮点。
+
+    与 _int_to_decimal_text 互为逆运算: CPython 3.11+ 的 int(text) 同样受
+    sys.get_int_max_str_digits 限制, 超限直接抛 ValueError。这里按运行时
+    当前上限减 1 的固定宽度把十进制文本分块, 每块的 int() 都严格位于限制
+    之内, 再按 value = value * 10**块宽 + 块值 逐块累乘, 得到与 int(text)
+    完全一致的任意精度整数: 支持任意位数, 负号原样保留。运行时关闭限制
+    (上限为 0)或解释器没有该限制时直接使用 int, 与标准库行为一致。
+    调用前 text 已由 JSON 扫描器确认为合法整数文本(可选负号后接十进制
+    数字, 不含小数点与指数标记)。
+    """
+    negative = text.startswith("-")
+    digits = text[1:] if negative else text
+    if _GET_INT_MAX_STR_DIGITS is None:
+        value = int(digits)
+    else:
+        limit = _GET_INT_MAX_STR_DIGITS()
+        if limit == 0 or len(digits) <= limit:
+            # 常见路径: 位数本就在限制之内, 与 int(text) 完全一致。
+            value = int(digits)
+        else:
+            width = limit - 1
+            value = 0
+            for start in range(0, len(digits), width):
+                chunk = digits[start:start + width]
+                value = value * (10 ** len(chunk)) + int(chunk)
+    return -value if negative else value
+
+
+def _decimal_text_to_decimal(text):
+    """把带小数点或指数标记的 JSON 数字文本精确转换为 Decimal。
+
+    Decimal 直接按十进制文本构造, 不经过浮点, 因此保留正负号、刻度、
+    指数形式与负零(如 "1.50"、"1E+2"、"-0.00"), 且不受
+    sys.get_int_max_str_digits 限制 —— 超长系数与极大/极小指数(如
+    1E100000)都精确还原。指数超出 decimal 可表示范围(绝对值大于
+    MAX_EMAX)时 Decimal 构造抛 decimal.InvalidOperation —— 该异常不是
+    ValueError 且绝不能泄漏给调用方: 这类数字无法以精确十进制表示,
+    按约定统一收敛为 ValueError。
+    调用前 text 已由 JSON 扫描器确认为合法数字文本。
+    """
+    try:
+        return Decimal(text)
+    except (InvalidOperation, ValueError):
+        raise ValueError(
+            "number cannot be represented exactly as Decimal: %r" % text
+        )
+
+
+def _reject_json_constant(text):
+    """拒绝 NaN / Infinity / -Infinity: 非有限值不是合法 JSON 数字,
+    也无法以精确十进制表示, 统一抛 ValueError。"""
+    raise ValueError("non-finite number is not deserializable: %s" % text)
+
+
+def _pairs_to_dict_no_duplicates(pairs):
+    """把对象成员对序列还原为 dict, 保持文本中的成员名与先后次序。
+
+    成员名一律为 str(文本形式); 重复成员名会让后写者静默覆盖先写者,
+    破坏序列化前后的精确对应, 按约定统一抛 ValueError, 绝不返回部分
+    结果。
+    """
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate object member name: %r" % key)
+        result[key] = value
+    return result
+
+
+def deserialize_metrics(text):
+    """把指标序列化文本还原为可继续计算的 Python 数据树。
+
+    参数只接受 str, 其他类型(包括 bytes / bytearray)统一抛 TypeError。
+    返回值按 JSON 结构还原: null -> None, true/false -> bool, 字符串 ->
+    str(允许 Unicode 转义), 数组 -> list, 对象 -> dict(成员名保持文本
+    形式与文本中的先后次序)。数字解析完全绕开浮点: 没有小数点或指数
+    标记的数字返回任意精度 int; 带小数点或指数标记的有限数字返回
+    Decimal, 保留正负号、刻度、指数与负零。NaN / Infinity / -Infinity、
+    语法错误、重复对象成员名, 以及任何无法保持上述精度的数字统一抛
+    ValueError; 解析要么完整成功, 要么整体失败, 绝不返回部分结果。
+    """
+    if not isinstance(text, str):
+        raise TypeError(
+            "metrics text must be a str, not %s" % type(text).__name__
+        )
+    # json 扫描器负责 JSON 语法(空白、转义、结构), 其 JSONDecodeError
+    # 本身是 ValueError 的子类, 语法错误天然归入约定的异常分类; 数字与
+    # 对象成员则全部由上面的精确钩子接管, 不经过任何浮点转换。
+    return json.loads(
+        text,
+        parse_int=_decimal_text_to_exact_int,
+        parse_float=_decimal_text_to_decimal,
+        parse_constant=_reject_json_constant,
+        object_pairs_hook=_pairs_to_dict_no_duplicates,
     )

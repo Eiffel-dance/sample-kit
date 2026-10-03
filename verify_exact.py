@@ -8,7 +8,9 @@
   4. 零权重永不选中; 微小正权重不被浮点吞掉;
   5. 相同 (输入, seed) 给出唯一相同序列;
   6. 异常仍按既有 TypeError / ValueError 分类; 入参不被修改;
-  7. 小整数(累计 <= 2**53)保持基线浮点路径的固定序列。
+  7. 小整数(累计 <= 2**53)保持基线浮点路径的固定序列;
+  8. deserialize_metrics 精确还原序列化文本(任意精度 int / Decimal,
+     重复成员名与非有限值拒绝), 并可消费 checkpoint 状态文本恢复采样。
 
 用法:  python3 verify_exact.py   (全部通过时退出码为 0)
 """
@@ -477,6 +479,75 @@ check(
     sorted(app.weighted_sample(["p", "q"], [0.5, 1.5], 2, 3)) == ["p", "q"],
     "Fraction 改动后普通浮点基线行为仍保持",
 )
+
+
+# ---------------------------------------------------------------------------
+# 11. deserialize_metrics: 序列化文本的精确还原
+# ---------------------------------------------------------------------------
+section("deserialize_metrics 精确还原")
+
+from decimal import Decimal as _Decimal
+
+dm, sm = app.deserialize_metrics, app.serialize_metrics
+
+# 11.1 结构还原: null/布尔/字符串/数组/对象 -> None/bool/str/list/dict。
+check(dm('{"a": [1, null, true, "x"], "b": {}}')
+      == {"a": [1, None, True, "x"], "b": {}},
+      "嵌套结构按 JSON 类型还原, 成员名保持文本形式")
+check(dm("{}") == {} and dm("[]") == [], "空对象/空数组还原")
+
+# 11.2 数字完全绕开浮点: 无标记 -> 任意精度 int; 带标记 -> Decimal。
+big = 10 ** 5000 - 1
+check(dm(sm(big)) == big and type(dm(sm(big))) is int
+      and dm(sm(-big)) == -big,
+      "5000 位整数(超默认位数限制)往返精确")
+dec_ok = all(
+    type(dm(lit)) is _Decimal and str(dm(lit)) == str(_Decimal(lit))
+    for lit in ("1.50", "-0.00", "0E3", "1E+2", "1E100000", "1E-100000")
+)
+check(dec_ok, "带小数点/指数标记的数字还原为 Decimal, 保留刻度/指数/负零")
+check(type(dm("-0")) is int and dm("-0") == 0, "无标记 -0 按整数规则还原")
+
+# 11.3 Fraction 的二元素数组按普通 list 还原; 再序列化文本逐字一致。
+check(dm(sm(Fraction(3, 4))) == [3, 4]
+      and type(dm(sm(Fraction(3, 4)))) is list
+      and sm(dm(sm(Fraction(3, 4)))) == "[3,4]",
+      "Fraction 二元素数组还原为普通 list 且可再精确序列化")
+
+# 11.4 嵌套指标树往返: 整数与 Decimal 的十进制内容精确, 文本逐字一致。
+tree = {"名": [1, _Decimal("1.50"), Fraction(3, 4), None, True],
+        "big": 10 ** 100, "z": [_Decimal("-0.00")]}
+check(sm(dm(sm(tree))) == sm(tree), "嵌套指标树 序列化->还原->序列化 逐字一致")
+
+# 11.5 错误分类: 非 str -> TypeError; 非有限值/语法错误/重复成员名 ->
+#   ValueError, 不返回部分结果。
+raises(TypeError, lambda: dm(b"{}"), "非 str 输入 (bytes) -> TypeError")
+raises(TypeError, lambda: dm(1), "非 str 输入 (int) -> TypeError")
+raises(ValueError, lambda: dm("NaN"), "NaN -> ValueError")
+raises(ValueError, lambda: dm("[Infinity]"), "Infinity -> ValueError")
+raises(ValueError, lambda: dm('{"a":1,"a":2}'), "重复成员名 -> ValueError")
+raises(ValueError, lambda: dm("[1,]"), "语法错误 -> ValueError")
+raises(ValueError, lambda: dm("1E999999999999999999999999"),
+       "无法精确表示的指数 -> ValueError")
+
+# 11.6 checkpoint 状态文本可直接消费并恢复(含浮点 seed)。
+cp_items, cp_weights, cp_k = list("abcd"), [1, 3, 2, 0], 3
+cp_ok = True
+for seed in (0, 42, 1.5, -0.0, 1e300, "s"):
+    state = app.weighted_sample_checkpoint(cp_items, cp_weights, cp_k, seed,
+                                           start=2)
+    restored = dm(sm(state))
+    rounds, next_state = app.weighted_sample_resume_indices(
+        cp_items, cp_weights, cp_k, restored, 3)
+    if rounds != app.weighted_sample_many_indices(
+            cp_items, cp_weights, cp_k, 3, seed, start=2):
+        cp_ok = False
+    more, _ = app.weighted_sample_resume_indices(
+        cp_items, cp_weights, cp_k, dm(sm(next_state)), 2)
+    if more != app.weighted_sample_many_indices(
+            cp_items, cp_weights, cp_k, 2, seed, start=5):
+        cp_ok = False
+check(cp_ok, "checkpoint 状态经 serialize/deserialize 还原后可断点续接")
 
 
 # ---------------------------------------------------------------------------
