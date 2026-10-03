@@ -8,6 +8,8 @@ import app
 from app import (
     weighted_sample,
     weighted_sample_indices,
+    weighted_sample_excluding,
+    weighted_sample_excluding_indices,
     weighted_sample_many,
     weighted_sample_many_indices,
     weighted_sample_stream,
@@ -3493,6 +3495,389 @@ class DeserializeMetricsTest(unittest.TestCase):
             weighted_sample_indices(["a", "b"], [1, True], 1, 0)
         with self.assertRaises(ValueError):
             weighted_sample_indices(["a", "b"], [1, -1], 1, 0)
+
+
+class WeightedSampleExcludingTest(unittest.TestCase):
+    """按原始位置排除的单轮入口 weighted_sample_excluding(_indices)。"""
+
+    def test_empty_excluded_matches_single_entries_exactly(self):
+        # excluded 为空(默认)时必须与现有单轮入口逐项相同。
+        cases = [
+            (["red", "green", "blue"], [1, 3, 2], 2),
+            (list("abcdef"), [1, 3, 2, 5, 0, 2], 4),
+            (["p", "q"], [0.5, 1.5], 2),
+            (list("xyz"), [10 ** 100, 1, 10 ** 50], 2),
+            (["a", "b"], [10 ** 400, 10 ** 400], 2),
+            (["p", "q", "r"], [2, Fraction(1), 0.5], 3),
+            (["a", "b", "c"], [Decimal("1.5"), Decimal("0.5"), Decimal("2")], 3),
+            (["a", "b", "c"], [1e308, 1e308, 1.0], 3),
+            ([], [], 0),
+            (["a", "b"], [0, 0], 0),
+        ]
+        for items, weights, k in cases:
+            for seed in (0, 1, 42, -7, 1.5, "s", b"s", bytearray(b"s"), True):
+                with self.subTest(items=items, k=k, seed=seed):
+                    self.assertEqual(
+                        weighted_sample_excluding_indices(items, weights, k, (), seed),
+                        weighted_sample_indices(items, weights, k, seed),
+                    )
+                    self.assertEqual(
+                        weighted_sample_excluding_indices(items, weights, k, seed=seed),
+                        weighted_sample_indices(items, weights, k, seed),
+                    )
+                    self.assertEqual(
+                        weighted_sample_excluding(items, weights, k, (), seed),
+                        weighted_sample(items, weights, k, seed),
+                    )
+
+    def test_excluded_positions_never_appear(self):
+        # 排除位置即使权重为正(甚至独占几乎全部权重)也绝不出现。
+        items = list("abcdef")
+        weights = [10 ** 100, 1, 10 ** 99, 3, 5, 7]
+        for seed in range(100):
+            idx = weighted_sample_excluding_indices(
+                items, weights, 3, (0, 2), seed
+            )
+            self.assertEqual(len(idx), 3)
+            self.assertEqual(len(set(idx)), 3)
+            self.assertTrue(all(0 <= i < 6 for i in idx))
+            self.assertNotIn(0, idx)
+            self.assertNotIn(2, idx)
+
+    def test_only_remaining_positive_position_is_chosen(self):
+        for seed in range(50):
+            self.assertEqual(
+                weighted_sample_excluding_indices(
+                    ["x", "y", "z"], [5, 1, 5], 1, (0, 2), seed
+                ),
+                [1],
+            )
+
+    def test_zero_weight_still_never_chosen(self):
+        # 未排除的零权重位置仍永不入选(含带符号 Decimal 零)。
+        for seed in range(60):
+            self.assertEqual(
+                weighted_sample_excluding_indices(
+                    ["x", "y", "z"], [0, 5, 0], 1, (2,), seed
+                ),
+                [1],
+            )
+            self.assertEqual(
+                weighted_sample_excluding_indices(
+                    ["x", "y"], [Decimal("-0"), Decimal("5")], 1, (), seed
+                ),
+                [1],
+            )
+
+    def test_excluded_set_semantics_duplicates_and_order(self):
+        # 重复成员与排列顺序不影响结果(集合语义)。
+        items = list("abcdef")
+        weights = [1, 2, 3, 4, 5, 6]
+        base = weighted_sample_excluding_indices(items, weights, 3, (1, 3), 7)
+        for excluded in ((1, 3), (3, 1), (1, 1, 3), (3, 1, 3, 1), [1, 3],
+                         [3, 1, 1, 3]):
+            with self.subTest(excluded=excluded):
+                self.assertEqual(
+                    weighted_sample_excluding_indices(
+                        items, weights, 3, excluded, 7
+                    ),
+                    base,
+                )
+                self.assertEqual(
+                    weighted_sample_excluding(items, weights, 3, excluded, 7),
+                    [items[i] for i in base],
+                )
+
+    def test_values_entry_corresponds_to_indices_entry(self):
+        cases = [
+            (list("abcdef"), [1, 3, 2, 5, 0, 2], 4, (0, 4)),
+            ([1, 1, 1, 1], [1, 1, 1, 1], 3, (2,)),
+            (["p", "q", "r"], [2, Fraction(1), 0.5], 2, (0,)),
+            (["a", "b", "c"], [Decimal("1.5"), Decimal("0.5"), 2], 2, (2,)),
+            (list("xyz"), [10 ** 100, 1, 10 ** 50], 2, (0,)),
+        ]
+        for items, weights, k, excluded in cases:
+            for seed in (0, 1, 42, -7, 1.5, "s", b"s", True):
+                with self.subTest(items=items, excluded=excluded, seed=seed):
+                    idx = weighted_sample_excluding_indices(
+                        items, weights, k, excluded, seed
+                    )
+                    self.assertEqual(
+                        weighted_sample_excluding(
+                            items, weights, k, excluded, seed
+                        ),
+                        [items[i] for i in idx],
+                    )
+
+    def test_duplicate_values_distinct_positions(self):
+        # 相同值仍按位置独立; 排除一个位置后其余位置各自独立。
+        idx = weighted_sample_excluding_indices([1, 1, 1, 1], [1, 1, 1, 1], 3, (1,), 5)
+        self.assertEqual(sorted(idx), [0, 2, 3])
+        self.assertEqual(
+            weighted_sample_excluding([1, 1, 1, 1], [1, 1, 1, 1], 3, (1,), 5),
+            [1, 1, 1],
+        )
+
+    def test_same_seed_same_result(self):
+        args = (["a", "b", "c", "d"], [1, 2, 3, 4], 2, (0, 3))
+        first = weighted_sample_excluding_indices(*args, seed=99)
+        first_v = weighted_sample_excluding(*args, seed=99)
+        for _ in range(5):
+            self.assertEqual(
+                weighted_sample_excluding_indices(*args, seed=99), first
+            )
+            self.assertEqual(weighted_sample_excluding(*args, seed=99), first_v)
+
+    def test_seed_none_keeps_random_semantics(self):
+        idx = weighted_sample_excluding_indices(
+            list(range(20)), list(range(1, 21)), 8, (0, 1, 2, 3), None
+        )
+        self.assertEqual(len(idx), 8)
+        self.assertEqual(len(set(idx)), 8)
+        self.assertTrue(all(4 <= i < 20 for i in idx))
+        vals = weighted_sample_excluding(
+            list(range(20)), list(range(1, 21)), 8, (0, 1, 2, 3), None
+        )
+        self.assertEqual(len(vals), 8)
+
+    def test_k_zero_returns_empty_after_full_validation(self):
+        self.assertEqual(
+            weighted_sample_excluding_indices(["a", "b"], [1, 2], 0, (0, 1), 0),
+            [],
+        )
+        self.assertEqual(
+            weighted_sample_excluding(["a", "b"], [1, 2], 0, (0, 1), 0), []
+        )
+        self.assertEqual(
+            weighted_sample_excluding_indices([], [], 0, (), 0), []
+        )
+        # k=0 仍完成 items/weights/k/seed 与 excluded 的全部校验。
+        with self.assertRaises(ValueError):
+            weighted_sample_excluding_indices(["a"], [float("nan")], 0, (), 0)
+        with self.assertRaises(TypeError):
+            weighted_sample_excluding_indices(["a"], [True], 0, (), 0)
+        with self.assertRaises(TypeError):
+            weighted_sample_excluding_indices("ab", [1, 2], 0, (), 0)
+        with self.assertRaises(TypeError):
+            weighted_sample_excluding_indices(["a"], [1], 0, (True,), 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_excluding_indices(["a"], [1], 0, (1,), 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_excluding(["a"], [1], 0, (-1,), 0)
+
+    def test_excluded_structure_validation(self):
+        # excluded 必须是非文本且长度可确定的序列, 否则 TypeError。
+        for bad in ("01", b"01", bytearray(b"01"), {0, 1}, {0: "a"},
+                    iter([0]), 3, None, object()):
+            with self.subTest(bad=bad):
+                with self.assertRaises(TypeError):
+                    weighted_sample_excluding_indices(
+                        ["a", "b"], [1, 2], 1, bad, 0
+                    )
+                with self.assertRaises(TypeError):
+                    weighted_sample_excluding(["a", "b"], [1, 2], 1, bad, 0)
+
+    def test_excluded_member_type_validation(self):
+        # 成员必须是非布尔整数, 否则 TypeError。
+        for bad_member in (True, False, 1.0, 0.0, "1", None, [0],
+                           Fraction(1, 2), Decimal("1"), 1 + 0j):
+            with self.subTest(bad_member=bad_member):
+                with self.assertRaises(TypeError):
+                    weighted_sample_excluding_indices(
+                        ["a", "b"], [1, 2], 1, (0, bad_member), 0
+                    )
+                with self.assertRaises(TypeError):
+                    weighted_sample_excluding(
+                        ["a", "b"], [1, 2], 1, (bad_member,), 0
+                    )
+
+    def test_excluded_out_of_range_raises_value_error(self):
+        for bad_excluded in ((2,), (-1,), (0, 5), (10 ** 100,), (-(10 ** 100),)):
+            with self.subTest(bad_excluded=bad_excluded):
+                with self.assertRaises(ValueError):
+                    weighted_sample_excluding_indices(
+                        ["a", "b"], [1, 2], 1, bad_excluded, 0
+                    )
+                with self.assertRaises(ValueError):
+                    weighted_sample_excluding(
+                        ["a", "b"], [1, 2], 1, bad_excluded, 0
+                    )
+        # 空 items 不接受任何排除位置。
+        with self.assertRaises(ValueError):
+            weighted_sample_excluding_indices([], [], 0, (0,), 0)
+
+    def test_sample_input_validation_runs_before_excluded(self):
+        # 先完成与现有采样入口一致的校验, 再校验 excluded: 两类错误同时
+        # 存在时, 采样入口的异常类别优先出现。
+        with self.assertRaises(TypeError):  # items 非序列先于 excluded 越界
+            weighted_sample_excluding_indices("ab", [1, 2], 1, (9,), 0)
+        with self.assertRaises(TypeError):  # k 类型错误先于 excluded 类型错误
+            weighted_sample_excluding_indices(["a"], [1], True, (True,), 0)
+        with self.assertRaises(TypeError):  # seed 类型错误
+            weighted_sample_excluding_indices(["a"], [1], 1, (), object())
+        with self.assertRaises(ValueError):  # 权重取值错误先于 excluded 越界
+            weighted_sample_excluding_indices(["a", "b"], [1, -1], 1, (9,), 0)
+        with self.assertRaises(ValueError):  # k 越界先于 excluded 越界
+            weighted_sample_excluding_indices(["a"], [1], 2, (9,), 0)
+        with self.assertRaises(ValueError):  # 长度不一致
+            weighted_sample_excluding_indices(["a", "b"], [1], 1, (), 0)
+        with self.assertRaises(TypeError):  # 布尔权重
+            weighted_sample_excluding_indices(["a", "b"], [1, True], 1, (), 0)
+        with self.assertRaises(ValueError):  # 无穷权重
+            weighted_sample_excluding_indices(
+                ["a", "b"], [1, float("inf")], 1, (), 0
+            )
+        with self.assertRaises(ValueError):  # Decimal NaN
+            weighted_sample_excluding_indices(["a"], [Decimal("NaN")], 0, (), 0)
+
+    def test_insufficient_remaining_positions_raises_before_result(self):
+        # 请求正数但未排除位置中的有效正权重不足: 在产生结果前抛 ValueError。
+        with self.assertRaises(ValueError):  # 全部正权重位置被排除
+            weighted_sample_excluding_indices(["a", "b"], [1, 0], 1, (0,), 0)
+        with self.assertRaises(ValueError):  # 剩余正权重个数小于 k
+            weighted_sample_excluding_indices(
+                ["a", "b", "c"], [1, 1, 0], 2, (0,), 0
+            )
+        with self.assertRaises(ValueError):  # 全部位置被排除
+            weighted_sample_excluding_indices(["a", "b"], [1, 2], 1, (0, 1), 0)
+        with self.assertRaises(ValueError):  # 权重全零且未排除
+            weighted_sample_excluding_indices(["a", "b"], [0, 0], 1, (), 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_excluding(["a", "b"], [1, 0], 1, (0,), 0)
+        with self.assertRaises(ValueError):  # 精确路径同样前置失败
+            weighted_sample_excluding_indices(
+                ["a", "b", "c"], [10 ** 100, 0, 1], 2, (0, 2), 0
+            )
+        # 排除零权重位置不影响可行性。
+        self.assertEqual(
+            weighted_sample_excluding_indices(["a", "b"], [1, 0], 1, (1,), 0),
+            [0],
+        )
+
+    def test_inputs_not_mutated(self):
+        items = ["a", "b", "c", "d"]
+        weights = [1, 2, 3, 4]
+        excluded = [0, 2]
+        snapshots = (list(items), list(weights), list(excluded))
+        weighted_sample_excluding_indices(items, weights, 2, excluded, 5)
+        weighted_sample_excluding(items, weights, 2, excluded, 5)
+        self.assertEqual((items, weights, excluded), snapshots)
+
+    def test_exact_paths_supported(self):
+        # 超大整数 / Fraction / Decimal / 浮点溢出路径在排除入口下仍确定。
+        cases = [
+            (["a", "b", "c"], [10 ** 400, 10 ** 400, 1], 2, (2,)),
+            (["H", "t", "z"], [10 ** 100, Decimal("1E-100"), Decimal("-0")],
+             1, (0,)),
+            (["a", "b", "c"], [1e308, 1e308, 1.0], 2, (2,)),
+            (["a", "b", "c"], [9, Fraction(1, 100), 3], 1, (2,)),
+            (["p", "q", "r", "s"], [2, Fraction(1), 0.5, Decimal("0.25")],
+             3, (1,)),
+        ]
+        for items, weights, k, excluded in cases:
+            for seed in (0, 7, 2316):
+                with self.subTest(items=items, excluded=excluded, seed=seed):
+                    idx = weighted_sample_excluding_indices(
+                        items, weights, k, excluded, seed
+                    )
+                    self.assertEqual(
+                        idx,
+                        weighted_sample_excluding_indices(
+                            items, weights, k, excluded, seed
+                        ),
+                    )
+                    self.assertEqual(len(idx), k)
+                    self.assertEqual(len(set(idx)), k)
+                    self.assertTrue(all(0 <= i < len(items) for i in idx))
+                    self.assertTrue(all(i not in excluded for i in idx))
+                    self.assertEqual(
+                        weighted_sample_excluding(
+                            items, weights, k, excluded, seed
+                        ),
+                        [items[i] for i in idx],
+                    )
+
+    def test_proportions_follow_remaining_weights(self):
+        # 排除最大权重位置后, 剩余位置仍按权重比例被选中。
+        weights = [10 ** 100, 1, 3]
+        counts = [0, 0]
+        trials = 4000
+        for seed in range(trials):
+            idx = weighted_sample_excluding_indices(
+                ["a", "b", "c"], weights, 1, (0,), seed
+            )
+            self.assertNotIn(0, idx)
+            counts[idx[0] - 1] += 1
+        self.assertAlmostEqual(counts[0] / trials, 1 / 4, delta=0.04)
+        self.assertAlmostEqual(counts[1] / trials, 3 / 4, delta=0.04)
+
+    def test_results_feed_serialize_metrics_without_float(self):
+        # 新入口的索引与元素值可直接交给 serialize_metrics, 不经过浮点。
+        idx = weighted_sample_excluding_indices(
+            list(range(6)), [10 ** 100, 1, 2, 3, 4, 5], 3, (0,), 42
+        )
+        text = serialize_metrics({"indices": idx})
+        self.assertEqual(deserialize_metrics(text), {"indices": idx})
+        items = [Decimal("1.5"), Fraction(1, 3), 10 ** 100, "x"]
+        vals = weighted_sample_excluding(items, [1, 1, 1, 1], 3, (3,), 7)
+        text = serialize_metrics({"values": vals})
+        self.assertEqual(
+            deserialize_metrics(text)["values"],
+            [Decimal("1.5"), [1, 3], 10 ** 100],
+        )
+
+    def test_both_entries_share_validation_and_error_classes(self):
+        # 两个入口对同一批非法输入给出完全一致的异常类别。
+        bad_calls = [
+            ("ab", [1, 2], 1, (), 0),
+            (["a", "b"], [1, "x"], 1, (), 0),
+            (["a", "b"], [1, True], 1, (), 0),
+            (["a"], [1], True, (), 0),
+            (["a"], [1], 1, (), object()),
+            (["a", "b"], [1, -1], 1, (), 0),
+            (["a", "b"], [1, float("nan")], 1, (), 0),
+            (["a", "b"], [1, float("inf")], 1, (), 0),
+            (["a", "b"], [1], 1, (), 0),
+            (["a"], [1], 2, (), 0),
+            (["a"], [1], -1, (), 0),
+            (["a", "b"], [1, 2], 1, "01", 0),
+            (["a", "b"], [1, 2], 1, {0}, 0),
+            (["a", "b"], [1, 2], 1, (True,), 0),
+            (["a", "b"], [1, 2], 1, (1.0,), 0),
+            (["a", "b"], [1, 2], 1, (2,), 0),
+            (["a", "b"], [1, 2], 1, (-1,), 0),
+            (["a", "b"], [1, 0], 1, (0,), 0),
+            (["a", "b"], [0, 0], 1, (), 0),
+        ]
+        for args in bad_calls:
+            with self.subTest(args=args):
+                categories = []
+                for entry in (weighted_sample_excluding_indices,
+                              weighted_sample_excluding):
+                    try:
+                        entry(*args)
+                    except (TypeError, ValueError) as exc:
+                        categories.append(type(exc))
+                    else:
+                        self.fail("no exception for %r" % (args,))
+                self.assertEqual(categories[0], categories[1])
+
+    def test_existing_entries_unchanged(self):
+        # 既有入口行为不受新入口影响。
+        self.assertEqual(
+            weighted_sample(["red", "green", "blue"], [1, 3, 2], 2, 42),
+            ["green", "red"],
+        )
+        self.assertEqual(
+            weighted_sample_indices(["a", "b", "c"], [1, 3, 2], 3, 7),
+            [1, 0, 2],
+        )
+        self.assertEqual(
+            weighted_sample_many_indices(
+                ["p", "q", "r"], [2, Fraction(1), 0.5], 3, 4, 42
+            ),
+            [[1, 0, 2], [0, 2, 1], [0, 1, 2], [0, 2, 1]],
+        )
 
 
 if __name__ == "__main__":
