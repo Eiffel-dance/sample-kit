@@ -18,6 +18,8 @@ from app import (
     weighted_sample_many_excluding_indices,
     weighted_sample_stream_excluding,
     weighted_sample_stream_excluding_indices,
+    weighted_sample_counts,
+    weighted_sample_excluding_counts,
     weighted_sample_checkpoint,
     weighted_sample_resume_indices,
     weighted_sample_resume,
@@ -4524,6 +4526,377 @@ class WeightedSampleManyExcludingTest(unittest.TestCase):
         )
         text = serialize_metrics({"n": 10 ** 100})
         self.assertEqual(text, '{"n":1' + "0" * 100 + "}")
+
+
+class WeightedSampleCountsTest(unittest.TestCase):
+    """批量频次入口 weighted_sample_counts /
+    weighted_sample_excluding_counts。"""
+
+    CASES = [
+        (list("abcdef"), [1, 3, 2, 5, 0, 2], 4),
+        (list(range(20)), [10 ** 80 + i for i in range(20)], 10),
+        (["p", "q"], [0.5, 1.5], 2),
+        (list("xyz"), [10 ** 100, 1, 10 ** 50], 2),
+        ([], [], 0),
+        (["p", "q", "r"], [2, Fraction(1), 0.5], 3),
+        (["a", "b", "c"],
+         [Decimal("1.5"), Decimal("0.5"), Decimal("2")], 3),
+        (["a", "b"], [10 ** 400, 10 ** 400], 2),
+        (["a", "b", "c"], [1e308, 1e308, 1.0], 3),
+        (["a", "b"], [1, Fraction(1, 10 ** 100)], 1),
+    ]
+    EXCLUDED_CASES = [
+        (list("abcdef"), [1, 3, 2, 5, 0, 2], 4, (0, 4)),
+        (list(range(20)), [10 ** 80 + i for i in range(20)], 10, (2, 5, 9)),
+        (["p", "q", "r"], [0.5, 1.5, 2.5], 2, (2,)),
+        (list("xyz"), [10 ** 100, 1, 10 ** 50], 2, (0,)),
+        (["a", "b"], [10 ** 400, 10 ** 400], 2, ()),
+        (["p", "q", "r"], [2, Fraction(1), 0.5], 2, (1,)),
+        (["a", "b", "c"],
+         [Decimal("1.5"), Decimal("0.5"), Decimal("2")], 2, (2,)),
+        (["a", "b", "c"], [1e308, 1e308, 1.0], 2, (2,)),
+        ([], [], 0, ()),
+        (["a", "b"], [0, 0], 0, (0, 1)),
+    ]
+    SEEDS = (0, 1, 42, -7, 1.5, "s", b"s", bytearray(b"s"), True)
+
+    @staticmethod
+    def _flatten(rounds, n):
+        counts = [0] * n
+        for rd in rounds:
+            for position in rd:
+                counts[position] += 1
+        return counts
+
+    def test_shape_is_length_n_int_list(self):
+        items, weights, k = list("abcdef"), [1, 2, 3, 4, 5, 6], 3
+        counts = weighted_sample_counts(items, weights, k, 9, 42)
+        self.assertIsInstance(counts, list)
+        self.assertEqual(len(counts), len(items))
+        self.assertTrue(all(type(c) is int for c in counts))
+        excluded = weighted_sample_excluding_counts(
+            items, weights, k, (1, 4), 9, 42)
+        self.assertIsInstance(excluded, list)
+        self.assertEqual(len(excluded), len(items))
+        self.assertTrue(all(type(c) is int for c in excluded))
+
+    def test_counts_equal_flattened_many_rounds(self):
+        # 与 weighted_sample_many_indices 对应窗口逐位置摊平计数一致。
+        for items, weights, k in self.CASES:
+            n = len(items)
+            for seed in self.SEEDS:
+                full = weighted_sample_many_indices(
+                    items, weights, k, 12, seed)
+                for start, draws in ((0, 12), (0, 5), (2, 6), (11, 1),
+                                     (0, 0), (3, 0)):
+                    with self.subTest(k=k, seed=seed, start=start,
+                                      draws=draws):
+                        self.assertEqual(
+                            weighted_sample_counts(
+                                items, weights, k, draws, seed, start),
+                            self._flatten(full[start:start + draws], n),
+                        )
+
+    def test_excluding_counts_equal_flattened_many_rounds(self):
+        for items, weights, k, ex in self.EXCLUDED_CASES:
+            n = len(items)
+            for seed in self.SEEDS:
+                full = weighted_sample_many_excluding_indices(
+                    items, weights, k, ex, 12, seed)
+                for start, draws in ((0, 12), (0, 5), (2, 6), (11, 1),
+                                     (0, 0), (3, 0)):
+                    with self.subTest(k=k, ex=ex, seed=seed, start=start,
+                                      draws=draws):
+                        self.assertEqual(
+                            weighted_sample_excluding_counts(
+                                items, weights, k, ex, draws, seed, start),
+                            self._flatten(full[start:start + draws], n),
+                        )
+
+    def test_total_count_is_draws_times_k(self):
+        for seed in range(60):
+            counts = weighted_sample_counts(
+                list(range(6)), [1, 2, 3, 0, 5, 6], 4, 13, seed)
+            self.assertEqual(sum(counts), 13 * 4)
+            excluded = weighted_sample_excluding_counts(
+                list(range(6)), [1, 2, 3, 0, 5, 6], 3, (0, 4), 11, seed)
+            self.assertEqual(sum(excluded), 11 * 3)
+
+    def test_excluded_positions_always_zero(self):
+        items = list(range(6))
+        weights = [10 ** 100, 1, 10 ** 99, 3, 0, 5]
+        for excluded in ((0,), (2, 4), (0, 2, 4), (5, 3, 1)):
+            for seed in self.SEEDS:
+                counts = weighted_sample_excluding_counts(
+                    items, weights, 2, excluded, 9, seed)
+                for position in excluded:
+                    self.assertEqual(counts[position], 0)
+                # 未排除的零权重位置 (4) 也永不累计。
+                if 4 not in excluded:
+                    self.assertEqual(counts[4], 0)
+                self.assertEqual(
+                    len(counts), len(items)
+                )
+
+    def test_empty_excluded_matches_plain_counts(self):
+        for items, weights, k, _ in self.EXCLUDED_CASES:
+            for seed in self.SEEDS:
+                self.assertEqual(
+                    weighted_sample_excluding_counts(
+                        items, weights, k, (), 8, seed),
+                    weighted_sample_counts(items, weights, k, 8, seed),
+                )
+
+    def test_excluded_set_semantics_duplicates_and_order(self):
+        items, weights = list("abcdef"), [1, 2, 3, 4, 5, 6]
+        base = weighted_sample_excluding_counts(
+            items, weights, 3, (1, 3), 7, 7)
+        for excluded in ((3, 1), (1, 1, 3), (3, 1, 3, 1), [1, 3],
+                         [3, 1, 1, 3]):
+            self.assertEqual(
+                weighted_sample_excluding_counts(
+                    items, weights, 3, excluded, 7, 7),
+                base,
+            )
+
+    def test_duplicate_values_distinct_positions(self):
+        # 相等元素值按不同位置独立累计。
+        counts = weighted_sample_counts(
+            [1, 1, 1], [1, 1, 1], 3, 4, 123)
+        self.assertEqual(len(counts), 3)
+        self.assertEqual(sum(counts), 12)
+        excluded = weighted_sample_excluding_counts(
+            [1, 1, 1, 1], [1, 1, 1, 1], 3, (1,), 5, 123)
+        self.assertEqual(excluded[1], 0)
+        self.assertEqual(sum(excluded), 15)
+
+    def test_draws_zero_returns_zeros_after_full_validation(self):
+        self.assertEqual(
+            weighted_sample_counts(["a", "b"], [1, 2], 2, 0, 0), [0, 0])
+        self.assertEqual(
+            weighted_sample_excluding_counts(
+                ["a", "b"], [1, 2], 1, (0,), 0, 0), [0, 0])
+        # draws=0 仍完成结构/范围/权重/excluded/可行性全部校验。
+        with self.assertRaises(TypeError):
+            weighted_sample_counts("ab", [1, 2], 1, 0, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_counts(["a", "b"], [1], 1, 0, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_counts(["a"], [float("nan")], 0, 0, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_counts(["a", "b"], [1, 0], 2, 0, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_excluding_counts(
+                ["a", "b"], [1, 2], 1, (9,), 0, 0)
+        with self.assertRaises(TypeError):
+            weighted_sample_excluding_counts(
+                ["a", "b"], [1, 2], 1, "01", 0, 0)
+        with self.assertRaises(TypeError):
+            weighted_sample_excluding_counts(
+                ["a", "b"], [1, 2], 1, (True,), 0, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_excluding_counts(
+                ["a", "b"], [1, 0], 2, (1,), 0, 0)
+
+    def test_k_zero_zeros_without_consuming_stream(self):
+        self.assertEqual(
+            weighted_sample_counts(["a", "b"], [1, 2], 0, 4, 0), [0, 0])
+        # k=0 任意 start 都不消耗随机流, 结果仍是全零。
+        self.assertEqual(
+            weighted_sample_counts(
+                ["a", "b"], [1, 2], 0, 4, 0, start=10 ** 9), [0, 0])
+        self.assertEqual(
+            weighted_sample_excluding_counts(
+                ["a", "b"], [0, 0], 0, (0, 1), 3, 7, start=10 ** 6),
+            [0, 0],
+        )
+        # k=0 仍完成权重与 excluded 校验。
+        with self.assertRaises(ValueError):
+            weighted_sample_counts(["a"], [float("nan")], 0, 4, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_excluding_counts(
+                ["a", "b"], [0, 0], 0, (9,), 4, 0)
+
+    def test_validation_parity_with_index_entries(self):
+        # 新入口与对应索引入口对同一批非法输入给出完全一致的异常类别。
+        plain_bad = [
+            ("ab", [1, 2], 1, 1, 0),
+            (["a", "b"], [1, "x"], 1, 1, 0),
+            (["a", "b"], [1, True], 1, 1, 0),
+            (["a"], [1], True, 1, 0),
+            (["a"], [1], 1, 1, object()),
+            (["a", "b"], [1, -1], 1, 1, 0),
+            (["a", "b"], [1, float("nan")], 1, 1, 0),
+            (["a", "b"], [1, float("inf")], 1, 1, 0),
+            (["a", "b"], [1], 1, 1, 0),
+            (["a"], [1], 2, 1, 0),
+            (["a"], [1], -1, 1, 0),
+            (["a"], [Decimal("NaN")], 0, 1, 0),
+            (["a"], [1], 0, True, 0),
+            (["a"], [1], 0, 1.0, 0),
+            (["a"], [1], 0, -1, 0),
+            (["a"], [1], 0, 1, 0, 1.0),
+            (["a"], [1], 0, 1, 0, -1),
+            (["a", "b"], [1, 0], 2, 3, 0),
+        ]
+        for call in plain_bad:
+            with self.subTest(call=call):
+                with self.assertRaises((TypeError, ValueError)) as e1:
+                    weighted_sample_counts(*call)
+                with self.assertRaises((TypeError, ValueError)) as e2:
+                    weighted_sample_many_indices(*call)
+                self.assertEqual(type(e1.exception), type(e2.exception))
+
+        excluding_bad = [
+            ("ab", [1, 2], 1, (9,), 1, 0),
+            (["a"], [1], True, (True,), 1, 0),
+            (["a"], [1], 1, (9,), 1, object()),
+            (["a", "b"], [1, -1], 1, (9,), 1, 0),
+            (["a"], [1], 2, (9,), 1, 0),
+            (["a", "b"], [1], 1, (9,), 1, 0),
+            (["a", "b"], [1, True], 1, "01", 1, 0),
+            (["a", "b"], [1, float("inf")], 1, (9,), 1, 0),
+            (["a"], [Decimal("NaN")], 0, (9,), 1, 0),
+            (["a", "b"], [1, 2], 1, "01", 1, 0),
+            (["a", "b"], [1, 2], 1, {0}, 1, 0),
+            (["a", "b"], [1, 2], 1, (True,), 1, 0),
+            (["a", "b"], [1, 2], 1, (1.0,), 1, 0),
+            (["a", "b"], [1, 2], 1, (2,), 1, 0),
+            (["a", "b"], [1, 2], 1, (-1,), 1, 0),
+            (["a", "b"], [1, 0], 1, (0,), 3, 0),
+            (["a", "b"], [0, 0], 1, (), 1, 0),
+            (["a", "b"], [1, 2], 1, (), True, 0),
+            (["a", "b"], [1, 2], 1, (), -1, 0),
+            (["a", "b"], [1, 2], 1, (), 1, 0, 1.0),
+            (["a", "b"], [1, 2], 1, (), 1, 0, -1),
+        ]
+        for call in excluding_bad:
+            with self.subTest(call=call):
+                with self.assertRaises((TypeError, ValueError)) as e1:
+                    weighted_sample_excluding_counts(*call)
+                with self.assertRaises((TypeError, ValueError)) as e2:
+                    weighted_sample_many_excluding_indices(*call)
+                self.assertEqual(type(e1.exception), type(e2.exception))
+
+    def test_insufficient_positive_raises_before_any_counts(self):
+        # 正权重不足必须在返回列表前抛 ValueError(无部分计数)。
+        with self.assertRaises(ValueError):
+            weighted_sample_counts(["a", "b"], [1, 0], 2, 3, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_counts(
+                ["a", "b", "c"], [10 ** 100, 0, 1], 3, 2, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_excluding_counts(
+                ["a", "b"], [1, 0], 1, (0,), 3, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_excluding_counts(
+                ["a", "b"], [1, 2], 1, (0, 1), 5, 0)
+        # start 很大也不例外: 可行性先于跳轮判定。
+        with self.assertRaises(ValueError):
+            weighted_sample_counts(["a"], [0], 1, 3, 0, start=10 ** 9)
+        with self.assertRaises(ValueError):
+            weighted_sample_excluding_counts(
+                ["a", "b"], [1, 0], 1, (0,), 3, 0, start=10 ** 9)
+
+    def test_inputs_not_mutated(self):
+        items = ["a", "b", "c", "d"]
+        weights = [Decimal("1.5"), 2, Fraction(1, 3), 0.5]
+        excluded = [2, 2, 0]
+        snapshots = (list(items), list(weights), list(excluded))
+        weighted_sample_counts(items, weights, 3, 5, 99)
+        weighted_sample_excluding_counts(items, weights, 2, excluded, 5, 99)
+        self.assertEqual((items, weights, excluded), snapshots)
+
+    def test_deterministic_for_same_seed(self):
+        args = (list(range(10)), list(range(1, 11)), 5)
+        first = weighted_sample_counts(*args, 30, seed=123)
+        for _ in range(4):
+            self.assertEqual(
+                weighted_sample_counts(*args, 30, seed=123), first)
+        ex_first = weighted_sample_excluding_counts(
+            list(range(10)), list(range(1, 11)), 5, (0, 2), 30, seed=123)
+        for _ in range(4):
+            self.assertEqual(
+                weighted_sample_excluding_counts(
+                    list(range(10)), list(range(1, 11)), 5, (0, 2),
+                    30, seed=123),
+                ex_first,
+            )
+
+    def test_exact_paths_counts_align(self):
+        cases = [
+            (["a", "b"], [10 ** 400, 10 ** 400], 2, ()),
+            (["H", "t", "z"],
+             [10 ** 100, Decimal("1E-100"), Decimal("-0")], 1, (0,)),
+            (["a", "b", "c"], [1e308, 1e308, 1.0], 2, (2,)),
+            (["a", "b"], [9, Fraction(1, 100)], 1, ()),
+            (["a", "b"], [1, Fraction(1, 10 ** 100)], 1, ()),
+            (["p", "q", "r", "s"],
+             [2, Fraction(1), 0.5, Decimal("0.25")], 3, (1,)),
+        ]
+        for items, weights, k, excluded in cases:
+            n = len(items)
+            for seed in (0, 7, 2316):
+                with self.subTest(k=k, seed=seed):
+                    plain = weighted_sample_counts(
+                        items, weights, k, 6, seed)
+                    self.assertEqual(
+                        plain,
+                        self._flatten(
+                            weighted_sample_many_indices(
+                                items, weights, k, 6, seed), n),
+                    )
+                    excluding = weighted_sample_excluding_counts(
+                        items, weights, k, excluded, 6, seed)
+                    self.assertEqual(
+                        excluding,
+                        self._flatten(
+                            weighted_sample_many_excluding_indices(
+                                items, weights, k, excluded, 6, seed), n),
+                    )
+
+    def test_counts_serialize_exact_roundtrip(self):
+        # 计数为任意精度整数, 直接交给 serialize_metrics 精确往返, 不出
+        # 现浮点或科学计数文本。
+        counts = weighted_sample_counts(
+            list(range(6)), [10 ** 100, 1, 2, 3, 4, 5], 3, 17, 42)
+        text = serialize_metrics(counts)
+        self.assertNotIn(".", text)
+        self.assertNotIn("e", text)
+        self.assertNotIn("E", text)
+        restored = deserialize_metrics(text)
+        self.assertEqual(restored, counts)
+        self.assertTrue(all(type(c) is int for c in restored))
+
+        excluding = weighted_sample_excluding_counts(
+            list(range(6)), [10 ** 100, 1, 2, 3, 4, 5], 3, (0,), 17, 42)
+        text = serialize_metrics({"counts": excluding})
+        self.assertEqual(
+            deserialize_metrics(text)["counts"], excluding)
+
+        # 计数列表本身也能容纳 5000 位整数并保持精确十进制往返(不经浮点)。
+        giant = [0, 10 ** 5000 + 7]
+        giant_text = serialize_metrics(giant)
+        self.assertNotIn("e", giant_text.lower())
+        self.assertEqual(deserialize_metrics(giant_text), giant)
+        self.assertTrue(
+            all(type(c) is int for c in deserialize_metrics(giant_text)))
+
+    def test_existing_entries_unchanged(self):
+        # 新增频次入口不改变既有入口的序列、返回类型与序列化格式。
+        self.assertEqual(
+            weighted_sample(["red", "green", "blue"], [1, 3, 2], 2, 42),
+            ["green", "red"],
+        )
+        self.assertEqual(
+            weighted_sample_many_indices(
+                ["p", "q", "r"], [2, Fraction(1), 0.5], 3, 4, 42),
+            [[1, 0, 2], [0, 2, 1], [0, 1, 2], [0, 2, 1]],
+        )
+        self.assertEqual(
+            serialize_metrics({"n": 10 ** 100}),
+            '{"n":1' + "0" * 100 + "}",
+        )
 
 
 if __name__ == "__main__":

@@ -34,6 +34,18 @@
     weighted_sample_many_indices(items, weights, k, draws, seed=0, start=0)
         与 weighted_sample_many 同规则(含 start 窗口语义), 但每轮返回
         按抽样先后排列的零基原始索引, 两个批量入口逐轮对应。
+    weighted_sample_counts(items, weights, k, draws, seed=0, start=0)
+        weighted_sample_many_indices 的批量频次入口: 接受与该入口相同
+        的 items、weights、k、draws、seed、start 语义与校验顺序, 按同一
+        随机流生成窗口内的轮次, 返回长度等于 items 的整数 list counts,
+        counts[i] 是零基区间 [start, start+draws) 中原始位置 i 被选中的
+        次数(每轮无放回, 相等的元素值仍按不同位置分别累计)。结果等于
+        把 weighted_sample_many_indices 对应窗口的全部轮次按位置摊平
+        计数; 首轮、后续轮次、相同种子以及 k=0 的随机流消耗逐项对齐。
+        draws=0 或 k=0 返回全零列表(仍完成全部校验), 正权重不足在返回
+        列表前抛 ValueError, 任何失败都不给出部分计数。计数为任意精度
+        整数, 可直接交给 serialize_metrics 并经 deserialize_metrics
+        精确往返。不修改入参。
     weighted_sample_stream_indices(items, weights, k, draws, seed=0, start=0)
         weighted_sample_many_indices 的按需逐轮入口: 返回一个可迭代对象,
         调用方逐轮取得与 weighted_sample_many_indices 完全一致的轮次
@@ -64,6 +76,22 @@
         与 weighted_sample_many_excluding_indices 同规则(同一套校验
         顺序、异常类别与 start 窗口语义), 但每轮按相同索引返回元素值,
         两个批量排除入口逐轮逐项对应。
+    weighted_sample_excluding_counts(items, weights, k, excluded, draws,
+        seed=0, start=0)
+        weighted_sample_many_excluding_indices 的批量频次入口: 接受与该
+        入口相同的 items、weights、k、excluded、draws、seed、start 语义
+        与固定校验顺序, 按同一随机流生成窗口内的轮次, 返回长度等于
+        items 的整数 list counts, counts[i] 是零基区间
+        [start, start+draws) 中原始位置 i 被选中的次数; 被排除位置的
+        计数始终为零, 其余位置按每轮重新开始的未排除位置池累计(相等
+        的元素值仍按不同位置分别累计)。结果等于把
+        weighted_sample_many_excluding_indices 对应窗口的全部轮次按
+        位置摊平计数; 首轮、后续轮次、相同种子以及 k=0 的随机流消耗
+        逐项对齐。draws=0 或 k=0 返回全零列表(仍完成全部校验, 含
+        excluded 与可行性检查), 正权重不足在返回列表前抛 ValueError,
+        任何失败都不给出部分计数。计数为任意精度整数, 可直接交给
+        serialize_metrics 并经 deserialize_metrics 精确往返。不修改
+        入参, 也不修改 excluded。
     weighted_sample_stream_excluding_indices(items, weights, k, excluded,
         draws, seed=0, start=0)
         weighted_sample_many_excluding_indices 的按需逐轮入口: 返回一个
@@ -667,6 +695,53 @@ def weighted_sample_many(items, weights, k, draws, seed=0, start=0):
     return [[items[i] for i in round_indices] for round_indices in rounds]
 
 
+def weighted_sample_counts(items, weights, k, draws, seed=0, start=0):
+    """weighted_sample_many_indices 的批量频次入口: 直接按原始零基位置
+    累计窗口内的选中次数, 免去调用方逐轮遍历。
+
+    接受与 weighted_sample_many_indices 完全相同的 items、weights、k、
+    draws、seed、start 语义与固定校验顺序(items/weights/k/seed、draws、
+    start, 随后正权重可行性检查), 按同一条由 seed 初始化的随机流先生成
+    (并跳过)start 个完整轮次, 再生成 draws 轮; 返回长度等于 items 的
+    list, counts[i] 即零基区间 [start, start+draws) 内位置 i 被选中的
+    总次数(每轮无放回, 同一位置每轮至多计一次; 相等的元素值仍按不同
+    位置分别累计)。因此对相同输入, 本入口与逐轮调用
+    weighted_sample_many_indices 后再按位置摊平计数逐项一致 —— 首轮、
+    后续轮次、相同种子以及 k=0 时的随机流消耗都与对应索引入口逐项对齐。
+
+    draws=0 或 k=0 返回全零列表(k=0 的轮次不消耗随机流), 但仍完成既有
+    全部校验; k>0 而正权重位置不足 k 个时在返回列表前抛 ValueError。
+    全部失败都不返回部分计数。计数为任意精度整数, 可直接交给
+    serialize_metrics 并经 deserialize_metrics 精确往返。不修改入参。
+    """
+    n = _validate_sample_inputs(items, weights, k, seed)
+    _validate_draws(draws)
+    _validate_start(start)
+
+    # 与批量索引入口相同的可行性前置检查: 在构造计数列表并生成任何一轮
+    # 之前确定失败, 保证绝不返回部分计数(即使 draws=0 或 start 很大)。
+    if k > 0 and k > _count_positive_weights(weights):
+        raise ValueError("no positive weight")
+
+    pool_weights = list(weights)
+    rng = random.Random(seed)
+    pool_weights, use_exact = _select_sampling_plan(pool_weights, k)
+
+    counts = [0] * n
+    # 与 weighted_sample_many_indices 完全相同的跳过与生成节奏: k=0 的
+    # 轮次不消耗随机流, draws=0 时跳过与否都不影响全零结果, 两种情形
+    # 都无需空转 —— 计数入口与索引入口的随机流消耗因此逐项对齐。
+    if k > 0 and draws > 0:
+        for _ in range(start):
+            _draw_indices_once(n, pool_weights, k, rng, use_exact)
+        for _ in range(draws):
+            for position in _draw_indices_once(
+                n, pool_weights, k, rng, use_exact
+            ):
+                counts[position] += 1
+    return counts
+
+
 def weighted_sample_stream_indices(items, weights, k, draws, seed=0, start=0):
     """weighted_sample_many_indices 的按需逐轮入口。
 
@@ -792,6 +867,55 @@ def weighted_sample_many_excluding(
         items, weights, k, excluded, draws, seed, start
     )
     return [[items[i] for i in round_indices] for round_indices in rounds]
+
+
+def weighted_sample_excluding_counts(
+    items, weights, k, excluded, draws, seed=0, start=0
+):
+    """weighted_sample_many_excluding_indices 的批量频次入口: 直接按原始
+    零基位置累计窗口内的选中次数, 免去调用方逐轮遍历。
+
+    接受与 weighted_sample_many_excluding_indices 完全相同的 items、
+    weights、k、excluded、draws、seed、start 语义与固定校验顺序
+    (items/weights/k/seed、excluded、draws、start, 随后未排除位置的
+    正权重可行性检查; excluded 按集合语义解释, 重复成员与排列顺序忽略)。
+    按同一条由 seed 初始化的随机流先生成(并跳过)start 个完整轮次,
+    再生成 draws 轮; 返回长度等于 items 的 list, counts[i] 即零基区间
+    [start, start+draws) 内位置 i 被选中的总次数。被排除位置的计数始终
+    为零(即使其权重为正), 其余位置按"每轮重新开始的同一组未排除位置
+    池"累计, 未排除的零权重位置仍永不入选; 相等的元素值仍按不同位置
+    分别累计。因此对相同输入, 本入口与逐轮调用
+    weighted_sample_many_excluding_indices 后再按位置摊平计数逐项一致
+    —— 首轮、后续轮次、相同种子以及 k=0 时的随机流消耗都与对应索引
+    入口逐项对齐。
+
+    draws=0 或 k=0 返回全零列表(k=0 的轮次不消耗随机流), 但仍完成既有
+    全部校验(含 excluded 与未排除位置的正权重可行性检查); k>0 而未排除
+    位置中的正权重不足 k 个时在返回列表前抛 ValueError。全部失败都不
+    返回部分计数。计数为任意精度整数, 可直接交给 serialize_metrics 并经
+    deserialize_metrics 精确往返。不修改入参, 也不修改 excluded。
+    """
+    pool, planned_weights, use_exact, rng = _validate_excluding_batch_inputs(
+        items, weights, k, seed, excluded, draws, start
+    )
+
+    counts = [0] * len(items)
+    # 与 weighted_sample_many_excluding_indices 完全相同的跳过与生成
+    # 节奏: k=0 的轮次不消耗随机流, draws=0 时跳过与否都不影响全零
+    # 结果, 两种情形都无需空转 —— 计数入口与索引入口的随机流消耗因此
+    # 逐项对齐。抽样器只返回未排除的原始位置, 被排除位置在 counts 中
+    # 自然始终保持为零。
+    if k > 0 and draws > 0:
+        for _ in range(start):
+            _draw_indices_once_pool(
+                pool, planned_weights, k, rng, use_exact
+            )
+        for _ in range(draws):
+            for position in _draw_indices_once_pool(
+                pool, planned_weights, k, rng, use_exact
+            ):
+                counts[position] += 1
+    return counts
 
 
 def weighted_sample_stream_excluding_indices(
