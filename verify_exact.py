@@ -10,7 +10,8 @@
   6. 异常仍按既有 TypeError / ValueError 分类; 入参不被修改;
   7. 小整数(累计 <= 2**53)保持基线浮点路径的固定序列;
   8. deserialize_metrics 精确还原序列化文本(任意精度 int / Decimal,
-     重复成员名与非有限值拒绝), 并可消费 checkpoint 状态文本恢复采样。
+     重复成员名与非有限值拒绝), 并可消费 checkpoint 状态文本恢复采样;
+  9. 排除采样会话可创建断点并分段恢复, 多次续接与一次性生成逐项一致。
 
 用法:  python3 verify_exact.py   (全部通过时退出码为 0)
 """
@@ -681,6 +682,117 @@ list(app.weighted_sample_stream_excluding(ex_items, ex_weights, 2, excluded, 4, 
 check((ex_items, ex_weights, list(excluded)) ==
       (ex_snap[0], ex_snap[1], list(ex_snap[2])),
       "排除批量/流式入口不修改 items / weights / excluded")
+
+
+# ---------------------------------------------------------------------------
+# 13. 排除采样的可暂停/恢复入口
+# ---------------------------------------------------------------------------
+section("排除采样的断点/恢复入口")
+
+ex_items = list("abcdef")
+ex_weights = [HUGE, 1, HUGE * 2, 7, 0, 3]
+excluded = (0, 4)
+
+# 13.1 恢复轮次等于批量排除入口的零基区间; 多次续接(含状态文本往返)与
+#   一次性生成逐项相同; 值/索引两个恢复入口逐轮对应且下一状态逐字段一致。
+resume_ok = True
+for seed in (0, 1, 42, -7, 1.5, "s", b"s", True):
+    full_i = app.weighted_sample_many_excluding_indices(
+        ex_items, ex_weights, 3, excluded, 12, seed)
+    state = app.weighted_sample_excluding_checkpoint(
+        ex_items, ex_weights, 3, excluded, seed, start=2)
+    collected = []
+    for chunk in (4, 3, 3):
+        rounds, state = app.weighted_sample_excluding_resume_indices(
+            ex_items, ex_weights, 3, excluded, state, chunk)
+        collected.extend(rounds)
+        state = app.deserialize_metrics(app.serialize_metrics(state))
+    if collected != full_i[2:] or state["position"] != 12:
+        resume_ok = False
+    fresh = app.weighted_sample_excluding_checkpoint(
+        ex_items, ex_weights, 3, excluded, seed, start=2)
+    v_rounds, v_next = app.weighted_sample_excluding_resume(
+        ex_items, ex_weights, 3, excluded, fresh, 10)
+    i_rounds, i_next = app.weighted_sample_excluding_resume_indices(
+        ex_items, ex_weights, 3, excluded, fresh, 10)
+    if v_rounds != [[ex_items[i] for i in rd] for rd in i_rounds]:
+        resume_ok = False
+    if v_next != i_next:
+        resume_ok = False
+check(resume_ok,
+      "断点续接等于批量区间, 值/索引恢复入口逐轮对应且下一状态一致")
+
+# 13.2 excluded 为空时与普通恢复入口一致; 集合语义(重复/顺序)不影响状态。
+empty_ok = True
+for seed in (0, 42, "s"):
+    rounds_e, _ = app.weighted_sample_excluding_resume_indices(
+        ex_items, ex_weights, 3, (),
+        app.weighted_sample_excluding_checkpoint(
+            ex_items, ex_weights, 3, (), seed, start=2), 5)
+    rounds_p, _ = app.weighted_sample_resume_indices(
+        ex_items, ex_weights, 3,
+        app.weighted_sample_checkpoint(ex_items, ex_weights, 3, seed, start=2),
+        5)
+    if rounds_e != rounds_p:
+        empty_ok = False
+set_state_ok = (
+    app.weighted_sample_excluding_checkpoint(
+        ex_items, ex_weights, 3, (1, 3), 7, start=2)
+    == app.weighted_sample_excluding_checkpoint(
+        ex_items, ex_weights, 3, [3, 1, 1], 7, start=2)
+)
+check(empty_ok and set_state_ok,
+      "excluded 为空时与普通恢复一致; 集合语义不影响状态内容")
+
+# 13.3 draws=0 / k=0 语义。
+z_state = app.weighted_sample_excluding_checkpoint(
+    ex_items, ex_weights, 3, excluded, 7, start=5)
+z_rounds, z_next = app.weighted_sample_excluding_resume_indices(
+    ex_items, ex_weights, 3, excluded, z_state, 0)
+check(z_rounds == [] and z_next == z_state and z_next is not z_state,
+      "draws=0 返回空轮次与不变状态副本")
+k0_state = app.weighted_sample_excluding_checkpoint(
+    ex_items, ex_weights, 0, excluded, 0)
+k0_rounds, k0_next = app.weighted_sample_excluding_resume(
+    ex_items, ex_weights, 0, excluded, k0_state, 3)
+check(k0_rounds == [[], [], []] and k0_next["position"] == 3
+      and k0_next["rng"] == k0_state["rng"],
+      "k=0 生成空轮次, 只推进位置不耗随机流")
+
+# 13.4 异常分类: 非映射状态 TypeError; excluded 结构/成员 TypeError、越界
+#   ValueError; 版本/摘要/绑定不匹配 ValueError; 正权重不足 ValueError。
+raises(TypeError,
+       lambda: app.weighted_sample_excluding_resume_indices(
+           ex_items, ex_weights, 3, excluded, "not-a-mapping", 1),
+       "排除恢复: 非映射状态 -> TypeError")
+raises(TypeError,
+       lambda: app.weighted_sample_excluding_resume(
+           ex_items, ex_weights, 3, "01", z_state, 1),
+       "排除恢复: excluded 结构错误 -> TypeError")
+raises(ValueError,
+       lambda: app.weighted_sample_excluding_resume_indices(
+           ex_items, ex_weights, 3, (9,), z_state, 1),
+       "排除恢复: excluded 越界 -> ValueError")
+raises(ValueError,
+       lambda: app.weighted_sample_excluding_resume_indices(
+           ex_items, ex_weights, 3, (1,), z_state, 1),
+       "排除恢复: excluded 与状态不匹配 -> ValueError")
+bad_ver = dict(z_state)
+bad_ver["version"] = 99
+raises(ValueError,
+       lambda: app.weighted_sample_excluding_resume_indices(
+           ex_items, ex_weights, 3, excluded, bad_ver, 1),
+       "排除恢复: 版本不支持 -> ValueError")
+bad_pos = dict(z_state)
+bad_pos["position"] = 99
+raises(ValueError,
+       lambda: app.weighted_sample_excluding_resume_indices(
+           ex_items, ex_weights, 3, excluded, bad_pos, 1),
+       "排除恢复: 篡改位置未重算摘要 -> ValueError")
+raises(ValueError,
+       lambda: app.weighted_sample_excluding_checkpoint(
+           ["a", "b"], [1, 0], 2, (), 0),
+       "排除断点: 未排除正权重不足 -> ValueError")
 
 
 # ---------------------------------------------------------------------------

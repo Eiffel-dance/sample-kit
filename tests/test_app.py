@@ -23,6 +23,9 @@ from app import (
     weighted_sample_checkpoint,
     weighted_sample_resume_indices,
     weighted_sample_resume,
+    weighted_sample_excluding_checkpoint,
+    weighted_sample_excluding_resume_indices,
+    weighted_sample_excluding_resume,
     serialize_metrics,
     deserialize_metrics,
 )
@@ -2553,6 +2556,777 @@ class WeightedSampleResumeValuesTest(unittest.TestCase):
         weighted_sample_resume(items, weights, 3, state, 4)
         self.assertEqual(items, items_snap)
         self.assertEqual(weights, weights_snap)
+        self.assertEqual(state, state_snap)
+
+
+class WeightedSampleExcludingCheckpointTest(unittest.TestCase):
+    """排除会话断点 weighted_sample_excluding_checkpoint /
+    weighted_sample_excluding_resume_indices。"""
+
+    CASES = [
+        (list("abcdef"), [1, 3, 2, 5, 0, 2], 3, (0, 4)),
+        (list(range(20)), [10 ** 80 + i for i in range(20)], 10, (1, 3, 5)),
+        (["p", "q"], [0.5, 1.5], 2, ()),
+        (list("xyz"), [10 ** 100, 1, 10 ** 50], 2, (2,)),
+        (["p", "q", "r"], [2, Fraction(1), 0.5], 2, (0,)),
+        (["a", "b", "c"], [Decimal("1.5"), Decimal("0.5"), Decimal("2")], 2, (1,)),
+        (["a", "b"], [1, 0], 1, (1,)),
+        (["H", "t", "z"], [10 ** 100, Decimal("1E-100"), Decimal("-0")], 2, (2,)),
+        ([1, 1, 1], [1, 1, 1], 3, ()),
+    ]
+
+    def test_resume_rounds_equal_batch_window(self):
+        # 恢复轮次等于批量排除入口对应零基区间 [position, position+draws)。
+        for items, weights, k, excluded in self.CASES:
+            for seed in (0, 1, 42, -7, 1.5, "s", b"s", bytearray(b"s"), True):
+                for start in (0, 1, 3):
+                    with self.subTest(k=k, seed=seed, start=start):
+                        total = start + 9
+                        full = weighted_sample_many_excluding_indices(
+                            items, weights, k, excluded, total, seed
+                        )
+                        state = weighted_sample_excluding_checkpoint(
+                            items, weights, k, excluded, seed, start
+                        )
+                        rounds, next_state = \
+                            weighted_sample_excluding_resume_indices(
+                                items, weights, k, excluded, state, 9
+                            )
+                        self.assertEqual(rounds, full[start:])
+                        self.assertEqual(next_state["position"], total)
+
+    def test_chunked_chain_covers_the_same_stream(self):
+        # 分块 3 + 4 + 5 推进, 每块都可能从 json 往返后的状态继续。
+        items, weights, k = list("abcdef"), [1, 3, 2, 5, 0, 2], 4
+        excluded = (0, 4)
+        full = weighted_sample_many_excluding_indices(
+            items, weights, k, excluded, 14, 42
+        )
+        state = weighted_sample_excluding_checkpoint(
+            items, weights, k, excluded, 42, start=2
+        )
+        collected = []
+        for chunk in (3, 4, 5):
+            rounds, state = weighted_sample_excluding_resume_indices(
+                items, weights, k, excluded, state, chunk
+            )
+            collected.extend(rounds)
+            state = json.loads(json.dumps(state))
+        self.assertEqual(collected, full[2:])
+        self.assertEqual(state["position"], 14)
+
+    def test_start_zero_first_round_matches_single_excluding_entry(self):
+        for items, weights, k, excluded in self.CASES:
+            with self.subTest(k=k, excluded=excluded):
+                state = weighted_sample_excluding_checkpoint(
+                    items, weights, k, excluded, 42
+                )
+                rounds, _ = weighted_sample_excluding_resume_indices(
+                    items, weights, k, excluded, state, 1
+                )
+                self.assertEqual(
+                    rounds[0],
+                    weighted_sample_excluding_indices(
+                        items, weights, k, excluded, 42
+                    ),
+                )
+
+    def test_empty_excluded_matches_plain_resume_entries(self):
+        # excluded 为空时, 轮次与普通批量/恢复入口逐项一致。
+        for items, weights, k in (
+            (list("abcdef"), [1, 3, 2, 5, 0, 2], 4),
+            (["p", "q", "r"], [2, Fraction(1), 0.5], 3),
+            (["a", "b", "c"], [Decimal("1.5"), Decimal("0.5"), 2], 2),
+        ):
+            for seed in (0, 42, "s", True):
+                with self.subTest(k=k, seed=seed):
+                    state = weighted_sample_excluding_checkpoint(
+                        items, weights, k, (), seed, start=2
+                    )
+                    rounds, _ = weighted_sample_excluding_resume_indices(
+                        items, weights, k, (), state, 5
+                    )
+                    plain_state = weighted_sample_checkpoint(
+                        items, weights, k, seed, start=2
+                    )
+                    plain_rounds, _ = weighted_sample_resume_indices(
+                        items, weights, k, plain_state, 5
+                    )
+                    self.assertEqual(rounds, plain_rounds)
+                    self.assertEqual(
+                        rounds,
+                        weighted_sample_many_indices(
+                            items, weights, k, 5, seed, start=2
+                        ),
+                    )
+
+    def test_excluded_set_semantics_normalize_state_and_resume(self):
+        # 重复位置与排列顺序不影响状态内容, 也不影响恢复时的匹配判定。
+        items, weights, k = list("abcdef"), [1, 3, 2, 5, 0, 2], 3
+        base = weighted_sample_excluding_checkpoint(
+            items, weights, k, (1, 3), 7, start=2
+        )
+        for variant in ((3, 1), (1, 1, 3), [3, 1, 1, 3]):
+            with self.subTest(variant=variant):
+                self.assertEqual(
+                    weighted_sample_excluding_checkpoint(
+                        items, weights, k, variant, 7, start=2
+                    ),
+                    base,
+                )
+        self.assertEqual(base["excluded"], [1, 3])
+        # 恢复时 excluded 的同集合不同写法同样匹配。
+        rounds, _ = weighted_sample_excluding_resume_indices(
+            items, weights, k, [3, 1, 1], base, 4
+        )
+        self.assertEqual(
+            rounds,
+            weighted_sample_many_excluding_indices(
+                items, weights, k, (1, 3), 4, 7, start=2
+            ),
+        )
+
+    def test_draws_zero_returns_empty_and_unchanged_state_copy(self):
+        items, weights, k = list("abcd"), [1, 3, 2, 0], 3
+        state = weighted_sample_excluding_checkpoint(
+            items, weights, k, (3,), 7, start=5
+        )
+        rounds, next_state = weighted_sample_excluding_resume_indices(
+            items, weights, k, (3,), state, 0
+        )
+        self.assertEqual(rounds, [])
+        self.assertEqual(next_state["position"], 5)
+        self.assertEqual(next_state["rng"], state["rng"])
+        self.assertEqual(next_state["digest"], state["digest"])
+        self.assertIsNot(next_state, state)
+        more, _ = weighted_sample_excluding_resume_indices(
+            items, weights, k, (3,), next_state, 2
+        )
+        self.assertEqual(
+            more,
+            weighted_sample_many_excluding_indices(
+                items, weights, k, (3,), 2, 7, start=5
+            ),
+        )
+        self.assertEqual(state["position"], 5)
+
+    def test_k_zero_empty_rounds_advance_position_without_rng(self):
+        for items, weights, excluded in (
+            ([], [], ()),
+            (["a", "b"], [1, 2], (0,)),
+            (["a"], [0], ()),
+        ):
+            state = weighted_sample_excluding_checkpoint(
+                items, weights, 0, excluded, 0
+            )
+            rounds, next_state = weighted_sample_excluding_resume_indices(
+                items, weights, 0, excluded, state, 4
+            )
+            self.assertEqual(rounds, [[], [], [], []])
+            self.assertEqual(next_state["position"], 4)
+            self.assertEqual(next_state["rng"], state["rng"])
+            again, third = weighted_sample_excluding_resume_indices(
+                items, weights, 0, excluded, next_state, 2
+            )
+            self.assertEqual(again, [[], []])
+            self.assertEqual(third["position"], 6)
+            self.assertEqual(third["rng"], state["rng"])
+
+    def test_excluded_positions_never_appear(self):
+        items, weights = list("abcdef"), [1, 3, 2, 5, 0, 2]
+        excluded = (0, 2, 4)
+        state = weighted_sample_excluding_checkpoint(
+            items, weights, 2, excluded, 99, start=3
+        )
+        rounds, _ = weighted_sample_excluding_resume_indices(
+            items, weights, 2, excluded, state, 50
+        )
+        for rd in rounds:
+            self.assertEqual(len(rd), 2)
+            self.assertEqual(len(set(rd)), 2)
+            self.assertTrue(all(i in (1, 3, 5) for i in rd))
+
+    # ------------------------------------------------------------------
+    # 状态: JSON 原生 / serialize_metrics 往返 / 字段
+    # ------------------------------------------------------------------
+    def test_state_contains_expected_fields(self):
+        state = weighted_sample_excluding_checkpoint(
+            list("abcd"), [1, 3, 2, 0], 2, (3, 0), 42, start=2
+        )
+        self.assertEqual(state["version"], 1)
+        self.assertEqual(state["position"], 2)
+        self.assertEqual(state["k"], 2)
+        self.assertEqual(state["n"], 4)
+        self.assertEqual(state["excluded"], [0, 3])
+        for field in ("items_digest", "weights_digest", "seed", "exact",
+                      "rng", "digest"):
+            self.assertIn(field, state)
+
+    def test_state_json_and_serialize_metrics_roundtrips(self):
+        items, weights, k = list("abcdef"), [1, 3, 2, 5, 0, 2], 4
+        excluded = (4, 0)
+        state = weighted_sample_excluding_checkpoint(
+            items, weights, k, excluded, 42, start=3
+        )
+        expected = weighted_sample_many_excluding_indices(
+            items, weights, k, excluded, 5, 42, start=3
+        )
+        # json 文本往返。
+        restored = json.loads(json.dumps(state, allow_nan=False))
+        rounds, next_state = weighted_sample_excluding_resume_indices(
+            items, weights, k, excluded, restored, 5
+        )
+        self.assertEqual(rounds, expected)
+        # serialize_metrics / deserialize_metrics 往返后继续恢复。
+        again = deserialize_metrics(serialize_metrics(next_state))
+        more, _ = weighted_sample_excluding_resume_indices(
+            items, weights, k, excluded, again, 2
+        )
+        self.assertEqual(
+            more,
+            weighted_sample_many_excluding_indices(
+                items, weights, k, excluded, 2, 42, start=8
+            ),
+        )
+
+    def test_state_roundtrip_through_deserialize_metrics(self):
+        items, weights, k = ["p", "q", "r"], [2, Fraction(1), 0.5], 2
+        for seed in (0, 42, 1.5, -0.0, "s"):
+            with self.subTest(seed=seed):
+                state = weighted_sample_excluding_checkpoint(
+                    items, weights, k, (2,), seed, start=2
+                )
+                restored = deserialize_metrics(serialize_metrics(state))
+                rounds, _ = weighted_sample_excluding_resume_indices(
+                    items, weights, k, (2,), restored, 3
+                )
+                self.assertEqual(
+                    rounds,
+                    weighted_sample_many_excluding_indices(
+                        items, weights, k, (2,), 3, seed, start=2
+                    ),
+                )
+
+    # ------------------------------------------------------------------
+    # 断点创建: 校验顺序与异常分类
+    # ------------------------------------------------------------------
+    def test_checkpoint_validation_matches_batch_entry(self):
+        items, weights, k = list("abcd"), [1, 3, 2, 0], 3
+
+        def te(fn):
+            with self.assertRaises(TypeError):
+                fn()
+
+        def ve(fn):
+            with self.assertRaises(ValueError):
+                fn()
+
+        te(lambda: weighted_sample_excluding_checkpoint(
+            "abcd", weights, k, (), 0))
+        te(lambda: weighted_sample_excluding_checkpoint(
+            items, iter(weights), k, (), 0))
+        te(lambda: weighted_sample_excluding_checkpoint(
+            items, weights, True, (), 0))
+        te(lambda: weighted_sample_excluding_checkpoint(
+            items, weights, k, (), object()))
+        te(lambda: weighted_sample_excluding_checkpoint(
+            items, [1, True, 2, 0], k, (), 0))
+        te(lambda: weighted_sample_excluding_checkpoint(
+            items, weights, k, "01", 0))
+        te(lambda: weighted_sample_excluding_checkpoint(
+            items, weights, k, (True,), 0))
+        te(lambda: weighted_sample_excluding_checkpoint(
+            items, weights, k, (1.0,), 0))
+        te(lambda: weighted_sample_excluding_checkpoint(
+            items, weights, k, (), 0, True))
+        te(lambda: weighted_sample_excluding_checkpoint(
+            items, weights, k, (), 0, 1.0))
+        ve(lambda: weighted_sample_excluding_checkpoint(
+            ["a", "b"], [1], 1, (), 0))
+        ve(lambda: weighted_sample_excluding_checkpoint(
+            items, weights, 5, (), 0))
+        ve(lambda: weighted_sample_excluding_checkpoint(
+            items, weights, -1, (), 0))
+        ve(lambda: weighted_sample_excluding_checkpoint(
+            items, [1, -1, 2, 0], 1, (), 0))
+        ve(lambda: weighted_sample_excluding_checkpoint(
+            items, [1, float("nan"), 2, 0], 1, (), 0))
+        ve(lambda: weighted_sample_excluding_checkpoint(
+            items, weights, k, (4,), 0))
+        ve(lambda: weighted_sample_excluding_checkpoint(
+            items, weights, k, (-1,), 0))
+        ve(lambda: weighted_sample_excluding_checkpoint(
+            items, weights, k, (), 0, -1))
+        # 未排除位置正权重不足。
+        ve(lambda: weighted_sample_excluding_checkpoint(
+            ["a", "b"], [1, 0], 2, (), 0))
+        ve(lambda: weighted_sample_excluding_checkpoint(
+            ["a", "b"], [1, 1], 2, (0,), 0))
+        # items 错误先于 excluded 越界。
+        te(lambda: weighted_sample_excluding_checkpoint(
+            "ab", [1, 2], 1, (9,), 0))
+
+    def test_checkpoint_does_not_mutate_inputs(self):
+        items, weights = list("abcd"), [1, 3, 2, 0]
+        excluded = [3, 1, 1]
+        items_snap, weights_snap = list(items), list(weights)
+        weighted_sample_excluding_checkpoint(items, weights, 2, excluded, 42,
+                                             start=5)
+        self.assertEqual(items, items_snap)
+        self.assertEqual(weights, weights_snap)
+        self.assertEqual(excluded, [3, 1, 1])
+
+    # ------------------------------------------------------------------
+    # 恢复: 状态类型 / 结构 / 版本 / 摘要 / 绑定
+    # ------------------------------------------------------------------
+    def test_non_mapping_state_raises_type_error(self):
+        for bad in (None, [], "{}", 1, True, (), {1, 2}):
+            with self.subTest(bad=bad):
+                with self.assertRaises(TypeError):
+                    weighted_sample_excluding_resume_indices(
+                        list("abcd"), [1, 3, 2, 0], 3, (), bad, 1
+                    )
+
+    def test_draws_type_and_value_rules(self):
+        state = weighted_sample_excluding_checkpoint(
+            list("abcd"), [1, 3, 2, 0], 3, (3,), 0
+        )
+        for bad in (True, False, 1.0, "1", None, [1], 1 + 0j):
+            with self.subTest(bad=bad):
+                with self.assertRaises(TypeError):
+                    weighted_sample_excluding_resume_indices(
+                        list("abcd"), [1, 3, 2, 0], 3, (3,), state, bad
+                    )
+        with self.assertRaises(ValueError):
+            weighted_sample_excluding_resume_indices(
+                list("abcd"), [1, 3, 2, 0], 3, (3,), state, -1
+            )
+
+    def test_invalid_state_structure_raises_value_error(self):
+        items, weights, k = list("abcd"), [1, 3, 2, 0], 3
+        state = weighted_sample_excluding_checkpoint(
+            items, weights, k, (3,), 0
+        )
+
+        def ve(mutator):
+            import copy as _copy
+            bad = _copy.deepcopy(state)
+            mutator(bad)
+            with self.assertRaises(ValueError):
+                weighted_sample_excluding_resume_indices(
+                    items, weights, k, (3,), bad, 1
+                )
+
+        ve(lambda s: s.pop("version"))
+        ve(lambda s: s.pop("excluded"))
+        ve(lambda s: s.pop("rng"))
+        ve(lambda s: s.update(extra=1))
+        ve(lambda s: s.update(position=-1))
+        ve(lambda s: s.update(position=True))
+        ve(lambda s: s.update(k=True))
+        ve(lambda s: s.update(n=-1))
+        ve(lambda s: s.update(exact=1))
+        ve(lambda s: s.update(items_digest=1))
+        ve(lambda s: s.update(seed=["z", 1]))
+        ve(lambda s: s.update(rng={"v": 3}))
+        ve(lambda s: s.update(digest=1))
+        ve(lambda s: s.update(excluded="1"))
+        ve(lambda s: s.update(excluded=[True]))
+        ve(lambda s: s.update(excluded=[1.0]))
+        ve(lambda s: s.update(excluded=[-1]))
+        ve(lambda s: s.update(excluded=[4]))
+        ve(lambda s: s.update(excluded=[2, 1]))   # 非规范(未排序)
+        ve(lambda s: s.update(excluded=[1, 1]))   # 非规范(重复)
+
+    def test_unsupported_version_raises_value_error(self):
+        items, weights, k = list("abcd"), [1, 3, 2, 0], 3
+        state = weighted_sample_excluding_checkpoint(items, weights, k, (), 0)
+        for bad_version in (0, 2, 99, True, "1", 1.0):
+            bad = dict(state)
+            bad["version"] = bad_version
+            with self.subTest(bad_version=bad_version):
+                with self.assertRaises(ValueError):
+                    weighted_sample_excluding_resume_indices(
+                        items, weights, k, (), bad, 1
+                    )
+
+    def test_plain_and_excluding_states_are_not_interchangeable(self):
+        items, weights, k = list("abcd"), [1, 3, 2, 0], 3
+        plain = weighted_sample_checkpoint(items, weights, k, 0)
+        excluding = weighted_sample_excluding_checkpoint(
+            items, weights, k, (), 0
+        )
+        with self.assertRaises(ValueError):
+            weighted_sample_excluding_resume_indices(
+                items, weights, k, (), plain, 1
+            )
+        with self.assertRaises(ValueError):
+            weighted_sample_resume_indices(items, weights, k, excluding, 1)
+
+    def test_state_mismatch_with_inputs_raises_value_error(self):
+        items, weights, k = list("abcd"), [1, 3, 2, 0], 3
+        state = weighted_sample_excluding_checkpoint(
+            items, weights, k, (3,), 0
+        )
+
+        def ve(label, i2, w2, k2, e2):
+            with self.subTest(label=label):
+                with self.assertRaises(ValueError):
+                    weighted_sample_excluding_resume_indices(
+                        i2, w2, k2, e2, state, 1
+                    )
+
+        ve("k differs", items, weights, 2, (3,))
+        ve("items differ", list("abce"), weights, k, (3,))
+        ve("weights differ", items, [1, 3, 2, 1], k, (3,))
+        ve("weight type swap", items, [1.0, 3, 2, 0], k, (3,))
+        ve("fewer positions", items[:3], weights[:3], k, (3,))
+        ve("excluded differs", items, weights, k, (0,))
+        ve("excluded superset", items, weights, k, (0, 3))
+        ve("excluded empty", items, weights, k, ())
+
+    def test_tampered_fields_without_valid_digest_raise_value_error(self):
+        items, weights, k = list("abcd"), [1, 3, 2, 0], 3
+        state = weighted_sample_excluding_checkpoint(
+            items, weights, k, (3,), 0
+        )
+
+        def ve(mutator):
+            import copy as _copy
+            bad = _copy.deepcopy(state)
+            mutator(bad)
+            with self.assertRaises(ValueError):
+                weighted_sample_excluding_resume_indices(
+                    items, weights, k, (3,), bad, 1
+                )
+
+        ve(lambda s: s.update(position=s["position"] + 5))
+        ve(lambda s: s["rng"]["mt"].__setitem__(0, s["rng"]["mt"][0] ^ 1))
+        ve(lambda s: s.update(digest="0" * 64))
+        ve(lambda s: s.update(seed=["i", 123]))
+        ve(lambda s: s.update(exact=not s["exact"]))
+        ve(lambda s: s.update(excluded=[0, 1]))
+
+    def test_resume_input_validation_matches_sample_rules(self):
+        items, weights, k = list("abcd"), [1, 3, 2, 0], 3
+        state = weighted_sample_excluding_checkpoint(
+            items, weights, k, (3,), 0
+        )
+
+        def te(fn):
+            with self.assertRaises(TypeError):
+                fn()
+
+        def ve(fn):
+            with self.assertRaises(ValueError):
+                fn()
+
+        te(lambda: weighted_sample_excluding_resume_indices(
+            "abcd", weights, k, (1,), state, 1))
+        te(lambda: weighted_sample_excluding_resume_indices(
+            items, iter(weights), k, (1,), state, 1))
+        te(lambda: weighted_sample_excluding_resume_indices(
+            items, weights, True, (1,), state, 1))
+        te(lambda: weighted_sample_excluding_resume_indices(
+            items, [1, True, 2, 0], k, (1,), state, 1))
+        te(lambda: weighted_sample_excluding_resume_indices(
+            items, weights, k, "01", state, 1))
+        te(lambda: weighted_sample_excluding_resume_indices(
+            items, weights, k, (True,), state, 1))
+        ve(lambda: weighted_sample_excluding_resume_indices(
+            items, [1, -1, 2, 0], k, (1,), state, 1))
+        ve(lambda: weighted_sample_excluding_resume_indices(
+            items, [1, float("nan"), 2, 0], k, (1,), state, 1))
+        ve(lambda: weighted_sample_excluding_resume_indices(
+            items, weights, k, (9,), state, 1))
+        # 未排除位置正权重不足仍是 ValueError, 且在产生轮次前判定。
+        ve(lambda: weighted_sample_excluding_resume_indices(
+            ["a", "b"], [1, 0], 2, (),
+            weighted_sample_excluding_checkpoint(["a", "b"], [1, 0], 1, ()),
+            1))
+
+    def test_no_partial_rounds_on_error(self):
+        items, weights, k = list("abcd"), [1, 3, 2, 0], 3
+        state = weighted_sample_excluding_checkpoint(items, weights, k, (), 0)
+        bad = dict(state)
+        bad["position"] = 10 ** 9
+        with self.assertRaises(ValueError):
+            weighted_sample_excluding_resume_indices(
+                items, weights, k, (), bad, 5
+            )
+        with self.assertRaises(ValueError):
+            weighted_sample_excluding_resume_indices(
+                items, weights, k, (), state, -5
+            )
+
+    def test_resume_does_not_mutate_inputs_or_state(self):
+        items, weights = list("abcd"), [1, 3, 2, 0]
+        excluded = [3, 1]
+        items_snap, weights_snap = list(items), list(weights)
+        state = weighted_sample_excluding_checkpoint(
+            items, weights, 2, excluded, 42, start=2
+        )
+        import copy
+        state_snap = copy.deepcopy(state)
+        weighted_sample_excluding_resume_indices(
+            items, weights, 2, excluded, state, 4
+        )
+        self.assertEqual(items, items_snap)
+        self.assertEqual(weights, weights_snap)
+        self.assertEqual(excluded, [3, 1])
+        self.assertEqual(state, state_snap)
+
+
+class WeightedSampleExcludingResumeValuesTest(unittest.TestCase):
+    """按元素值恢复入口 weighted_sample_excluding_resume。"""
+
+    CASES = [
+        (list("abcdef"), [1, 3, 2, 5, 0, 2], 3, (0, 4)),
+        (list(range(20)), [10 ** 80 + i for i in range(20)], 10, (1, 3, 5)),
+        (["p", "q"], [0.5, 1.5], 2, ()),
+        (list("xyz"), [10 ** 100, 1, 10 ** 50], 2, (2,)),
+        (["p", "q", "r"], [2, Fraction(1), 0.5], 2, (0,)),
+        (["a", "b", "c"], [Decimal("1.5"), Decimal("0.5"), Decimal("2")], 2, (1,)),
+        (["H", "t", "z"], [10 ** 100, Decimal("1E-100"), Decimal("-0")], 2, (2,)),
+        ([1, 1, 1], [1, 1, 1], 3, ()),
+        ([], [], 0, ()),
+    ]
+
+    def test_value_rounds_match_index_rounds_and_next_state(self):
+        # 每轮元素值是索引轮次的逐项映射; 两个入口的下一状态逐字段一致。
+        for items, weights, k, excluded in self.CASES:
+            for seed in (0, 1, 42, -7, 1.5, "s", b"s", bytearray(b"s"), True):
+                for start in (0, 1, 3):
+                    with self.subTest(k=k, seed=seed, start=start):
+                        state = weighted_sample_excluding_checkpoint(
+                            items, weights, k, excluded, seed, start
+                        )
+                        idx_rounds, idx_next = \
+                            weighted_sample_excluding_resume_indices(
+                                items, weights, k, excluded, state, 7
+                            )
+                        val_rounds, val_next = weighted_sample_excluding_resume(
+                            items, weights, k, excluded,
+                            json.loads(json.dumps(state)), 7,
+                        )
+                        self.assertEqual(
+                            val_rounds,
+                            [[items[i] for i in rd] for rd in idx_rounds],
+                        )
+                        self.assertEqual(val_next, idx_next)
+
+    def test_value_rounds_equal_batch_values_window(self):
+        for items, weights, k, excluded in self.CASES:
+            for seed in (0, 7, 42, -3, "s", True):
+                for start, draws in ((0, 5), (2, 4), (10, 3)):
+                    with self.subTest(k=k, seed=seed, start=start):
+                        state = weighted_sample_excluding_checkpoint(
+                            items, weights, k, excluded, seed, start
+                        )
+                        rounds, next_state = weighted_sample_excluding_resume(
+                            items, weights, k, excluded, state, draws
+                        )
+                        self.assertEqual(
+                            rounds,
+                            weighted_sample_many_excluding(
+                                items, weights, k, excluded,
+                                start + draws, seed, start=0,
+                            )[start:],
+                        )
+                        self.assertEqual(next_state["position"], start + draws)
+
+    def test_empty_excluded_matches_plain_value_resume(self):
+        items, weights, k = list("abcdef"), [1, 3, 2, 5, 0, 2], 4
+        state = weighted_sample_excluding_checkpoint(
+            items, weights, k, (), 42, start=2
+        )
+        rounds, _ = weighted_sample_excluding_resume(
+            items, weights, k, (), state, 5
+        )
+        plain_state = weighted_sample_checkpoint(items, weights, k, 42, start=2)
+        plain_rounds, _ = weighted_sample_resume(
+            items, weights, k, plain_state, 5
+        )
+        self.assertEqual(rounds, plain_rounds)
+
+    def test_chunked_chain_covers_the_same_value_stream(self):
+        items, weights, k = list("abcdef"), [1, 3, 2, 5, 0, 2], 4
+        excluded = (0, 4)
+        full = weighted_sample_many_excluding(
+            items, weights, k, excluded, 14, 42
+        )
+        state = weighted_sample_excluding_checkpoint(
+            items, weights, k, excluded, 42, start=2
+        )
+        collected = []
+        for chunk in (3, 4, 5):
+            rounds, state = weighted_sample_excluding_resume(
+                items, weights, k, excluded, state, chunk
+            )
+            collected.extend(rounds)
+            state = json.loads(serialize_metrics(state))
+        self.assertEqual(collected, full[2:])
+        self.assertEqual(state["position"], 14)
+
+    def test_next_state_can_reenter_either_resume_entry(self):
+        items, weights, k = ["p", "q", "r"], [2, Fraction(1), 0.5], 2
+        excluded = (2,)
+        state = weighted_sample_excluding_checkpoint(
+            items, weights, k, excluded, 42, start=2
+        )
+        val_rounds, next_state = weighted_sample_excluding_resume(
+            items, weights, k, excluded, state, 4
+        )
+        self.assertEqual(
+            val_rounds,
+            weighted_sample_many_excluding(
+                items, weights, k, excluded, 6, 42
+            )[2:],
+        )
+        idx_rounds, state2 = weighted_sample_excluding_resume_indices(
+            items, weights, k, excluded, next_state, 2
+        )
+        self.assertEqual(
+            [items[i] for i in idx_rounds[0]],
+            weighted_sample_many_excluding(
+                items, weights, k, excluded, 8, 42
+            )[6],
+        )
+        self.assertEqual(state2["position"], 8)
+        more, state3 = weighted_sample_excluding_resume(
+            items, weights, k, excluded, state2, 2
+        )
+        self.assertEqual(
+            more,
+            weighted_sample_many_excluding(
+                items, weights, k, excluded, 10, 42
+            )[8:],
+        )
+        self.assertEqual(state3["position"], 10)
+
+    def test_draws_zero_returns_empty_and_unchanged_state_copy(self):
+        items, weights, k = list("abcd"), [1, 3, 2, 0], 3
+        state = weighted_sample_excluding_checkpoint(
+            items, weights, k, (3,), 7, start=5
+        )
+        rounds, next_state = weighted_sample_excluding_resume(
+            items, weights, k, (3,), state, 0
+        )
+        self.assertEqual(rounds, [])
+        self.assertEqual(next_state["position"], 5)
+        self.assertEqual(next_state["rng"], state["rng"])
+        self.assertEqual(next_state["digest"], state["digest"])
+        self.assertIsNot(next_state, state)
+        self.assertEqual(state["position"], 5)
+
+    def test_k_zero_draws_empty_lists_advance_position_without_rng(self):
+        for items, weights, excluded in (
+            ([], [], ()),
+            (["a", "b"], [1, 2], (0,)),
+            (["a"], [0], ()),
+        ):
+            state = weighted_sample_excluding_checkpoint(
+                items, weights, 0, excluded, 0
+            )
+            rounds, next_state = weighted_sample_excluding_resume(
+                items, weights, 0, excluded, state, 4
+            )
+            self.assertEqual(rounds, [[], [], [], []])
+            self.assertEqual(next_state["position"], 4)
+            self.assertEqual(next_state["rng"], state["rng"])
+
+    def test_validation_starts_with_sample_entry_checks(self):
+        # items/weights/k/excluded 的校验先于 state / draws。
+        good_state = weighted_sample_excluding_checkpoint(
+            list("abcd"), [1, 3, 2, 0], 3, (3,), 0
+        )
+        tampered = dict(good_state)
+        tampered["version"] = 2
+
+        def te(fn):
+            with self.assertRaises(TypeError):
+                fn()
+
+        def ve(fn):
+            with self.assertRaises(ValueError):
+                fn()
+
+        te(lambda: weighted_sample_excluding_resume(
+            "abcd", [1, 3, 2, 0], 3, (1,), tampered, -1))
+        te(lambda: weighted_sample_excluding_resume(
+            list("abcd"), iter([1, 3, 2, 0]), 3, (1,), tampered, -1))
+        te(lambda: weighted_sample_excluding_resume(
+            list("abcd"), [1, 3, 2, 0], True, (1,), tampered, -1))
+        te(lambda: weighted_sample_excluding_resume(
+            list("abcd"), [1, True, 2, 0], 3, (1,), tampered, -1))
+        te(lambda: weighted_sample_excluding_resume(
+            list("abcd"), [1, 3, 2, 0], 3, "01", tampered, -1))
+        te(lambda: weighted_sample_excluding_resume(
+            list("abcd"), [1, 3, 2, 0], 3, (True,), tampered, -1))
+        ve(lambda: weighted_sample_excluding_resume(
+            list("abcd"), [1, -1, 2, 0], 3, (1,), tampered, -1))
+        ve(lambda: weighted_sample_excluding_resume(
+            list("abcd"), [1, float("nan"), 2, 0], 3, (1,), tampered, -1))
+        ve(lambda: weighted_sample_excluding_resume(
+            list("abcd"), [1, 3, 2, 0], 3, (9,), tampered, -1))
+        ve(lambda: weighted_sample_excluding_resume(
+            ["a"], [Decimal("NaN")], 0, (), tampered, -1))
+
+    def test_state_and_draws_resume_entry_rules(self):
+        items, weights, k = list("abcd"), [1, 3, 2, 0], 3
+
+        def te(fn):
+            with self.assertRaises(TypeError):
+                fn()
+
+        def ve(fn):
+            with self.assertRaises(ValueError):
+                fn()
+
+        for bad_state in (None, [], "{}", 1, True, (), {1, 2}):
+            te(lambda bs=bad_state: weighted_sample_excluding_resume(
+                items, weights, k, (1,), bs, 1))
+        state = weighted_sample_excluding_checkpoint(
+            items, weights, k, (3,), 0
+        )
+        for bad in (True, False, 1.0, "1", None, [1], 1 + 0j):
+            te(lambda b=bad: weighted_sample_excluding_resume(
+                items, weights, k, (3,), state, b))
+        ve(lambda: weighted_sample_excluding_resume(
+            items, weights, k, (3,), state, -1))
+        import copy as _copy
+        for mutator in (
+            lambda s: s.pop("version"),
+            lambda s: s.pop("excluded"),
+            lambda s: s.update(extra=1),
+            lambda s: s.update(digest="0" * 64),
+        ):
+            bad = _copy.deepcopy(state)
+            mutator(bad)
+            ve(lambda b=bad: weighted_sample_excluding_resume(
+                items, weights, k, (3,), b, 1))
+        bad = dict(state)
+        bad["version"] = 99
+        ve(lambda: weighted_sample_excluding_resume(
+            items, weights, k, (3,), bad, 1))
+        ve(lambda: weighted_sample_excluding_resume(
+            list("abce"), weights, k, (3,), state, 1))
+        ve(lambda: weighted_sample_excluding_resume(
+            items, weights, k, (0,), state, 1))
+
+    def test_does_not_mutate_inputs_or_state(self):
+        items, weights = list("abcd"), [1, 3, 2, 0]
+        excluded = [3, 1]
+        items_snap, weights_snap = list(items), list(weights)
+        state = weighted_sample_excluding_checkpoint(
+            items, weights, 2, excluded, 42, start=2
+        )
+        import copy
+        state_snap = copy.deepcopy(state)
+        weighted_sample_excluding_resume(items, weights, 2, excluded, state, 4)
+        self.assertEqual(items, items_snap)
+        self.assertEqual(weights, weights_snap)
+        self.assertEqual(excluded, [3, 1])
         self.assertEqual(state, state_snap)
 
 
