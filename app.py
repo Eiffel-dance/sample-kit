@@ -77,6 +77,30 @@
         与 weighted_sample_stream_excluding_indices 同规则(同一套
         创建时校验与 start 窗口语义), 但每轮按相同索引产出元素值列表,
         与 weighted_sample_many_excluding 逐轮对应。
+    weighted_sample_counts(items, weights, k, draws, seed=0, start=0)
+        weighted_sample_many_indices 的批量频次入口: 接受与其完全相同
+        的 items、weights、k、draws、seed、start(同一套校验、校验顺序、
+        异常类别与 start 窗口语义, 同一条随机流), 返回长度等于 items 的
+        整数列表 counts, counts[i] 是区间 [start, start+draws) 中原始
+        零基位置 i 被选中的总次数; 结果等于遍历
+        weighted_sample_many_indices 对应窗口的全部轮次逐项累加, 调用方
+        无需自行物化轮次。重复元素值仍按不同位置分别计数; 第一轮、后续
+        轮次、相同种子与 k=0 时的随机流消耗都与该索引入口逐项对齐。
+        draws=0 或 k=0 返回全零列表且仍完成既有完整校验; 正权重不足在
+        返回列表前抛 ValueError, 任何失败都不返回部分计数。计数为任意
+        精度整数, 可直接交给 serialize_metrics, 经 serialize_metrics /
+        deserialize_metrics 往返后仍是相同的整数列表(不转为浮点或科学
+        计数文本)。
+    weighted_sample_excluding_counts(items, weights, k, excluded, draws,
+        seed=0, start=0)
+        与 weighted_sample_counts 同规则, 但与
+        weighted_sample_many_excluding_indices 共享 excluded 的集合语义
+        与固定校验顺序(items/weights/k/seed → excluded → draws →
+        start, 随后完成未排除位置正权重可行性检查): 被排除位置的计数
+        始终为零, 其余位置按每轮重新开始的未排除位置池累计; excluded
+        为空时与 weighted_sample_counts 逐位一致。结果等于遍历
+        weighted_sample_many_excluding_indices 对应窗口的全部轮次逐项
+        累加。不修改入参与 excluded。
     weighted_sample_checkpoint(items, weights, k, seed=0, start=0)
         创建可暂停/恢复的采样会话断点: 接受与批量入口相同的输入及 start,
         在完成与批量入口一致的全部校验(含正权重可行性)后, 把随机流推进到
@@ -852,6 +876,78 @@ def weighted_sample_stream_excluding(
         items, weights, k, excluded, draws, seed, start
     )
     return ([items[i] for i in round_indices] for round_indices in index_stream)
+
+
+def weighted_sample_counts(items, weights, k, draws, seed=0, start=0):
+    """weighted_sample_many_indices 的批量频次入口: 按原始零基位置统计
+    窗口 [start, start+draws) 内各位置被选中的总次数。
+
+    接受与 weighted_sample_many_indices 完全相同的 items、weights、k、
+    draws、seed、start: 同一套参数与正权重可行性校验、相同的校验顺序与
+    唯一 TypeError / ValueError 结果、同一条由 seed 初始化的随机流以及
+    相同的 start 跳过语义。返回长度等于 items 的整数 list counts,
+    counts[i] 是区间 [start, start+draws) 内各轮中位置 i 被选中的次数;
+    items 中重复的元素值仍视为不同位置, 分别计数。计数结果与遍历
+    weighted_sample_many_indices(items, weights, k, draws, seed, start)
+    的全部轮次、按每轮抽到的原始位置逐项累加所得完全一致 —— 第一轮、
+    后续轮次、相同种子以及 k=0 时的随机流消耗都与该索引入口逐项对齐,
+    调用方无需自行物化并反复遍历全部轮次。start 跳过的轮次只推进随机
+    流, 不参与计数。draws=0 或 k=0 返回全零列表, 且仍完成既有完整校验;
+    正权重不足必须在返回列表前抛 ValueError, 任何失败都不返回部分计数。
+    计数使用任意精度整数, 结果可直接交给 serialize_metrics, 经
+    serialize_metrics 与 deserialize_metrics 往返后仍是相同的整数列表,
+    大计数不会被转成浮点或科学计数文本。不修改入参。
+    """
+    # 直接复用批量索引入口: 校验顺序、异常类别、可行性检查、随机流消耗与
+    # start 窗口因此与该入口严格一致; 这里只做按原始位置的累加, 不再触碰
+    # 任何输入序列。
+    rounds = weighted_sample_many_indices(
+        items, weights, k, draws, seed, start
+    )
+    counts = [0] * len(items)
+    for round_indices in rounds:
+        for position in round_indices:
+            counts[position] += 1
+    return counts
+
+
+def weighted_sample_excluding_counts(
+    items, weights, k, excluded, draws, seed=0, start=0
+):
+    """weighted_sample_many_excluding_indices 的批量频次入口: 按原始
+    零基位置统计窗口 [start, start+draws) 内各位置被选中的总次数。
+
+    接受与 weighted_sample_many_excluding_indices 完全相同的 items、
+    weights、k、excluded、draws、seed、start: excluded 按同一集合语义
+    解释(重复成员与排列顺序不影响结果), 固定校验顺序
+    items/weights/k/seed → excluded → draws → start, 随后在输出任何计数
+    前完成未排除位置的正权重可行性检查, 全部错误沿用唯一 TypeError /
+    ValueError 结果。返回长度等于 items 的整数 list counts: 被排除位置
+    的计数始终为零(即使其权重为正), 其余位置按"每轮重新开始的未排除
+    位置池、轮内无放回"累计, items 中重复的元素值仍视为不同位置分别
+    计数。计数结果与遍历
+    weighted_sample_many_excluding_indices(items, weights, k, excluded,
+    draws, seed, start) 的全部轮次、按每轮抽到的原始位置逐项累加所得
+    完全一致 —— 第一轮、后续轮次、相同种子以及 k=0 时的随机流消耗都与
+    该索引入口逐项对齐, excluded 为空时与 weighted_sample_counts 逐位
+    一致。start 跳过的轮次只推进随机流, 不参与计数。draws=0 或 k=0
+    返回全零列表, 且仍完成既有完整校验; 正权重不足必须在返回列表前抛
+    ValueError, 任何失败都不返回部分计数。计数使用任意精度整数, 结果
+    可直接交给 serialize_metrics, 经 serialize_metrics 与
+    deserialize_metrics 往返后仍是相同的整数列表, 大计数不会被转成
+    浮点或科学计数文本。不修改入参, 也不修改 excluded。
+    """
+    # 直接复用批量排除索引入口: excluded 集合语义、校验顺序、异常类别、
+    # 可行性检查、随机流消耗与 start 窗口因此与该入口严格一致; 被排除位置
+    # 从不出现在任何轮次中, 其计数自然恒为零。
+    rounds = weighted_sample_many_excluding_indices(
+        items, weights, k, excluded, draws, seed, start
+    )
+    counts = [0] * len(items)
+    for round_indices in rounds:
+        for position in round_indices:
+            counts[position] += 1
+    return counts
 
 
 # ---------------------------------------------------------------------------
