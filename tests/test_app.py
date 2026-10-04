@@ -14,6 +14,9 @@ from app import (
     weighted_sample_many_indices,
     weighted_sample_schedule,
     weighted_sample_schedule_indices,
+    weighted_sample_schedule_checkpoint,
+    weighted_sample_schedule_resume_indices,
+    weighted_sample_schedule_resume,
     weighted_sample_stream,
     weighted_sample_stream_indices,
     weighted_sample_many_excluding,
@@ -5734,6 +5737,445 @@ class WeightedSampleScheduleTest(unittest.TestCase):
             serialize_metrics({"n": 10 ** 100}),
             '{"n":1' + "0" * 100 + "}",
         )
+
+
+class WeightedSampleScheduleCheckpointTest(unittest.TestCase):
+    """按轮权重计划的可暂停 / 恢复会话:
+    weighted_sample_schedule_checkpoint /
+    weighted_sample_schedule_resume_indices /
+    weighted_sample_schedule_resume。"""
+
+    ITEMS = list("abcde")
+    SCHEDULE = [
+        [1, 2, 3, 0, 5],
+        [Fraction(1, 3), 0, 2, 7, 1],
+        [0.5, 1.5, 0, 2.0, 1.0],
+        [10 ** 80, 1, 0, 2, 3],
+        [Decimal("0.1"), Decimal("0.2"), 0, Decimal("1E-100"), 1],
+        [3, 1, 4, 1, 5],
+        [2, 2, 2, 2, 2],
+    ]
+    K = 3
+    SEED = 42
+
+    def _full(self):
+        return weighted_sample_schedule_indices(
+            self.ITEMS, self.SCHEDULE, self.K, len(self.SCHEDULE), self.SEED)
+
+    def test_checkpoint_state_is_json_native(self):
+        state = weighted_sample_schedule_checkpoint(
+            self.ITEMS, self.SCHEDULE, self.K, self.SEED, start=2)
+        # 版本 / kind / 位置 / 计划长度 / 指纹 / seed / RNG / 摘要齐备。
+        self.assertEqual(state["version"], 1)
+        self.assertEqual(state["kind"], "schedule")
+        self.assertEqual(state["position"], 2)
+        self.assertEqual(state["k"], self.K)
+        self.assertEqual(state["n"], len(self.ITEMS))
+        self.assertEqual(state["schedule_length"], len(self.SCHEDULE))
+        self.assertTrue(json.loads(json.dumps(state)) == state)
+
+    def test_resume_window_equals_one_shot_slice(self):
+        full = self._full()
+        for start in range(len(self.SCHEDULE) + 1):
+            state = weighted_sample_schedule_checkpoint(
+                self.ITEMS, self.SCHEDULE, self.K, self.SEED, start=start)
+            for draws in range(0, len(self.SCHEDULE) - start + 1):
+                with self.subTest(start=start, draws=draws):
+                    rounds, next_state = (
+                        weighted_sample_schedule_resume_indices(
+                            self.ITEMS, self.SCHEDULE, self.K, state, draws)
+                    )
+                    self.assertEqual(rounds, full[start:start + draws])
+                    self.assertEqual(next_state["position"], start + draws)
+
+    def test_chained_resumes_equal_one_shot_run(self):
+        full = self._full()
+        state = weighted_sample_schedule_checkpoint(
+            self.ITEMS, self.SCHEDULE, self.K, self.SEED)
+        chunks = []
+        for draws in (1, 2, 1, 3, 0, 0):
+            rounds, state = weighted_sample_schedule_resume_indices(
+                self.ITEMS, self.SCHEDULE, self.K, state, draws)
+            chunks.extend(rounds)
+        self.assertEqual(chunks, full)
+        # 链式结束时位置恰为计划末尾。
+        self.assertEqual(state["position"], len(self.SCHEDULE))
+
+    def test_first_round_matches_single_and_schedule_entry(self):
+        state = weighted_sample_schedule_checkpoint(
+            self.ITEMS, self.SCHEDULE, self.K, self.SEED)
+        rounds, _ = weighted_sample_schedule_resume_indices(
+            self.ITEMS, self.SCHEDULE, self.K, state, 1)
+        self.assertEqual(
+            rounds,
+            weighted_sample_schedule_indices(
+                self.ITEMS, self.SCHEDULE, self.K, 1, self.SEED),
+        )
+        self.assertEqual(
+            rounds[0],
+            weighted_sample_indices(
+                self.ITEMS, self.SCHEDULE[0], self.K, self.SEED),
+        )
+
+    def test_uniform_rows_match_fixed_weight_resume(self):
+        # 各行权重完全相同时, 计划恢复与固定权重批量入口逐轮一致。
+        weights = [1, 2, 3, 0, 5]
+        schedule = [list(weights) for _ in range(6)]
+        full = weighted_sample_schedule_indices(
+            self.ITEMS, schedule, 3, 6, seed=99)
+        self.assertEqual(
+            full,
+            weighted_sample_many_indices(self.ITEMS, weights, 3, 6, seed=99),
+        )
+        state = weighted_sample_schedule_checkpoint(
+            self.ITEMS, schedule, 3, seed=99, start=2)
+        rounds, _ = weighted_sample_schedule_resume_indices(
+            self.ITEMS, schedule, 3, state, 4)
+        self.assertEqual(rounds, full[2:])
+
+    def test_draws_zero_returns_empty_and_unchanged_state_copy(self):
+        state = weighted_sample_schedule_checkpoint(
+            self.ITEMS, self.SCHEDULE, self.K, self.SEED, start=3)
+        rounds, next_state = weighted_sample_schedule_resume_indices(
+            self.ITEMS, self.SCHEDULE, self.K, state, 0)
+        self.assertEqual(rounds, [])
+        self.assertEqual(next_state, state)
+        self.assertIsNot(next_state, state)
+
+    def test_k_zero_only_advances_position_without_rng(self):
+        items = ["a", "b"]
+        schedule = [[1, 2], [3, 4], [5, 6]]
+        import random as _random
+        fresh = app._rng_state_to_jsonable(_random.Random(7).getstate())
+        state = weighted_sample_schedule_checkpoint(
+            items, schedule, 0, seed=7, start=1)
+        self.assertEqual(state["rng"], fresh)
+        rounds, next_state = weighted_sample_schedule_resume_indices(
+            items, schedule, 0, state, 2)
+        self.assertEqual(rounds, [[], []])
+        self.assertEqual(next_state["position"], 3)
+        # 随机流未被消耗。
+        self.assertEqual(next_state["rng"], state["rng"])
+
+    def test_checkpoint_at_end_of_schedule(self):
+        # start == 计划长度允许, 表示整批已完成; 只能再以 draws=0 恢复。
+        end = weighted_sample_schedule_checkpoint(
+            self.ITEMS, self.SCHEDULE, self.K, self.SEED,
+            start=len(self.SCHEDULE))
+        self.assertEqual(end["position"], len(self.SCHEDULE))
+        rounds, same = weighted_sample_schedule_resume_indices(
+            self.ITEMS, self.SCHEDULE, self.K, end, 0)
+        self.assertEqual(rounds, [])
+        self.assertEqual(same, end)
+        with self.assertRaises(ValueError):
+            weighted_sample_schedule_resume_indices(
+                self.ITEMS, self.SCHEDULE, self.K, end, 1)
+
+    def test_value_resume_maps_positions_and_shares_next_state(self):
+        items = ["x", "y", "x", "z", "y"]
+        state = weighted_sample_schedule_checkpoint(
+            items, self.SCHEDULE, self.K, self.SEED, start=1)
+        value_rounds, value_next = weighted_sample_schedule_resume(
+            items, self.SCHEDULE, self.K, state, 4)
+        index_rounds, index_next = weighted_sample_schedule_resume_indices(
+            items, self.SCHEDULE, self.K, state, 4)
+        self.assertEqual(
+            value_rounds,
+            [[items[i] for i in rd] for rd in index_rounds],
+        )
+        # 下一状态逐字段一致, 可互换续接。
+        self.assertEqual(value_next, index_next)
+        full = weighted_sample_schedule(
+            items, self.SCHEDULE, self.K, len(self.SCHEDULE), self.SEED)
+        self.assertEqual(value_rounds, full[1:5])
+
+    def test_state_roundtrips_serialize_metrics(self):
+        state = weighted_sample_schedule_checkpoint(
+            self.ITEMS, self.SCHEDULE, self.K, self.SEED, start=2)
+        restored = deserialize_metrics(serialize_metrics(state))
+        full = self._full()
+        rounds, next_state = weighted_sample_schedule_resume_indices(
+            self.ITEMS, self.SCHEDULE, self.K, restored, 3)
+        self.assertEqual(rounds, full[2:5])
+        # 下一状态再做一次文本往返后仍可续接。
+        again, _ = weighted_sample_schedule_resume_indices(
+            self.ITEMS, self.SCHEDULE, self.K,
+            deserialize_metrics(serialize_metrics(next_state)), 2)
+        self.assertEqual(again, full[5:7])
+
+    def test_rng_words_keep_exact_decimal_integers(self):
+        big = [[10 ** 5000, 1, 2], [1, 1, 1]]
+        state = weighted_sample_schedule_checkpoint(
+            self.ITEMS[:3], big, 2, seed=8, start=1)
+        restored = deserialize_metrics(serialize_metrics(state))
+        self.assertTrue(all(isinstance(x, int) for x in restored["rng"]["mt"]))
+        rounds, _ = weighted_sample_schedule_resume_indices(
+            self.ITEMS[:3], big, 2, restored, 1)
+        self.assertEqual(
+            rounds,
+            weighted_sample_schedule_indices(
+                self.ITEMS[:3], big, 2, 2, seed=8)[1:],
+        )
+
+    # ------------------------------------------------------------------
+    # 创建入口: 沿用 schedule 的全部校验
+    # ------------------------------------------------------------------
+    def test_checkpoint_validation_matches_schedule_entry(self):
+        te = lambda fn: self.assertRaises(TypeError, fn)
+        ve = lambda fn: self.assertRaises(ValueError, fn)
+        items, schedule, k = self.ITEMS, self.SCHEDULE, self.K
+        te(lambda: weighted_sample_schedule_checkpoint("abcde", schedule, k, 0))
+        te(lambda: weighted_sample_schedule_checkpoint(
+            items, iter([list(r) for r in schedule]), k, 0))
+        te(lambda: weighted_sample_schedule_checkpoint(
+            items, [list(r) for r in schedule] + ["abcde"], k, 0))
+        te(lambda: weighted_sample_schedule_checkpoint(
+            items, [list(r) for r in schedule] + [iter([1, 2, 3, 4, 5])], k, 0))
+        te(lambda: weighted_sample_schedule_checkpoint(items, schedule, True, 0))
+        te(lambda: weighted_sample_schedule_checkpoint(items, schedule, 1.0, 0))
+        te(lambda: weighted_sample_schedule_checkpoint(
+            items, schedule, k, object()))
+        te(lambda: weighted_sample_schedule_checkpoint(items, schedule, k, 0, True))
+        te(lambda: weighted_sample_schedule_checkpoint(items, schedule, k, 0, 1.0))
+        ve(lambda: weighted_sample_schedule_checkpoint(items, schedule, -1, 0))
+        ve(lambda: weighted_sample_schedule_checkpoint(items, schedule, 6, 0))
+        ve(lambda: weighted_sample_schedule_checkpoint(
+            items, [[1, 2, 3, 4]], k, 0))
+        ve(lambda: weighted_sample_schedule_checkpoint(
+            items, schedule, k, 0, len(schedule) + 1))
+        te(lambda: weighted_sample_schedule_checkpoint(
+            items, [[1, True, 3, 0, 5]], k, 0))
+        te(lambda: weighted_sample_schedule_checkpoint(
+            items, [[1, "x", 3, 0, 5]], k, 0))
+        ve(lambda: weighted_sample_schedule_checkpoint(
+            items, [[1, -2, 3, 0, 5]], k, 0))
+        ve(lambda: weighted_sample_schedule_checkpoint(
+            items, [[1, float("nan"), 3, 0, 5]], k, 0))
+        ve(lambda: weighted_sample_schedule_checkpoint(
+            items, [[1, float("inf"), 3, 0, 5]], k, 0))
+        ve(lambda: weighted_sample_schedule_checkpoint(
+            items, [[Decimal("NaN"), 1, 1, 1, 1]], k, 0))
+        ve(lambda: weighted_sample_schedule_checkpoint(
+            items, [[0, 0, 0, 0, 0]], 1, 0))
+        ve(lambda: weighted_sample_schedule_checkpoint(
+            items, [[1, 0, 0, 0, 0], [0, 0, 0, 0, 0]], 1, 0))
+        # k=0 时全零行合法。
+        zero_state = weighted_sample_schedule_checkpoint(
+            items, [[0, 0, 0, 0, 0], [0, 0, 0, 0, 0]], 0, seed=1)
+        self.assertEqual(zero_state["position"], 0)
+
+    def test_checkpoint_does_not_mutate_inputs(self):
+        items = list(self.ITEMS)
+        schedule = [list(r) for r in self.SCHEDULE]
+        items_snap = list(items)
+        schedule_snap = [list(r) for r in schedule]
+        weighted_sample_schedule_checkpoint(
+            items, schedule, self.K, self.SEED, start=4)
+        self.assertEqual(items, items_snap)
+        self.assertEqual(schedule, schedule_snap)
+
+    # ------------------------------------------------------------------
+    # 恢复: 状态类型 / 结构 / 摘要 / 输入绑定
+    # ------------------------------------------------------------------
+    def test_non_mapping_state_raises_type_error(self):
+        for bad in (None, [], "{}", 1, True, (), {1, 2}):
+            with self.subTest(bad=bad):
+                with self.assertRaises(TypeError):
+                    weighted_sample_schedule_resume_indices(
+                        self.ITEMS, self.SCHEDULE, self.K, bad, 1)
+
+    def test_draws_type_and_value_rules(self):
+        state = weighted_sample_schedule_checkpoint(
+            self.ITEMS, self.SCHEDULE, self.K, self.SEED)
+        for bad in (True, False, 1.0, "1", None, [1], 1 + 0j):
+            with self.subTest(bad=bad):
+                with self.assertRaises(TypeError):
+                    weighted_sample_schedule_resume_indices(
+                        self.ITEMS, self.SCHEDULE, self.K, state, bad)
+        with self.assertRaises(ValueError):
+            weighted_sample_schedule_resume_indices(
+                self.ITEMS, self.SCHEDULE, self.K, state, -1)
+
+    def test_resume_window_out_of_range_raises_value_error(self):
+        state = weighted_sample_schedule_checkpoint(
+            self.ITEMS, self.SCHEDULE, self.K, self.SEED, start=5)
+        with self.assertRaises(ValueError):
+            weighted_sample_schedule_resume_indices(
+                self.ITEMS, self.SCHEDULE, self.K, state, 3)
+
+    def test_invalid_state_structure_raises_value_error(self):
+        import copy as _copy
+        state = weighted_sample_schedule_checkpoint(
+            self.ITEMS, self.SCHEDULE, self.K, self.SEED, start=1)
+
+        def ve(mutator):
+            bad = _copy.deepcopy(state)
+            mutator(bad)
+            with self.assertRaises(ValueError):
+                weighted_sample_schedule_resume_indices(
+                    self.ITEMS, self.SCHEDULE, self.K, bad, 1)
+
+        ve(lambda s: s.pop("version"))
+        ve(lambda s: s.pop("kind"))
+        ve(lambda s: s.pop("rng"))
+        ve(lambda s: s.update(extra=1))
+        ve(lambda s: s.update(position=-1))
+        ve(lambda s: s.update(position=True))
+        ve(lambda s: s.update(k=True))
+        ve(lambda s: s.update(n=-1))
+        ve(lambda s: s.update(schedule_length=-1))
+        ve(lambda s: s.update(kind="fixed"))
+        ve(lambda s: s.update(items_digest=1))
+        ve(lambda s: s.update(seed=["z", 1]))
+        ve(lambda s: s.update(rng={"v": 3}))
+        ve(lambda s: s.update(digest=1))
+
+    def test_unsupported_version_raises_value_error(self):
+        state = weighted_sample_schedule_checkpoint(
+            self.ITEMS, self.SCHEDULE, self.K, self.SEED)
+        for bad_version in (0, 2, 99, True, "1", 1.0):
+            bad = dict(state)
+            bad["version"] = bad_version
+            with self.subTest(bad_version=bad_version):
+                with self.assertRaises(ValueError):
+                    weighted_sample_schedule_resume_indices(
+                        self.ITEMS, self.SCHEDULE, self.K, bad, 1)
+
+    def test_state_mismatch_with_inputs_raises_value_error(self):
+        state = weighted_sample_schedule_checkpoint(
+            self.ITEMS, self.SCHEDULE, self.K, self.SEED, start=1)
+
+        def ve(label, i2, s2, k2):
+            with self.subTest(label=label):
+                with self.assertRaises(ValueError):
+                    weighted_sample_schedule_resume_indices(i2, s2, k2, state, 1)
+
+        ve("k differs", self.ITEMS, self.SCHEDULE, 2)
+        ve("items differ", list("abcdf"), self.SCHEDULE, self.K)
+        ve("a row differs", self.ITEMS,
+           [list(r) for r in self.SCHEDULE[:-1]] + [[9, 9, 9, 9, 9]], self.K)
+        # 同值不同类型(1 -> 1.0)可能改变抽样计划, 必须视为不匹配。
+        swapped = [list(r) for r in self.SCHEDULE]
+        swapped[0][0] = 1.0
+        ve("weight type swap", self.ITEMS, swapped, self.K)
+        # 调换两行改变第 j 轮使用的权重。
+        reordered = [list(r) for r in self.SCHEDULE]
+        reordered[0], reordered[1] = reordered[1], reordered[0]
+        ve("row order", self.ITEMS, reordered, self.K)
+        # 追加一行改变计划长度。
+        ve("extra row", self.ITEMS,
+           [list(r) for r in self.SCHEDULE] + [[1, 1, 1, 1, 1]], self.K)
+        # 少一行同样不匹配。
+        ve("missing row", self.ITEMS, self.SCHEDULE[:-1], self.K)
+
+    def test_tampered_fields_without_valid_digest_raise_value_error(self):
+        import copy as _copy
+        state = weighted_sample_schedule_checkpoint(
+            self.ITEMS, self.SCHEDULE, self.K, self.SEED, start=1)
+
+        def ve(mutator):
+            bad = _copy.deepcopy(state)
+            mutator(bad)
+            with self.assertRaises(ValueError):
+                weighted_sample_schedule_resume_indices(
+                    self.ITEMS, self.SCHEDULE, self.K, bad, 1)
+
+        ve(lambda s: s.update(position=s["position"] + 1))
+        ve(lambda s: s.update(schedule_length=s["schedule_length"] + 1))
+        ve(lambda s: s["rng"]["mt"].__setitem__(0, s["rng"]["mt"][0] ^ 1))
+        ve(lambda s: s.update(digest="0" * 64))
+        ve(lambda s: s.update(seed=["i", 123]))
+
+    def test_out_of_range_rng_state_raises_value_error_even_with_digest(self):
+        # 即使重算了绑定摘要, 越界 MT 状态字/索引也必须统一抛 ValueError。
+        import copy as _copy
+        from app import _schedule_checkpoint_binding_digest
+        state = weighted_sample_schedule_checkpoint(
+            self.ITEMS, self.SCHEDULE, self.K, self.SEED)
+        for pos, value in (
+            (0, 10 ** 40), (1, -5), (623, 1 << 32), (624, 625), (624, -1),
+        ):
+            bad = _copy.deepcopy(state)
+            bad["rng"]["mt"][pos] = value
+            bad["digest"] = _schedule_checkpoint_binding_digest(
+                bad["seed"], bad["position"], bad["k"], bad["n"],
+                bad["schedule_length"], bad["items_digest"],
+                bad["schedule_digest"], bad["rng"],
+            )
+            with self.subTest(pos=pos, value=value):
+                with self.assertRaises(ValueError):
+                    weighted_sample_schedule_resume_indices(
+                        self.ITEMS, self.SCHEDULE, self.K, bad, 1)
+
+    def test_other_kinds_of_checkpoint_state_rejected(self):
+        # 固定权重 / 排除会话的状态不能用于按轮计划恢复, 反之亦然。
+        schedule_state = weighted_sample_schedule_checkpoint(
+            self.ITEMS, self.SCHEDULE, self.K, self.SEED, start=1)
+        fixed_state = weighted_sample_checkpoint(
+            self.ITEMS, self.SCHEDULE[0], self.K, self.SEED, start=1)
+        excluding_state = weighted_sample_excluding_checkpoint(
+            self.ITEMS, self.SCHEDULE[0], self.K, (), self.SEED, start=1)
+        with self.assertRaises(ValueError):
+            weighted_sample_schedule_resume_indices(
+                self.ITEMS, self.SCHEDULE, self.K, fixed_state, 1)
+        with self.assertRaises(ValueError):
+            weighted_sample_schedule_resume_indices(
+                self.ITEMS, self.SCHEDULE, self.K, excluding_state, 1)
+        with self.assertRaises(ValueError):
+            weighted_sample_resume_indices(
+                self.ITEMS, self.SCHEDULE[0], self.K, schedule_state, 1)
+        with self.assertRaises(ValueError):
+            weighted_sample_excluding_resume_indices(
+                self.ITEMS, self.SCHEDULE[0], self.K, (), schedule_state, 1)
+
+    def test_value_entry_validates_inputs_before_mapping(self):
+        # 值入口先按 schedule 入口校验 items/schedule/k, 再要求 state 是
+        # 映射并校验 draws —— 损坏的状态不能掩盖非法输入。
+        with self.assertRaises(TypeError):
+            weighted_sample_schedule_resume(
+                "abcde", self.SCHEDULE, self.K, "not-a-mapping", 1)
+        with self.assertRaises(ValueError):
+            weighted_sample_schedule_resume(
+                self.ITEMS, [[0, 0, 0, 0, 0]], 1, "not-a-mapping", 1)
+        state = weighted_sample_schedule_checkpoint(
+            self.ITEMS, self.SCHEDULE, self.K, self.SEED)
+        with self.assertRaises(TypeError):
+            weighted_sample_schedule_resume(
+                self.ITEMS, self.SCHEDULE, self.K, [], 1)
+        with self.assertRaises(TypeError):
+            weighted_sample_schedule_resume(
+                self.ITEMS, self.SCHEDULE, self.K, state, True)
+
+    def test_no_rounds_partially_returned_on_failure(self):
+        # 恢复窗口越界时即使能抽出前面的轮次, 也不返回部分结果。
+        state = weighted_sample_schedule_checkpoint(
+            self.ITEMS, self.SCHEDULE, self.K, self.SEED, start=5)
+        with self.assertRaises(ValueError):
+            weighted_sample_schedule_resume_indices(
+                self.ITEMS, self.SCHEDULE, self.K, state, 3)
+
+    def test_float_str_and_none_seeds_resume_consistently(self):
+        for seed in (1.5, "hello", -0.0, float("nan")):
+            state = weighted_sample_schedule_checkpoint(
+                self.ITEMS, self.SCHEDULE, 1, seed, start=1)
+            rounds, _ = weighted_sample_schedule_resume_indices(
+                self.ITEMS, self.SCHEDULE, 1, state, 2)
+            self.assertEqual(
+                rounds,
+                weighted_sample_schedule_indices(
+                    self.ITEMS, self.SCHEDULE, 1, 3, seed)[1:],
+            )
+        # None 种子来自系统熵: 同一份快照无论恢复多少次都给出同一序列。
+        none_state = weighted_sample_schedule_checkpoint(
+            self.ITEMS, self.SCHEDULE, 1, None, start=1)
+        payload = json.loads(json.dumps(none_state))
+        a, _ = weighted_sample_schedule_resume_indices(
+            self.ITEMS, self.SCHEDULE, 1, payload, 2)
+        b, _ = weighted_sample_schedule_resume_indices(
+            self.ITEMS, self.SCHEDULE, 1,
+            json.loads(json.dumps(none_state)), 2)
+        self.assertEqual(a, b)
+        self.assertEqual(len(a), 2)
 
 
 if __name__ == "__main__":

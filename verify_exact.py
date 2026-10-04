@@ -18,6 +18,7 @@
 import math
 import random
 import sys
+from decimal import Decimal
 from fractions import Fraction
 
 import app
@@ -681,6 +682,167 @@ list(app.weighted_sample_stream_excluding(ex_items, ex_weights, 2, excluded, 4, 
 check((ex_items, ex_weights, list(excluded)) ==
       (ex_snap[0], ex_snap[1], list(ex_snap[2])),
       "排除批量/流式入口不修改 items / weights / excluded")
+
+
+# ---------------------------------------------------------------------------
+# 13. 按轮权重计划的可暂停 / 恢复会话
+# ---------------------------------------------------------------------------
+section("按轮权重计划 checkpoint / resume")
+
+sc_items = list("abcde")
+sc_schedule = [
+    [1, 2, 3, 0, 5],
+    [Fraction(1, 3), 0, 2, 7, 1],
+    [0.5, 1.5, 0, 2.0, 1.0],
+    [HUGE, 1, 0, 2, 3],
+    [_Decimal("0.1"), _Decimal("0.2"), 0, _Decimal("1E-100"), 1],
+    [3, 1, 4, 1, 5],
+]
+sc_k, sc_seed = 3, 42
+sc_full = app.weighted_sample_schedule_indices(
+    sc_items, sc_schedule, sc_k, len(sc_schedule), sc_seed)
+
+# 13.1 恢复窗口逐轮等于一次性批量入口的零基切片; 连续恢复与一次性一致。
+slice_ok = True
+for start in range(len(sc_schedule) + 1):
+    state = app.weighted_sample_schedule_checkpoint(
+        sc_items, sc_schedule, sc_k, sc_seed, start=start)
+    for draws in range(0, len(sc_schedule) - start + 1):
+        rounds, next_state = app.weighted_sample_schedule_resume_indices(
+            sc_items, sc_schedule, sc_k, state, draws)
+        if rounds != sc_full[start:start + draws]:
+            slice_ok = False
+        if next_state["position"] != start + draws:
+            slice_ok = False
+state = app.weighted_sample_schedule_checkpoint(
+    sc_items, sc_schedule, sc_k, sc_seed)
+chained = []
+for d in (2, 1, 0, 3):
+    rounds, state = app.weighted_sample_schedule_resume_indices(
+        sc_items, sc_schedule, sc_k, state, d)
+    chained.extend(rounds)
+if chained != sc_full:
+    slice_ok = False
+check(slice_ok, "schedule 恢复窗口等于一次性批量入口切片, 连续恢复一致")
+
+# 13.2 值入口按位置映射, 相同值的不同位置仍按位置区分; 下一状态逐字段一致。
+dup_items = ["x", "y", "x", "z", "y"]
+dup_state = app.weighted_sample_schedule_checkpoint(
+    dup_items, sc_schedule, sc_k, sc_seed, start=1)
+v_rounds, v_next = app.weighted_sample_schedule_resume(
+    dup_items, sc_schedule, sc_k, dup_state, 4)
+i_rounds, i_next = app.weighted_sample_schedule_resume_indices(
+    dup_items, sc_schedule, sc_k, dup_state, 4)
+values_ok = (
+    v_rounds == [[dup_items[i] for i in rd] for rd in i_rounds]
+    and v_next == i_next
+    and v_rounds == app.weighted_sample_schedule(
+        dup_items, sc_schedule, sc_k, len(sc_schedule), sc_seed)[1:5]
+)
+check(values_ok, "schedule 值恢复按位置映射元素, 下一状态与索引入口一致")
+
+# 13.3 draws=0 返回空轮次与不变状态副本; k=0 只推进位置不耗随机流。
+zero_state = app.weighted_sample_schedule_checkpoint(
+    sc_items, sc_schedule, sc_k, sc_seed, start=2)
+zero_rounds, zero_next = app.weighted_sample_schedule_resume_indices(
+    sc_items, sc_schedule, sc_k, zero_state, 0)
+k0_schedule = [[1, 2], [3, 4], [5, 6]]
+k0_state = app.weighted_sample_schedule_checkpoint(
+    ["a", "b"], k0_schedule, 0, seed=7, start=1)
+k0_fresh = app._rng_state_to_jsonable(random.Random(7).getstate())
+k0_rounds, k0_next = app.weighted_sample_schedule_resume_indices(
+    ["a", "b"], k0_schedule, 0, k0_state, 2)
+zero_ok = (
+    zero_rounds == [] and zero_next == zero_state
+    and zero_next is not zero_state
+    and k0_rounds == [[], []] and k0_next["position"] == 3
+    and k0_state["rng"] == k0_fresh and k0_next["rng"] == k0_fresh
+)
+check(zero_ok, "draws=0 返回空轮次与不变状态; k=0 只推进位置不耗随机流")
+
+# 13.4 状态经 serialize/deserialize 往返后仍可恢复, 超大整数精确十进制。
+rt_ok = True
+state = app.weighted_sample_schedule_checkpoint(
+    sc_items, sc_schedule, sc_k, sc_seed, start=2)
+rounds, next_state = app.weighted_sample_schedule_resume_indices(
+    sc_items, sc_schedule, sc_k, dm(sm(state)), 3)
+if rounds != sc_full[2:5]:
+    rt_ok = False
+more, _ = app.weighted_sample_schedule_resume_indices(
+    sc_items, sc_schedule, sc_k, dm(sm(next_state)), 1)
+if more != sc_full[5:6]:
+    rt_ok = False
+big_schedule = [[10 ** 5000, 1, 2], [1, 1, 1]]
+big_state = app.weighted_sample_schedule_checkpoint(
+    sc_items[:3], big_schedule, 2, seed=8, start=1)
+big_restored = dm(sm(big_state))
+if not all(isinstance(x, int) for x in big_restored["rng"]["mt"]):
+    rt_ok = False
+big_rounds, _ = app.weighted_sample_schedule_resume_indices(
+    sc_items[:3], big_schedule, 2, big_restored, 1)
+if big_rounds != app.weighted_sample_schedule_indices(
+        sc_items[:3], big_schedule, 2, 2, seed=8)[1:]:
+    rt_ok = False
+check(rt_ok, "schedule 状态经 serialize/deserialize 往返后可恢复且整数精确")
+
+# 13.5 非法输入与损坏状态按既有 TypeError / ValueError 分类, 不出部分结果。
+raises(TypeError, lambda: app.weighted_sample_schedule_checkpoint(
+    "abcde", sc_schedule, sc_k, 0),
+    "schedule checkpoint: items 为文本 -> TypeError")
+raises(TypeError, lambda: app.weighted_sample_schedule_checkpoint(
+    sc_items, [list(r) for r in sc_schedule] + ["abcde"], sc_k, 0),
+    "schedule checkpoint: 行是文本 -> TypeError")
+raises(TypeError, lambda: app.weighted_sample_schedule_checkpoint(
+    sc_items, sc_schedule, True, 0),
+    "schedule checkpoint: k 为布尔 -> TypeError")
+raises(ValueError, lambda: app.weighted_sample_schedule_checkpoint(
+    sc_items, [[1, 2, 3, 4]], sc_k, 0),
+    "schedule checkpoint: 行长度不符 -> ValueError")
+raises(ValueError, lambda: app.weighted_sample_schedule_checkpoint(
+    sc_items, sc_schedule, sc_k, 0, len(sc_schedule) + 1),
+    "schedule checkpoint: start 越过计划长度 -> ValueError")
+raises(ValueError, lambda: app.weighted_sample_schedule_checkpoint(
+    sc_items, [[1, -2, 3, 0, 5]], 1, 0),
+    "schedule checkpoint: 负权重 -> ValueError")
+raises(ValueError, lambda: app.weighted_sample_schedule_checkpoint(
+    sc_items, [[1, float("nan"), 3, 0, 5]], 1, 0),
+    "schedule checkpoint: NaN 权重 -> ValueError")
+raises(ValueError, lambda: app.weighted_sample_schedule_checkpoint(
+    sc_items, [[0, 0, 0, 0, 0]], 1, 0),
+    "schedule checkpoint: 正权重不足 -> ValueError")
+end_state = app.weighted_sample_schedule_checkpoint(
+    sc_items, sc_schedule, sc_k, sc_seed, start=len(sc_schedule))
+raises(ValueError, lambda: app.weighted_sample_schedule_resume_indices(
+    sc_items, sc_schedule, sc_k, end_state, 1),
+    "schedule resume: 恢复窗口超出计划范围 -> ValueError")
+raises(TypeError, lambda: app.weighted_sample_schedule_resume_indices(
+    sc_items, sc_schedule, sc_k, [], 1),
+    "schedule resume: 非映射状态 -> TypeError")
+raises(TypeError, lambda: app.weighted_sample_schedule_resume_indices(
+    sc_items, sc_schedule, sc_k, end_state, True),
+    "schedule resume: draws 为布尔 -> TypeError")
+import copy as _copy
+tampered = _copy.deepcopy(zero_state)
+tampered["position"] += 1
+raises(ValueError, lambda: app.weighted_sample_schedule_resume_indices(
+    sc_items, sc_schedule, sc_k, tampered, 1),
+    "schedule resume: 位置篡改且摘要不符 -> ValueError")
+wrong_kind = app.weighted_sample_checkpoint(
+    sc_items, sc_schedule[0], sc_k, sc_seed, start=2)
+raises(ValueError, lambda: app.weighted_sample_schedule_resume_indices(
+    sc_items, sc_schedule, sc_k, wrong_kind, 1),
+    "schedule resume: 固定权重状态不能用于计划恢复 -> ValueError")
+
+# 13.6 入参不被修改。
+sc_snap = (list(sc_items), [list(r) for r in sc_schedule])
+app.weighted_sample_schedule_checkpoint(
+    sc_items, sc_schedule, sc_k, sc_seed, start=4)
+app.weighted_sample_schedule_resume_indices(
+    sc_items, sc_schedule, sc_k,
+    app.weighted_sample_schedule_checkpoint(
+        sc_items, sc_schedule, sc_k, sc_seed), 3)
+check((list(sc_items), [list(r) for r in sc_schedule]) == sc_snap,
+      "schedule checkpoint/resume 不修改 items / weights_schedule")
 
 
 # ---------------------------------------------------------------------------
