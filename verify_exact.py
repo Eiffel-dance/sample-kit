@@ -684,6 +684,129 @@ check((ex_items, ex_weights, list(excluded)) ==
 
 
 # ---------------------------------------------------------------------------
+# 13. 按轮次变化权重的批量入口
+# ---------------------------------------------------------------------------
+section("轮变权重批量入口 schedule")
+
+sc_items = list("abcdef")
+sc_rows = [
+    [HUGE, 1, HUGE * 2, 7, 0, 3],
+    [1, 2, 3, 4, 5, 6],
+    [2, Fraction(1), 0.5, _Decimal("0.25"), 0, 9],
+]
+
+# 13.1 start=0 首轮与 weighted_sample_indices(schedule[0]) 逐项一致; 两个
+#   新入口逐轮对应; 手工在同一 rng 上按行计划连抽逐项相等。
+sc_ok = True
+for seed in (0, 1, 42, -7, 1.5, "s", b"s", True):
+    got = app.weighted_sample_schedule_indices(sc_items, sc_rows, 4, 3, seed)
+    got_v = app.weighted_sample_schedule(sc_items, sc_rows, 4, 3, seed)
+    if got[0] != app.weighted_sample_indices(sc_items, sc_rows[0], 4, seed):
+        sc_ok = False
+    if got_v != [[sc_items[i] for i in rd] for rd in got]:
+        sc_ok = False
+    rng = random.Random(seed)
+    for j, row in enumerate(sc_rows):
+        pw, exact = app._select_sampling_plan(list(row), 4)
+        if app._draw_indices_once(len(sc_items), pw, 4, rng, exact) != got[j]:
+            sc_ok = False
+check(sc_ok, "首轮=单轮入口, 共享随机流按行连抽, values<->indices 逐轮对应")
+
+# 13.2 各行权重相同 -> 与 weighted_sample_many_indices 同参(含 start)一致;
+#   start 窗口按区间切片; k=0 不耗随机流(start 可越界)。
+uniform = [[1, 3, 2, 5, 0, 2]] * 8
+uni_ok = (
+    app.weighted_sample_schedule_indices(sc_items, uniform, 4, 6, 42)
+    == app.weighted_sample_many_indices(sc_items, uniform[0], 4, 6, 42)
+    and app.weighted_sample_schedule_indices(sc_items, uniform, 3, 3, 42, start=3)
+    == app.weighted_sample_many_indices(sc_items, uniform[0], 3, 3, 42, start=3)
+)
+check(uni_ok, "各行相同: 与 weighted_sample_many(_indices) 同参逐项一致")
+
+full_sc = app.weighted_sample_schedule_indices(sc_items, sc_rows, 4, 3, 99)
+# 延长 schedule 以覆盖更大窗口。
+long_rows = sc_rows + [[6, 0, 5, 4, 3, 2], [1, 1, 1, 1, 1, 1],
+                       [HUGE, 0, 2, 1, 3, 0]]
+full_long = app.weighted_sample_schedule_indices(sc_items, long_rows, 4, 6, 99)
+window_ok = all(
+    app.weighted_sample_schedule_indices(sc_items, long_rows, 4, 6 - s, 99,
+                                         start=s) == full_long[s:]
+    for s in (0, 1, 3, 5)
+)
+check(window_ok, "start 只跳过完整轮次且按行消耗同一条随机流: 区间切片一致")
+check(
+    app.weighted_sample_schedule_indices(sc_items, sc_rows, 0, 3, 7,
+                                         start=10 ** 9) == [[], [], []],
+    "k=0 每轮为空、不消耗随机流, start 不受 schedule 边界约束",
+)
+
+# 13.3 draws=0 完成全部结构/权重/可行性校验后返回 []。
+check(app.weighted_sample_schedule_indices(sc_items, sc_rows, 4, 0) == [],
+      "draws=0 且合法 -> []")
+raises(ValueError,
+       lambda: app.weighted_sample_schedule_indices(
+           sc_items, [[1, -1, 2, 3, 4, 5]], 1, 0),
+       "schedule: draws=0 仍校验负权重 -> ValueError")
+raises(ValueError,
+       lambda: app.weighted_sample_schedule_indices(
+           sc_items, [[1, 0, 0, 0, 0, 0]], 2, 0),
+       "schedule: draws=0 仍逐行做正权重可行性检查 -> ValueError")
+raises(ValueError,
+       lambda: app.weighted_sample_schedule_indices(
+           sc_items, [[1, 2]], 1, 0),
+       "schedule: 行长度不等于 items -> ValueError")
+raises(TypeError,
+       lambda: app.weighted_sample_schedule_indices(sc_items, "ab", 1, 0),
+       "schedule: 非文本可确定长度序列 -> TypeError")
+raises(TypeError,
+       lambda: app.weighted_sample_schedule_indices(sc_items, [99], 1, 0),
+       "schedule: 行不是同类序列 -> TypeError")
+raises(TypeError,
+       lambda: app.weighted_sample_schedule_indices(
+           sc_items, [[1, True, 2, 3, 4, 5]], 1, 0),
+       "schedule: 布尔权重 -> TypeError")
+raises(ValueError,
+       lambda: app.weighted_sample_schedule_indices(sc_items, sc_rows, 4, 4, 0),
+       "schedule: 窗口越界 -> ValueError")
+raises(TypeError,
+       lambda: app.weighted_sample_schedule_indices(sc_items, sc_rows, 4, 1.0),
+       "schedule: draws 类型错误 -> TypeError")
+raises(ValueError,
+       lambda: app.weighted_sample_schedule_indices(
+           sc_items, sc_rows, 4, 1, start=-1),
+       "schedule: 负 start -> ValueError")
+
+# 13.4 精确权重行 / 零权重行 / 入参不变 / 可序列化往返。
+sc_exact = [
+    [10 ** 400, 10 ** 400, 1, 1, 1, 1],
+    [9, Fraction(1, 100), 1, 1, 1, 1],
+    [1, 1, _Decimal("1E-100"), 10 ** 200, 1, 1],
+]
+exact_rounds = app.weighted_sample_schedule_indices(sc_items, sc_exact, 2, 3, 2026)
+exact_ok = (
+    exact_rounds
+    == app.weighted_sample_schedule_indices(sc_items, sc_exact, 2, 3, 2026)
+    and all(len(set(rd)) == 2 and all(0 <= i < 6 for i in rd)
+            for rd in exact_rounds)
+)
+check(exact_ok, "超大整数 / Fraction / Decimal 行不转浮点且确定")
+zero_rows = [[0, 5, 0, 0, 0, 0], [0, 0, 3, 0, 0, 0]] * 2
+check(
+    [rd[0] for rd in app.weighted_sample_schedule_indices(
+        sc_items, zero_rows, 1, 4, 3)] == [1, 2, 1, 2],
+    "零权重位置逐行永不入选",
+)
+sc_snap = [list(r) for r in sc_rows]
+app.weighted_sample_schedule(sc_items, sc_rows, 4, 3, 5)
+app.weighted_sample_schedule_indices(sc_items, sc_rows, 2, 2, -9, start=1)
+check([list(r) for r in sc_rows] == sc_snap,
+      "schedule: items / weights_schedule 及各行原样保留")
+sc_text = app.serialize_metrics({"rounds": full_sc})
+check(app.deserialize_metrics(sc_text)["rounds"] == full_sc,
+      "schedule 索引轮次可直接 serialize_metrics 并精确往返")
+
+
+# ---------------------------------------------------------------------------
 print()
 if _FAILURES:
     print("结果: %d 项失败" % len(_FAILURES))

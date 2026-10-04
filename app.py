@@ -46,6 +46,36 @@
         列表前抛 ValueError, 任何失败都不给出部分计数。计数为任意精度
         整数, 可直接交给 serialize_metrics 并经 deserialize_metrics
         精确往返。不修改入参。
+    weighted_sample_schedule_indices(items, weights_schedule, k, draws,
+        seed=0, start=0)
+        按轮次变化权重的批量入口: weights_schedule 是长度可确定的非文本
+        序列, 每个成员都是与 items 等长的权重序列, 第 start+j 轮(零基)
+        使用 weights_schedule[start+j] 这一行。返回长度等于 draws 的外层
+        list, 每轮是按抽样先后排列的原始零基索引; 每轮都从全部位置重新
+        开始(轮内无放回, 轮间恢复全部位置, 重复值按位置区分), 所有轮次
+        共享同一个由 seed 初始化的随机流。start 只跳过完整轮次: 跳过的
+        每一轮都按其在 schedule 中对应行的权重消耗与从 0 生成时相同的
+        随机流, 结果与 start=0 的完整调用按区间 [start, start+draws)
+        切片逐项一致; 当 k>0 且 draws>0 时窗口超出 schedule 范围抛
+        ValueError(k=0 或 draws=0 不使用窗口内行, start 不受边界约束)。
+        start=0 的
+        第一轮与 weighted_sample_indices(items, weights_schedule[0], k,
+        seed) 逐项一致; schedule 各行权重相同时与
+        weighted_sample_many_indices(items, 该行, k, draws, seed, start)
+        同参逐项一致。k=0 的轮次返回空列表且不消耗随机流; draws=0 仍
+        完成 items/k/seed 与 schedule 全部行的结构、长度、权重类型/取值
+        及正权重可行性校验后返回空 list。校验在任何一轮物化之前完成:
+        items/k/seed 沿用既有规则, draws/start 为非布尔非负整数,
+        schedule 非长度可确定非文本序列或任一行非同类序列抛 TypeError,
+        行长度不等于 items、窗口越界、负权重、NaN、无穷权重或任一行在
+        k>0 时正权重位置不足 k 个抛 ValueError。权重元素继续接受非布尔
+        int、有限非负 float、Fraction 与 Decimal, 不转浮点, 零权重不可
+        选。不修改 items、weights_schedule 及其各行。
+    weighted_sample_schedule(items, weights_schedule, k, draws, seed=0,
+        start=0)
+        与 weighted_sample_schedule_indices 同规则(同一套校验顺序、异常
+        类别与 start 窗口语义), 但每轮按相同索引返回 items 元素值列表,
+        两个新增入口逐轮逐项对应。
     weighted_sample_stream_indices(items, weights, k, draws, seed=0, start=0)
         weighted_sample_many_indices 的按需逐轮入口: 返回一个可迭代对象,
         调用方逐轮取得与 weighted_sample_many_indices 完全一致的轮次
@@ -266,6 +296,21 @@ def _validate_sample_inputs(items, weights, k, seed):
     # ---- 3. 权重类型: 布尔值和非实数权重 (TypeError) ----
     # decimal.Decimal 不注册为 numbers.Real, 但它是精确十进制实数, 这里
     # 与 int / float / Fraction 一视同仁地接受。
+    _check_weight_element_types(weights)
+
+    # ---- 4. 权重取值: NaN / 无穷 / 负数 (ValueError) ----
+    _check_weight_values(weights)
+
+    return n
+
+
+def _check_weight_element_types(weights):
+    """逐位置确认权重元素类型, 非法元素抛 TypeError。
+
+    与 _validate_sample_inputs 的第 3 步同规则(decimal.Decimal 虽不注册
+    为 numbers.Real, 但作为精确十进制实数接受); 抽成独立入口以便轮变
+    权重 schedule 先对全部行做一次完整的类型检查, 再进入取值检查。
+    """
     for index, w in enumerate(weights):
         if isinstance(w, bool) or not (
             isinstance(w, numbers.Real) or isinstance(w, Decimal)
@@ -275,11 +320,17 @@ def _validate_sample_inputs(items, weights, k, seed):
                 % (index, type(w).__name__)
             )
 
-    # ---- 4. 权重取值: NaN / 无穷 / 负数 (ValueError) ----
+
+def _check_weight_values(weights):
+    """逐位置确认权重取值, NaN / 无穷 / 负数抛 ValueError。
+
+    与 _validate_sample_inputs 的第 4 步同规则, 仅在元素类型已通过
+    _check_weight_element_types 后调用。
+    """
     for index, w in enumerate(weights):
-        # 整数(布尔已在第 3 步拒绝)既不可能是 NaN 也不可能是无穷; 直接判断
-        # 符号, 避免 math.isnan/isinf 把超大整数(如 10**400)转成浮点而抛
-        # OverflowError —— 任意精度整数权重始终是合法的有限权重。
+        # 整数(布尔已在类型检查中拒绝)既不可能是 NaN 也不可能是无穷;
+        # 直接判断符号, 避免 math.isnan/isinf 把超大整数(如 10**400)转成
+        # 浮点而抛 OverflowError —— 任意精度整数权重始终是合法的有限权重。
         if isinstance(w, int):
             if w < 0:
                 raise ValueError("negative weight")
@@ -312,8 +363,6 @@ def _validate_sample_inputs(items, weights, k, seed):
             raise ValueError("weight at index %d must be finite" % index)
         if w < 0:
             raise ValueError("negative weight")
-
-    return n
 
 
 def _validate_draws(draws):
@@ -605,6 +654,126 @@ def _validate_excluding_batch_inputs(
     return pool, planned_weights, use_exact, rng
 
 
+def _validate_items_k_seed(items, k, seed):
+    """轮变权重入口对 items / k / seed 的校验, 返回位置数 n。
+
+    规则与 _validate_sample_inputs 的对应步骤完全一致(结构错误抛
+    TypeError, k 越界抛 ValueError); 该入口没有单一权重序列, 权重由
+    weights_schedule 的每一行各自完成结构、长度、类型、取值与可行性
+    校验。
+    """
+    if not _is_length_determinable_sequence(items):
+        raise TypeError("items must be a length-determinable sequence")
+    if isinstance(k, bool) or not isinstance(k, int):
+        raise TypeError("k must be a non-boolean integer")
+    if not isinstance(seed, _SEED_TYPES):
+        raise TypeError("unsupported seed type: %s" % type(seed).__name__)
+    n = len(items)
+    if k < 0 or k > n:
+        raise ValueError("invalid sample size")
+    return n
+
+
+def _validate_weights_schedule(weights_schedule, n, k, seed, draws, start):
+    """轮变权重 schedule 入口共用的全部前置校验与抽样计划准备。
+
+    调用前 items / k / seed 已通过 _validate_items_k_seed 校验, n 为
+    位置总数。校验顺序固定:
+      1. schedule 本身必须是长度可确定的非文本序列, 每一行也必须是长度
+         可确定的非文本序列(结构错误 TypeError);
+      2. draws / start 必须是非布尔非负整数;
+      3. 当 k>0 且 draws>0(窗口内的行确实会被抽样与跳过)时, 零基窗口
+         [start, start+draws) 必须落在 schedule 范围内; 每一行长度都
+         必须等于 items(长度类错误 ValueError)。k=0 的轮次不使用权重
+         行也不消耗随机流, draws=0 不生成也不跳过, 两种情形都不做窗口
+         越界检查(与既有固定权重批量入口同参行为一致);
+      4. 先对全部行完成权重元素类型检查(TypeError), 再完成 NaN / 无穷 /
+         负权重取值检查(ValueError) —— 与单轮入口"先类型后取值"同一
+         顺序;
+      5. k>0 时每一行的正权重位置都必须不少于 k(ValueError)。
+    即使 draws=0(包括 schedule 为空、start 很大)也完成 schedule 内全部
+    行的结构、长度、权重内容与可行性校验, 任何失败都在第一轮物化之前
+    确定抛出。
+
+    通过后返回 (plans, rng): plans 只覆盖会被跳过或抽样的行前缀
+    [0, start+draws)(k=0 或 draws=0 时为空列表), 每项为
+    (planned_weights, use_exact), 即按该行权重独立选择的抽样计划
+    (可能经 LCM 精确放大)与路径标志 —— 与 weighted_sample_indices 对
+    同一行权重生成的计划逐元素一致, 因此首轮、以及各行权重相同的整段
+    序列都与既有入口逐项对齐; rng 已由 seed 初始化但尚未消耗。全程只
+    操作 schedule 与其各行的本地副本, 绝不修改入参。
+    """
+    if not _is_length_determinable_sequence(weights_schedule):
+        raise TypeError(
+            "weights_schedule must be a length-determinable sequence"
+        )
+    schedule_rows = list(weights_schedule)
+
+    # 先只检查各行的结构(长度可确定的非文本序列), 使类型类错误先于长度
+    # 与权重内容检查确定。
+    for row_index, row in enumerate(schedule_rows):
+        if not _is_length_determinable_sequence(row):
+            raise TypeError(
+                "weights row %d must be a length-determinable sequence"
+                % row_index
+            )
+
+    _validate_draws(draws)
+    _validate_start(start)
+
+    schedule_length = len(schedule_rows)
+    # 只有确实需要按行抽样(k>0)且至少生成一轮(draws>0)时, 窗口与跳过的
+    # 行才会被使用: 此时窗口 [start, start+draws) 必须落在 schedule 范围
+    # 内。k=0 的轮次不使用任何权重行也不消耗随机流, draws=0 则既不生成
+    # 也不跳过 —— 两种情形都与既有固定权重批量入口同参行为一致(包括
+    # start 很大也合法)。
+    if k > 0 and draws > 0 and start + draws > schedule_length:
+        raise ValueError("weights schedule window out of range")
+    for row_index, row in enumerate(schedule_rows):
+        if len(row) != n:
+            raise ValueError("weights row %d length mismatch" % row_index)
+
+    # 复制到本地后再做内容检查与计划构造, 后续放大与抽样绝不触碰入参行。
+    local_rows = [list(row) for row in schedule_rows]
+
+    def _fail_row(row_index, exc):
+        # 保留既有权重错误文案与异常类别, 仅补充行定位。
+        message = "weights row %d: %s" % (row_index, exc.args[0]) \
+            if exc.args else "weights row %d" % row_index
+        return type(exc)(message)
+
+    for row_index, row_weights in enumerate(local_rows):
+        try:
+            _check_weight_element_types(row_weights)
+        except TypeError as exc:
+            raise _fail_row(row_index, exc) from exc
+    for row_index, row_weights in enumerate(local_rows):
+        try:
+            _check_weight_values(row_weights)
+        except ValueError as exc:
+            raise _fail_row(row_index, exc) from exc
+
+    # 每一行在 k>0 时都必须能独立抽满 k 个位置; 窗口外的行同样参与校验
+    # (draws=0 仍完成全部可行性检查)。
+    if k > 0:
+        for row_index, row_weights in enumerate(local_rows):
+            if k > _count_positive_weights(row_weights):
+                raise ValueError(
+                    "weights row %d: no positive weight" % row_index
+                )
+
+    rng = random.Random(seed)
+    # 只有会被跳过或抽样的行前缀需要抽样计划(Fraction / Decimal 行的
+    # LCM 精确放大可能很贵); 校验仍覆盖全部行。k=0 或 draws=0 不索引
+    # 任何计划。
+    needed = start + draws if k > 0 and draws > 0 else 0
+    plans = [
+        _select_sampling_plan(row_weights, k)
+        for row_weights in local_rows[:needed]
+    ]
+    return plans, rng
+
+
 def weighted_sample_indices(items, weights, k, seed=0):
     n = _validate_sample_inputs(items, weights, k, seed)
 
@@ -772,10 +941,85 @@ def weighted_sample_counts(items, weights, k, draws, seed=0, start=0):
     return counts
 
 
+def weighted_sample_schedule_indices(items, weights_schedule, k, draws,
+                                     seed=0, start=0):
+    """按轮次变化权重的批量入口: 一次调用生成 draws 轮, 每轮使用
+    weights_schedule 中对应行的权重完成加权无放回抽样。
+
+    weights_schedule 是长度可确定的非文本序列, 每个成员都是与 items
+    等长的权重序列; 第 start+j 轮(零基)使用 weights_schedule[start+j]
+    这一行。返回长度等于 draws 的外层 list, 每个元素是一轮按抽样先后
+    排列的原始零基索引。每轮都从全部原始位置重新开始(同一轮内位置最多
+    出现一次, 轮次之间允许再次选中同一位置; 相等的 items 值仍按不同
+    位置独立处理)。所有轮次共享同一个由 seed 初始化的随机流。
+
+    start(默认 0)只跳过完整轮次, 且跳过的每一轮(无论是否落在返回窗口
+    内)都使用其在 schedule 中对应行的权重, 消耗与从 0 开始生成时完全
+    相同的随机流; 因此返回结果与 start=0 的完整调用按零基区间
+    [start, start+draws) 切片逐项一致, 等价于把同参 calls 按各自 start
+    续接在同一随机流上。当 k>0 且 draws>0(窗口内行确实会被抽样与跳过)
+    时, 窗口超出 schedule 范围抛 ValueError; k=0 或 draws=0 时不使用
+    窗口内的行, start 不受 schedule 边界约束(与
+    weighted_sample_many_indices 同参行为一致)。
+
+    start=0 的第一轮与
+    weighted_sample_indices(items, weights_schedule[0], k, seed) 逐项
+    一致; schedule 每一行权重都相同时, 全部轮次与
+    weighted_sample_many_indices(items, weights_schedule[0], k, draws,
+    seed, start) 同参逐项一致。k=0 的轮次返回空列表且不消耗随机流
+    (跳过与生成都是如此); draws=0 仍完成 items/k/seed 以及 schedule
+    全部行的结构、长度、权重类型/取值和正权重可行性校验, 然后返回空
+    list。
+
+    校验在产生任何一轮之前完成, 顺序为: items、k、seed(沿用既有入口
+    规则), weights_schedule 及其各行的结构, draws、start, 窗口与各行
+    长度, 全部行的权重元素类型(再)取值, 最后逐行做 k>0 的正权重可行
+    性检查。draws / start 必须是非布尔非负整数; schedule 不是长度可
+    确定的非文本序列或任一行不是同类序列时抛 TypeError; 行长度不等于
+    items、窗口越界、负权重、NaN、无穷权重, 或任一行在 k>0 时正权重
+    位置不足 k 个时抛 ValueError。权重元素继续接受非布尔 int、有限非
+    负 float、Fraction 与 Decimal, 不经过浮点转换, 零权重永不入选。
+    不修改 items、weights_schedule 及其各行。
+    """
+    n = _validate_items_k_seed(items, k, seed)
+    plans, rng = _validate_weights_schedule(
+        weights_schedule, n, k, seed, draws, start
+    )
+
+    # 先按各自行权重跳过 start 个完整轮次, 消耗与从 0 生成时相同的随机
+    # 流; k=0 的轮次不消耗随机流, draws=0 时也无需空转。
+    if k > 0 and draws > 0:
+        for round_index in range(start):
+            planned_weights, use_exact = plans[round_index]
+            _draw_indices_once(n, planned_weights, k, rng, use_exact)
+
+    rounds = []
+    for j in range(draws):
+        if k == 0:
+            rounds.append([])
+            continue
+        planned_weights, use_exact = plans[start + j]
+        rounds.append(
+            _draw_indices_once(n, planned_weights, k, rng, use_exact)
+        )
+    return rounds
+
+
+def weighted_sample_schedule(items, weights_schedule, k, draws, seed=0,
+                             start=0):
+    """轮变权重批量采样的元素值入口: 规则、校验顺序与异常类别与
+    weighted_sample_schedule_indices 完全一致, 区别仅在于每轮按相同
+    索引返回 items 的元素值列表; 两个入口逐轮逐项对应(相同值的不同
+    位置仍按位置独立处理)。
+    """
+    rounds = weighted_sample_schedule_indices(
+        items, weights_schedule, k, draws, seed, start
+    )
+    return [[items[i] for i in round_indices] for round_indices in rounds]
+
+
 def weighted_sample_stream_indices(items, weights, k, draws, seed=0, start=0):
     """weighted_sample_many_indices 的按需逐轮入口。
-
-    返回一个可迭代对象, 每次迭代产出一轮按抽样先后排列的零基原始索引
     列表, 共 draws 轮; 对相同输入和种子, 逐轮结果与
     weighted_sample_many_indices(items, weights, k, draws, seed) 返回的
     全部轮次完全一致(第一轮同样与 weighted_sample_indices 逐项相同)。
