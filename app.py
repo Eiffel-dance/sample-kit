@@ -133,6 +133,36 @@
         索引入口)继续推进; draws=0 时返回空轮次与未改变的状态副本, k=0 时
         生成 draws 个空列表并按轮数推进 position、不消耗随机流。不修改入参,
         也不修改传入的状态映射。
+    weighted_sample_excluding_checkpoint(items, weights, k, excluded, seed=0,
+        start=0)
+        排除采样会话的断点创建入口: 接受与 weighted_sample_checkpoint 相同
+        的 items、weights、k、seed、start 校验, 并按排除入口的集合语义处理
+        excluded(重复位置与排列顺序不影响结果; 结构或成员类型错误抛
+        TypeError, 越界位置抛 ValueError), 随后在产生任何状态前完成未排除
+        位置的正权重可行性检查。校验通过后先完成 start 个轮次(每轮从同一组
+        未排除位置重新开始无放回抽样, 轮次共享 seed 的随机流, start=0 时
+        首轮与 weighted_sample_excluding_indices 一致), 再返回当前位置和
+        只含 JSON 原生值的可序列化状态; 状态绑定版本、位置、抽样参数(k/n)、
+        规范化后的 excluded、items/weights 指纹、标签化 seed、RNG 内部状态
+        与抽样计划, 可经 serialize_metrics 与 deserialize_metrics 往返后
+        继续恢复。不修改入参, 也不修改 excluded。
+    weighted_sample_excluding_resume_indices(items, weights, k, excluded,
+        state, draws)
+        排除采样会话的按索引恢复入口: 传入与创建断点时相同的 items、
+        weights、k、excluded 与状态, 返回 (索引轮次列表, 下一状态)。第一轮
+        从断点位置开始, 逐轮等于 weighted_sample_many_excluding_indices
+        的零基区间 [pos, pos+draws); 多次续接与一次性生成逐项相同,
+        excluded 为空时与 weighted_sample_resume_indices 一致。draws=0
+        返回空轮次与不变的状态副本; k=0 时生成 draws 个空轮次、只推进位置
+        且不消耗随机流。状态不是映射抛 TypeError; 字段缺失或额外、版本不
+        支持、摘要或输入不匹配统一抛 ValueError, 且绝不产生部分轮次;
+        其余输入错误沿用既有 TypeError / ValueError。不修改入参与状态。
+    weighted_sample_excluding_resume(items, weights, k, excluded, state,
+        draws)
+        排除采样会话的按元素值恢复入口, 规则与
+        weighted_sample_excluding_resume_indices 完全一致(同一套校验
+        顺序与异常类别): 每轮按原始位置映射元素值, 返回的下一状态与按索引
+        入口逐字段一致, 可再次传入任一恢复入口继续推进。
     serialize_metrics(metrics)
         将指标树稳定序列化为紧凑 JSON 文本, 任意精度整数保持精确十进制。
         字典键先统一转换为成员名文本(str 原样, None->null, bool->true/false,
@@ -1493,6 +1523,340 @@ def weighted_sample_resume(items, weights, k, state, draws):
     # JSON / Decimal / random 异常同样统一收敛为 ValueError。
     index_rounds, next_state = _resume_rounds_indices(
         items, weights, k, state, draws
+    )
+    # 按每轮原始位置逐项映射为元素值: 相同值的不同位置各自独立映射,
+    # 轮内不重复位置这一性质随索引结果原样保留。只读取 items, 不修改入参。
+    rounds = [[items[i] for i in round_indices] for round_indices in index_rounds]
+    return rounds, next_state
+
+
+# ---------------------------------------------------------------------------
+# 可暂停 / 恢复的排除采样会话
+# ---------------------------------------------------------------------------
+
+def _excluding_checkpoint_binding_digest(
+    seed_tagged, position, k, n, excluded_list,
+    items_digest, weights_digest, exact, rng_payload,
+):
+    """把排除断点各字段绑定为一个防篡改摘要。
+
+    与 _checkpoint_binding_digest 同一构造(serialize_metrics 规范化后
+    sha256), 额外绑定规范化后的 excluded 位置列表: 对排除集合、位置、
+    seed、RNG 快照、指纹或 exact 的任何改动若不重算摘要, 恢复时都会被
+    发现, 因此恢复长批次无需从头重放随机流。
+    """
+    return _hash_text(serialize_metrics({
+        "seed": seed_tagged,
+        "position": position,
+        "k": k,
+        "n": n,
+        "excluded": excluded_list,
+        "items_digest": items_digest,
+        "weights_digest": weights_digest,
+        "exact": exact,
+        "rng": rng_payload,
+    }))
+
+
+def weighted_sample_excluding_checkpoint(
+    items, weights, k, excluded, seed=0, start=0
+):
+    """创建排除采样会话断点(只含 JSON 原生值的状态映射)。
+
+    校验顺序与批量排除入口一致: 先 items、weights、k、seed
+    (_validate_sample_inputs), 再 excluded(非文本可确定长度序列, 成员
+    为非布尔整数且在 items 零基范围内, 按集合语义解释 —— 重复成员与排列
+    顺序不影响结果), 最后 start; 随后在产生任何状态前完成未排除位置的
+    正权重可行性检查(k>0 而未排除正权重不足 k 个时抛 ValueError)。
+    全部通过后先完成 start 个轮次(每轮从同一组未排除位置重新开始无放回
+    抽样, 轮次共享由 seed 初始化的同一随机流, k=0 的轮次不消耗随机流),
+    把随机流推进到 "已完成 start 轮" 的位置并快照。
+
+    返回的状态只含 str/int/bool/None/float/list/dict 等 JSON 原生值,
+    绑定版本、当前位置(已完成轮次)、k/n、规范化后的 excluded(升序去重
+    位置列表)、items 与 weights 指纹、标签化 seed、抽样计划(exact)与
+    RNG 内部状态; 可直接交给 serialize_metrics, 经 json 文本落盘或
+    deserialize_metrics 还原(甚至跨进程)后仍可交给
+    weighted_sample_excluding_resume_indices 恢复, 不依赖任何进程内
+    对象身份。excluded 为空时与 weighted_sample_checkpoint 的状态逐字段
+    一致(除 excluded 字段本身)。不修改入参, 也不修改 excluded。
+    """
+    n = _validate_sample_inputs(items, weights, k, seed)
+    excluded_set = _validate_excluded_positions(excluded, n)
+    _validate_start(start)
+
+    # 复制到本地并剔除被排除的位置, 绝不修改入参; 与批量排除入口相同的
+    # 可行性前置检查: 即使只是创建断点, k 超过未排除位置的正权重个数也
+    # 必须在返回任何状态前确定抛 ValueError。
+    pool = [i for i in range(n) if i not in excluded_set]
+    pool_weights = [weights[i] for i in pool]
+    if k > 0 and k > _count_positive_weights(pool_weights):
+        raise ValueError("no positive weight")
+
+    rng = random.Random(seed)
+    planned_weights, use_exact = _select_sampling_plan(pool_weights, k)
+
+    # 与 weighted_sample_many_excluding_indices 的跳过逻辑一致: k=0 的
+    # 轮次不消耗随机流; excluded 为空时 pool 即 range(n), 与
+    # weighted_sample_checkpoint 消耗的随机流完全相同。
+    if k > 0:
+        for _ in range(start):
+            _draw_indices_once_pool(pool, planned_weights, k, rng, use_exact)
+
+    # 集合语义规范化: 升序去重的位置列表是 excluded 的唯一状态表示。
+    excluded_list = sorted(excluded_set)
+    seed_tagged = _seed_to_tagged_value(seed)
+    rng_payload = _rng_state_to_jsonable(rng.getstate())
+    items_digest = _items_fingerprint(items)
+    weights_digest = _weights_fingerprint(weights)
+    state = {
+        "version": _CHECKPOINT_VERSION,
+        "position": start,
+        "k": k,
+        "n": n,
+        "excluded": excluded_list,
+        "items_digest": items_digest,
+        "weights_digest": weights_digest,
+        "seed": seed_tagged,
+        "exact": bool(use_exact),
+        "rng": rng_payload,
+    }
+    state["digest"] = _excluding_checkpoint_binding_digest(
+        seed_tagged, start, k, n, excluded_list, items_digest,
+        weights_digest, bool(use_exact), rng_payload,
+    )
+    return state
+
+
+def _validate_excluding_checkpoint_state(state):
+    """校验排除断点状态本身的结构与版本, 返回规范化字段。
+
+    调用前须已确认 state 是映射(否则 TypeError 在外层抛出)。字段缺失、
+    类型错误、非法取值、版本不支持、多余字段、excluded 不是规范化位置
+    列表等一切结构问题统一抛 ValueError。
+    """
+    required = ("version", "position", "k", "n", "excluded", "items_digest",
+                "weights_digest", "seed", "exact", "rng", "digest")
+    if not all(key in state for key in required):
+        raise ValueError("invalid checkpoint state: missing fields")
+    if set(state) != set(required):
+        raise ValueError("invalid checkpoint state: unexpected fields")
+
+    version = state["version"]
+    if (isinstance(version, bool) or not isinstance(version, int)
+            or version != _CHECKPOINT_VERSION):
+        raise ValueError("unsupported checkpoint version: %r" % (version,))
+    position = state["position"]
+    k = state["k"]
+    n = state["n"]
+    for name, value in (("position", position), ("k", k), ("n", n)):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError("invalid checkpoint state: %s" % name)
+    if k > n:
+        raise ValueError("invalid checkpoint state: k exceeds n")
+    if not isinstance(state["exact"], bool):
+        raise ValueError("invalid checkpoint state: exact")
+    for name in ("items_digest", "weights_digest", "digest"):
+        if not isinstance(state[name], str):
+            raise ValueError("invalid checkpoint state: %s" % name)
+
+    # excluded 在状态中只以规范化形式(升序去重的非布尔整数位置列表, 全部
+    # 处于 [0, n))出现; 任何其他结构都视为非法状态。经 json /
+    # deserialize_metrics 往返后成员仍是 int, 规范化形式保持不变。
+    excluded_list = state["excluded"]
+    if not isinstance(excluded_list, list):
+        raise ValueError("invalid checkpoint state: excluded")
+    for member in excluded_list:
+        if (isinstance(member, bool) or not isinstance(member, int)
+                or member < 0 or member >= n):
+            raise ValueError("invalid checkpoint state: excluded")
+    if excluded_list != sorted(set(excluded_list)):
+        raise ValueError("invalid checkpoint state: excluded")
+
+    # 状态可能经 serialize_metrics + deserialize_metrics 还原: 其中的
+    # Decimal 载荷先还原为创建时的等值 float, 再解码与核对摘要 —— 两条
+    # 文本路径(json / serialize_metrics)解析出的状态因此可互换恢复。
+    seed_payload = _normalize_checkpoint_numbers(state["seed"])
+    rng_payload = _normalize_checkpoint_numbers(state["rng"])
+
+    # 两个逆运算对内部结构问题统一抛 ValueError。
+    seed = _tagged_value_to_seed(seed_payload)
+    rng_state = _rng_state_from_jsonable(rng_payload)
+
+    # 绑定摘要: 任何对字段的篡改(位置、excluded、seed、RNG 快照、指纹、
+    # exact)若不附带重算的摘要, 都会在这里被发现 —— 因此恢复时不必从头
+    # 重放随机流。
+    expected_digest = _excluding_checkpoint_binding_digest(
+        seed_payload, position, k, n, excluded_list, state["items_digest"],
+        state["weights_digest"], state["exact"], rng_payload,
+    )
+    if not hmac.compare_digest(expected_digest, state["digest"]):
+        raise ValueError("invalid checkpoint state: digest mismatch")
+    return (position, k, n, excluded_list, state["exact"], seed, rng_state,
+            seed_payload)
+
+
+def _resume_excluding_rounds_indices(items, weights, k, excluded, state,
+                                     draws):
+    """两个排除恢复入口共用的已校验核心: 只产出索引轮次与下一状态。
+
+    校验顺序按恢复入口约定固定: 先确认 state 是映射(否则 TypeError 在外层
+    抛出)并按既有规则校验 draws; 然后校验状态本身的结构/版本/摘要, 用状态
+    携带的 seed 完成 items、weights、k 的采样入口校验, 再按排除入口规则
+    校验 excluded; 最后核对状态与当前输入的绑定(k/n、excluded 集合、items
+    指纹、weights 指纹、抽样计划)。任一失败都在物化任何轮次之前抛出既有
+    TypeError / ValueError(未排除位置正权重不足同样是 ValueError);
+    JSON / Decimal / random 层面的意外异常统一收敛为 ValueError, 绝不以
+    其他类型泄漏。全部通过后直接从 RNG 快照续接, 返回 (索引轮次, 下一
+    状态); 不修改入参, 也不修改传入的状态映射。
+    """
+    # 状态结构与版本先校验(ValueError), 取出的 seed 再用于采样输入校验,
+    # 保证 _validate_sample_inputs 的 seed 类型规则同样被执行。
+    (position, state_k, state_n, state_excluded, use_exact, seed, rng_state,
+     seed_payload) = _validate_excluding_checkpoint_state(state)
+    n = _validate_sample_inputs(items, weights, k, seed)
+    excluded_set = _validate_excluded_positions(excluded, n)
+
+    # 状态与当前采样输入的一致性: excluded 按集合语义比较, 调用方传入的
+    # 重复成员与排列顺序不影响判定。
+    if state_k != k or state_n != n:
+        raise ValueError("checkpoint state does not match items/weights/k")
+    if set(state_excluded) != excluded_set:
+        raise ValueError("checkpoint state does not match excluded")
+    if state["items_digest"] != _items_fingerprint(items):
+        raise ValueError("checkpoint state does not match items")
+    if state["weights_digest"] != _weights_fingerprint(weights):
+        raise ValueError("checkpoint state does not match weights")
+
+    # 未排除位置的正权重可行性与抽样计划必须与创建断点时一致; 权重已逐
+    # 位置指纹核对, 这里重建计划并比对 exact 标志。RNG 快照与 (seed,
+    # position, excluded) 的绑定已由状态摘要保证未被篡改, 故恢复直接从
+    # 快照继续, 无需从头重放。
+    pool = [i for i in range(n) if i not in excluded_set]
+    pool_weights = [weights[i] for i in pool]
+    if k > 0 and k > _count_positive_weights(pool_weights):
+        raise ValueError("no positive weight")
+    planned_weights, planned_exact = _select_sampling_plan(pool_weights, k)
+    if planned_exact != use_exact:
+        raise ValueError("invalid checkpoint state: sampling plan mismatch")
+
+    # 全部校验通过后才物化轮次: 直接从快照状态继续, 与批量排除入口的
+    # 对应区间逐轮一致。
+    rng = random.Random()
+    try:
+        rng.setstate(rng_state)
+    except ValueError:
+        raise
+    except Exception as exc:
+        # 结构与取值范围已在上游校验; 任何解释器层面的额外拒绝都统一成
+        # ValueError, 绝不泄漏其他异常类型, 也不会已产出部分轮次。
+        raise ValueError("invalid checkpoint RNG state") from exc
+    rounds = []
+    for _ in range(draws):
+        rounds.append(
+            _draw_indices_once_pool(pool, planned_weights, k, rng,
+                                    planned_exact)
+        )
+
+    next_state = dict(state)
+    next_rng_payload = _rng_state_to_jsonable(rng.getstate())
+    next_position = position + draws
+    next_state["position"] = next_position
+    next_state["rng"] = next_rng_payload
+    # excluded 与 seed 载荷使用校验时规范化后的形式: 经 deserialize_metrics
+    # 还原的状态其 Decimal 已回到等值 float, 下一状态因此与 JSON 原生状态
+    # 链逐字段一致, 可继续经任一文本路径序列化/解析后再恢复。
+    next_state["excluded"] = list(state_excluded)
+    next_state["seed"] = seed_payload
+    # 摘要必须随 position / RNG 一并刷新, 否则链式再恢复时会因摘要失配
+    # 而失败(其余字段与原状态相同)。
+    next_state["digest"] = _excluding_checkpoint_binding_digest(
+        seed_payload, next_position, k, n, list(state_excluded),
+        state["items_digest"], state["weights_digest"],
+        planned_exact, next_rng_payload,
+    )
+    return rounds, next_state
+
+
+def weighted_sample_excluding_resume_indices(
+    items, weights, k, excluded, state, draws
+):
+    """从排除断点继续产出索引轮次, 返回 (轮次列表, 下一状态)。
+
+    第一轮从断点记录的位置开始; 逐轮结果与
+    weighted_sample_many_excluding_indices(items, weights, k, excluded,
+    draws, seed, start=position) 完全一致, 即等于 start=0 完整批量排除
+    序列的零基区间 [position, position+draws); 多次续接与一次性生成逐项
+    相同, excluded 为空时与 weighted_sample_resume_indices 的对应窗口
+    一致。返回前完成与采样入口一致的全部输入校验(含 excluded 的集合语义
+    校验), 并核对状态与 items、weights、k、excluded 及 (seed, 位置, RNG
+    快照)的自洽性: 状态不是映射抛 TypeError; 字段缺失或额外、版本不支持、
+    摘要或输入不匹配统一抛 ValueError; items/weights/k/excluded/draws 的
+    错误沿用既有 TypeError / ValueError。所有失败都在任何轮次物化之前
+    确定, 绝不返回部分轮次。draws=0 返回空轮次与位置不变的状态副本;
+    k=0 时每轮为空列表, 位置仍逐轮加一且不消耗随机流。不修改入参,
+    也不修改传入的状态映射与 excluded。
+    """
+    # 状态不是映射: TypeError(文档约定的明确分类)。映射前提下的一切
+    # 结构/版本/摘要问题在 _validate_excluding_checkpoint_state 中统一为
+    # ValueError。
+    if not isinstance(state, collections.abc.Mapping):
+        raise TypeError("checkpoint state must be a mapping")
+    # draws 的类型/取值规则独立于状态, 先按既有规则校验(TypeError /
+    # ValueError), 再解析状态。
+    _validate_draws(draws)
+    return _resume_excluding_rounds_indices(
+        items, weights, k, excluded, state, draws
+    )
+
+
+def weighted_sample_excluding_resume(
+    items, weights, k, excluded, state, draws
+):
+    """按元素值从排除断点继续, 返回 (元素值轮次列表, 下一状态)。
+
+    校验顺序按恢复入口约定固定: 调用开始先按现有采样入口完成 items、
+    weights、k 的结构、长度、权重取值与范围校验(这部分与 seed 无关;
+    state 携带的 seed 其标签化编码与既有种子类型语义随后随 state 一并
+    校验), 再按排除入口规则校验 excluded, 然后按现有恢复入口校验 state
+    的映射类型、版本、字段集合、摘要、随机数状态以及 state 与当前输入的
+    绑定, draws 必须是非布尔非负整数。状态不是映射抛 TypeError; 非法
+    状态、版本不支持、状态与输入不匹配、未排除位置正权重不足等一律抛
+    ValueError; 其余输入错误沿用既有 TypeError / ValueError。所有失败
+    都在产生任何轮次之前确定, JSON / Decimal / random 的异常不会以其他
+    类型泄漏。
+
+    每轮返回元素值列表, 与 weighted_sample_excluding_resume_indices
+    返回的每轮原始位置逐项对应(第 j 个值恰为 items[第 j 个索引]): 相同
+    值的不同位置分别消耗, 轮内不会出现重复位置。返回的下一状态与按索引
+    入口产出的逐字段一致(position、excluded、RNG 快照、digest 相同),
+    只含 JSON 原生值, 可直接再次传入本入口或按索引入口, 或经
+    serialize_metrics 与 json 解析后继续恢复。draws=0 返回空轮次与位置、
+    随机状态不变的状态副本; k=0 时生成 draws 个空列表并按轮数推进
+    position, 不消耗随机流。不修改入参, 也不修改传入的状态映射与
+    excluded。
+    """
+    # 第一步: 先按现有采样入口完成 items、weights、k 的结构、长度、权重
+    # 取值与范围校验, 再按排除入口规则校验 excluded。这些检查只用到 seed
+    # 的类型(0 恒为合法种子), 与 seed 的具体值无关; state 中携带的 seed
+    # 其编码与类型在下一步状态校验时由 _tagged_value_to_seed 按既有种子
+    # 语义核对。因此即使 state 本身已损坏, 非法 items/weights/k/excluded
+    # 仍优先以采样/排除入口的异常类别报告。
+    n = _validate_sample_inputs(items, weights, k, 0)
+    _validate_excluded_positions(excluded, n)
+
+    # 第二步: 恢复入口的映射类型检查与 draws 规则(TypeError / ValueError)。
+    if not isinstance(state, collections.abc.Mapping):
+        raise TypeError("checkpoint state must be a mapping")
+    _validate_draws(draws)
+
+    # 第三步: 状态结构/版本/字段/摘要/RNG、state 与输入绑定(含从状态
+    # 解出的 seed 再跑一次采样入口校验与 excluded 集合比对)、正权重可行
+    # 性与抽样计划核对, 全部通过后从 RNG 快照续接产出索引轮次。与按索引
+    # 入口共用同一个已校验核心, 因此轮次内容、下一状态、异常类别与其
+    # 逐项一致; JSON / Decimal / random 异常同样统一收敛为 ValueError。
+    index_rounds, next_state = _resume_excluding_rounds_indices(
+        items, weights, k, excluded, state, draws
     )
     # 按每轮原始位置逐项映射为元素值: 相同值的不同位置各自独立映射,
     # 轮内不重复位置这一性质随索引结果原样保留。只读取 items, 不修改入参。
