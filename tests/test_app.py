@@ -17,6 +17,11 @@ from app import (
     weighted_sample_schedule_checkpoint,
     weighted_sample_schedule_resume_indices,
     weighted_sample_schedule_resume,
+    weighted_sample_partition_indices,
+    weighted_sample_partition,
+    weighted_sample_partition_checkpoint,
+    weighted_sample_partition_resume_indices,
+    weighted_sample_partition_resume,
     weighted_sample_stream,
     weighted_sample_stream_indices,
     weighted_sample_many_excluding,
@@ -6176,6 +6181,555 @@ class WeightedSampleScheduleCheckpointTest(unittest.TestCase):
             json.loads(json.dumps(none_state)), 2)
         self.assertEqual(a, b)
         self.assertEqual(len(a), 2)
+
+
+class WeightedSamplePartitionTest(unittest.TestCase):
+    """分组采样与可暂停 / 恢复的分组会话:
+    weighted_sample_partition_indices / weighted_sample_partition /
+    weighted_sample_partition_checkpoint /
+    weighted_sample_partition_resume_indices /
+    weighted_sample_partition_resume。"""
+
+    ITEMS = list("abcdef")
+    WEIGHTS = [1, 3, 0, 2, 5, 0]
+    GROUP_SIZES = [2, 1, 0, 1]
+    SEED = 42
+
+    def _flat_reference(self):
+        return weighted_sample_indices(
+            self.ITEMS, self.WEIGHTS, sum(self.GROUP_SIZES), self.SEED)
+
+    def _full(self):
+        return weighted_sample_partition_indices(
+            self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, self.SEED)
+
+    # ------------------------------------------------------------------
+    # 一次性分组入口
+    # ------------------------------------------------------------------
+    def test_groups_split_the_single_without_replacement_sequence(self):
+        groups = self._full()
+        self.assertEqual([len(g) for g in groups], self.GROUP_SIZES)
+        # 各组拼接逐项等于 weighted_sample_indices 的无放回序列。
+        self.assertEqual(
+            [position for group in groups for position in group],
+            self._flat_reference(),
+        )
+        # 所有组互不重叠, 且零权重位置(2、5)永不出现。
+        flattened = [position for group in groups for position in group]
+        self.assertEqual(len(flattened), len(set(flattened)))
+        self.assertNotIn(2, flattened)
+        self.assertNotIn(5, flattened)
+
+    def test_values_entry_maps_positions(self):
+        index_groups = self._full()
+        value_groups = weighted_sample_partition(
+            self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, self.SEED)
+        self.assertEqual(
+            value_groups,
+            [[self.ITEMS[i] for i in group] for group in index_groups],
+        )
+
+    def test_duplicate_values_are_distinct_positions(self):
+        items = ["x", "y", "x", "z", "y", "q"]
+        index_groups = weighted_sample_partition_indices(
+            items, self.WEIGHTS, [2, 2], seed=5)
+        value_groups = weighted_sample_partition(
+            items, self.WEIGHTS, [2, 2], seed=5)
+        self.assertEqual(
+            value_groups,
+            [[items[i] for i in group] for group in index_groups],
+        )
+
+    def test_empty_plan_and_zero_sizes_after_validation(self):
+        self.assertEqual(
+            weighted_sample_partition_indices(
+                self.ITEMS, self.WEIGHTS, [], self.SEED),
+            [],
+        )
+        self.assertEqual(
+            weighted_sample_partition_indices(
+                self.ITEMS, self.WEIGHTS, [0, 0, 0], self.SEED),
+            [[], [], []],
+        )
+        # 权重总量为零但总组大小也为零: 完成校验后返回对应数量的空组。
+        self.assertEqual(
+            weighted_sample_partition_indices(
+                self.ITEMS, [0] * len(self.ITEMS), [0, 0], self.SEED),
+            [[], []],
+        )
+        self.assertEqual(
+            weighted_sample_partition(
+                self.ITEMS, [0] * len(self.ITEMS), [0, 0], self.SEED),
+            [[], []],
+        )
+
+    def test_tuple_inputs_accepted(self):
+        self.assertEqual(
+            weighted_sample_partition_indices(
+                tuple(self.ITEMS), tuple(self.WEIGHTS),
+                tuple(self.GROUP_SIZES), self.SEED),
+            self._full(),
+        )
+
+    def test_fraction_decimal_exact_path(self):
+        weights = [Fraction(1, 7), Decimal("0.2"), 0, 1, 10 ** 80, 0]
+        groups = weighted_sample_partition_indices(
+            self.ITEMS, weights, [1, 2, 1], seed=7)
+        self.assertEqual(
+            [p for g in groups for p in g],
+            weighted_sample_indices(self.ITEMS, weights, 4, 7),
+        )
+        self.assertEqual(
+            weighted_sample_partition(self.ITEMS, weights, [1, 2, 1], 7),
+            [[self.ITEMS[i] for i in g] for g in groups],
+        )
+
+    def test_inputs_not_mutated(self):
+        items = list(self.ITEMS)
+        weights = list(self.WEIGHTS)
+        group_sizes = list(self.GROUP_SIZES)
+        weighted_sample_partition_indices(items, weights, group_sizes, self.SEED)
+        self.assertEqual(items, self.ITEMS)
+        self.assertEqual(weights, self.WEIGHTS)
+        self.assertEqual(group_sizes, self.GROUP_SIZES)
+
+    def test_validation_type_errors(self):
+        te = lambda fn: self.assertRaises(TypeError, fn)
+        items, weights, groups = self.ITEMS, self.WEIGHTS, self.GROUP_SIZES
+        te(lambda: weighted_sample_partition_indices("abcdef", weights, groups, 0))
+        te(lambda: weighted_sample_partition_indices(items, iter(weights), groups, 0))
+        te(lambda: weighted_sample_partition_indices(items, weights, "abc", 0))
+        te(lambda: weighted_sample_partition_indices(items, weights, iter(groups), 0))
+        te(lambda: weighted_sample_partition_indices(items, weights, [1, True], 0))
+        te(lambda: weighted_sample_partition_indices(items, weights, [1, 1.0], 0))
+        te(lambda: weighted_sample_partition_indices(
+            items, [1, True, 0, 2, 5, 0], groups, 0))
+        te(lambda: weighted_sample_partition_indices(
+            items, [1, "x", 0, 2, 5, 0], groups, 0))
+        te(lambda: weighted_sample_partition_indices(
+            items, weights, groups, object()))
+
+    def test_validation_value_errors(self):
+        ve = lambda fn: self.assertRaises(ValueError, fn)
+        items, weights, groups = self.ITEMS, self.WEIGHTS, self.GROUP_SIZES
+        # 长度不一致(ValueError, tuple 是合法序列)。
+        ve(lambda: weighted_sample_partition_indices(items, (1, 2), groups, 0))
+        ve(lambda: weighted_sample_partition_indices(items, [1, 2, 0], groups, 0))
+        # 负组大小。
+        ve(lambda: weighted_sample_partition_indices(items, weights, [-1], 0))
+        ve(lambda: weighted_sample_partition_indices(items, weights, [1, -1], 0))
+        # 总组大小超过可用正权重位置数(正权重位置只有 4 个)。
+        ve(lambda: weighted_sample_partition_indices(items, weights, [5], 0))
+        ve(lambda: weighted_sample_partition_indices(items, weights, [3, 2], 0))
+        # 全零权重下任何正组大小都失败。
+        ve(lambda: weighted_sample_partition_indices(
+            items, [0] * len(items), [1], 0))
+        # 负权重、NaN、无穷。
+        ve(lambda: weighted_sample_partition_indices(
+            items, [1, -3, 0, 2, 5, 0], groups, 0))
+        ve(lambda: weighted_sample_partition_indices(
+            items, [1, float("nan"), 0, 2, 5, 0], groups, 0))
+        ve(lambda: weighted_sample_partition_indices(
+            items, [1, float("inf"), 0, 2, 5, 0], groups, 0))
+        ve(lambda: weighted_sample_partition_indices(
+            items, [Decimal("NaN"), 3, 0, 2, 5, 0], groups, 0))
+
+    # ------------------------------------------------------------------
+    # 断点创建
+    # ------------------------------------------------------------------
+    def test_checkpoint_state_is_json_native(self):
+        state = weighted_sample_partition_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, self.SEED, start=2)
+        self.assertEqual(state["version"], 1)
+        self.assertEqual(state["kind"], "partition")
+        self.assertEqual(state["start"], 2)
+        self.assertEqual(state["n"], len(self.ITEMS))
+        self.assertEqual(state["groups_count"], len(self.GROUP_SIZES))
+        self.assertEqual(state["groups_total"], sum(self.GROUP_SIZES))
+        # 整条无放回位置序列就是一次性序列, 零权重位置永不出现。
+        self.assertEqual(state["sequence"], self._flat_reference())
+        self.assertTrue(json.loads(json.dumps(state)) == state)
+
+    def test_checkpoint_start_marks_group_boundaries_only(self):
+        # 不同 start 只改边界, 不重抽: sequence 与随机结果相同。
+        states = [
+            weighted_sample_partition_checkpoint(
+                self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, self.SEED,
+                start=start)
+            for start in range(len(self.GROUP_SIZES) + 1)
+        ]
+        for state in states:
+            self.assertEqual(state["sequence"], self._flat_reference())
+
+    def test_checkpoint_start_validation(self):
+        te = lambda fn: self.assertRaises(TypeError, fn)
+        ve = lambda fn: self.assertRaises(ValueError, fn)
+        te(lambda: weighted_sample_partition_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, self.SEED, start=True))
+        te(lambda: weighted_sample_partition_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, self.SEED, start=1.0))
+        ve(lambda: weighted_sample_partition_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, self.SEED, start=-1))
+        ve(lambda: weighted_sample_partition_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, self.SEED,
+            start=len(self.GROUP_SIZES) + 1))
+
+    def test_checkpoint_at_end_of_plan(self):
+        end = weighted_sample_partition_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, self.SEED,
+            start=len(self.GROUP_SIZES))
+        self.assertEqual(end["start"], len(self.GROUP_SIZES))
+        groups, same = weighted_sample_partition_resume_indices(
+            self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, end, 0)
+        self.assertEqual(groups, [])
+        self.assertEqual(same, end)
+        with self.assertRaises(ValueError):
+            weighted_sample_partition_resume_indices(
+                self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, end, 1)
+
+    def test_checkpoint_zero_total_plan(self):
+        state = weighted_sample_partition_checkpoint(
+            self.ITEMS, [0] * len(self.ITEMS), [0, 0], seed=1)
+        self.assertEqual(state["sequence"], [])
+        self.assertEqual(state["groups_total"], 0)
+        groups, next_state = weighted_sample_partition_resume_indices(
+            self.ITEMS, [0] * len(self.ITEMS), [0, 0], state, 2)
+        self.assertEqual(groups, [[], []])
+        self.assertEqual(next_state["start"], 2)
+        self.assertEqual(next_state["sequence"], [])
+
+    def test_checkpoint_does_not_mutate_inputs(self):
+        items = list(self.ITEMS)
+        weights = list(self.WEIGHTS)
+        group_sizes = list(self.GROUP_SIZES)
+        weighted_sample_partition_checkpoint(
+            items, weights, group_sizes, self.SEED, start=3)
+        self.assertEqual(items, self.ITEMS)
+        self.assertEqual(weights, self.WEIGHTS)
+        self.assertEqual(group_sizes, self.GROUP_SIZES)
+
+    # ------------------------------------------------------------------
+    # 恢复: 与一次性分组区间逐项一致
+    # ------------------------------------------------------------------
+    def test_resume_window_equals_one_shot_slice(self):
+        full = self._full()
+        for start in range(len(self.GROUP_SIZES) + 1):
+            state = weighted_sample_partition_checkpoint(
+                self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, self.SEED,
+                start=start)
+            for draws in range(0, len(self.GROUP_SIZES) - start + 1):
+                with self.subTest(start=start, draws=draws):
+                    groups, next_state = (
+                        weighted_sample_partition_resume_indices(
+                            self.ITEMS, self.WEIGHTS, self.GROUP_SIZES,
+                            state, draws)
+                    )
+                    self.assertEqual(groups, full[start:start + draws])
+                    self.assertEqual(next_state["start"], start + draws)
+
+    def test_chained_resumes_equal_one_shot_run(self):
+        full = self._full()
+        state = weighted_sample_partition_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, self.SEED)
+        chunks = []
+        for draws in (1, 2, 0, 1, 0):
+            groups, state = weighted_sample_partition_resume_indices(
+                self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, state, draws)
+            chunks.extend(groups)
+        self.assertEqual(chunks, full)
+        self.assertEqual(state["start"], len(self.GROUP_SIZES))
+
+    def test_draws_zero_returns_empty_and_unchanged_state_copy(self):
+        state = weighted_sample_partition_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, self.SEED, start=2)
+        groups, next_state = weighted_sample_partition_resume_indices(
+            self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, state, 0)
+        self.assertEqual(groups, [])
+        self.assertEqual(next_state, state)
+        self.assertIsNot(next_state, state)
+
+    def test_resume_window_out_of_range_raises_value_error(self):
+        state = weighted_sample_partition_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, self.SEED, start=3)
+        with self.assertRaises(ValueError):
+            weighted_sample_partition_resume_indices(
+                self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, state, 2)
+
+    def test_value_resume_maps_positions_and_shares_next_state(self):
+        items = ["x", "y", "x", "z", "y", "q"]
+        state = weighted_sample_partition_checkpoint(
+            items, self.WEIGHTS, self.GROUP_SIZES, self.SEED, start=1)
+        value_groups, value_next = weighted_sample_partition_resume(
+            items, self.WEIGHTS, self.GROUP_SIZES, state, 3)
+        index_groups, index_next = (
+            weighted_sample_partition_resume_indices(
+                items, self.WEIGHTS, self.GROUP_SIZES, state, 3)
+        )
+        self.assertEqual(
+            value_groups,
+            [[items[i] for i in group] for group in index_groups],
+        )
+        self.assertEqual(value_next, index_next)
+        full = weighted_sample_partition(
+            items, self.WEIGHTS, self.GROUP_SIZES, self.SEED)
+        self.assertEqual(value_groups, full[1:])
+
+    def test_state_roundtrips_serialize_metrics(self):
+        state = weighted_sample_partition_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, self.SEED, start=1)
+        restored = deserialize_metrics(serialize_metrics(state))
+        full = self._full()
+        groups, next_state = weighted_sample_partition_resume_indices(
+            self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, restored, 2)
+        self.assertEqual(groups, full[1:3])
+        # 下一状态再做一次文本往返后仍可续接。
+        again, _ = weighted_sample_partition_resume_indices(
+            self.ITEMS, self.WEIGHTS, self.GROUP_SIZES,
+            deserialize_metrics(serialize_metrics(next_state)), 1)
+        self.assertEqual(again, full[3:])
+
+    def test_rng_words_keep_exact_decimal_integers(self):
+        big_weights = [10 ** 5000, 1, 2, 3, 0, 0]
+        state = weighted_sample_partition_checkpoint(
+            self.ITEMS, big_weights, [2, 1], seed=8, start=1)
+        restored = deserialize_metrics(serialize_metrics(state))
+        self.assertTrue(all(isinstance(x, int) for x in restored["sequence"]))
+        groups, _ = weighted_sample_partition_resume_indices(
+            self.ITEMS, big_weights, [2, 1], restored, 1)
+        self.assertEqual(
+            groups,
+            weighted_sample_partition_indices(
+                self.ITEMS, big_weights, [2, 1], 8)[1:],
+        )
+
+    def test_seed_types_resume_consistently(self):
+        for seed in (0, 1.5, -0.0, "s", b"b", bytearray([1]), True,
+                     float("nan")):
+            state = weighted_sample_partition_checkpoint(
+                self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, seed)
+            groups, _ = weighted_sample_partition_resume_indices(
+                self.ITEMS, self.WEIGHTS, self.GROUP_SIZES,
+                deserialize_metrics(serialize_metrics(state)),
+                len(self.GROUP_SIZES))
+            self.assertEqual(
+                groups,
+                weighted_sample_partition_indices(
+                    self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, seed),
+            )
+        # None 种子来自系统熵: 同一份快照无论恢复多少次都给出同一序列。
+        none_state = weighted_sample_partition_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, None)
+        payload = json.loads(json.dumps(none_state))
+        a, _ = weighted_sample_partition_resume_indices(
+            self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, payload, 4)
+        b, _ = weighted_sample_partition_resume_indices(
+            self.ITEMS, self.WEIGHTS, self.GROUP_SIZES,
+            json.loads(json.dumps(none_state)), 4)
+        self.assertEqual(a, b)
+
+    # ------------------------------------------------------------------
+    # 恢复: 状态类型 / 结构 / 摘要 / 输入绑定
+    # ------------------------------------------------------------------
+    def test_non_mapping_state_raises_type_error(self):
+        for bad in (None, [], "{}", 1, True, (), {1, 2}):
+            with self.subTest(bad=bad):
+                with self.assertRaises(TypeError):
+                    weighted_sample_partition_resume_indices(
+                        self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, bad, 1)
+
+    def test_draws_type_and_value_rules(self):
+        state = weighted_sample_partition_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, self.SEED)
+        for bad in (True, False, 1.0, "1", None, [1], 1 + 0j):
+            with self.subTest(bad=bad):
+                with self.assertRaises(TypeError):
+                    weighted_sample_partition_resume_indices(
+                        self.ITEMS, self.WEIGHTS, self.GROUP_SIZES,
+                        state, bad)
+        with self.assertRaises(ValueError):
+            weighted_sample_partition_resume_indices(
+                self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, state, -1)
+
+    def test_invalid_state_structure_raises_value_error(self):
+        import copy as _copy
+        state = weighted_sample_partition_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, self.SEED, start=1)
+
+        def ve(mutator):
+            bad = _copy.deepcopy(state)
+            mutator(bad)
+            with self.assertRaises(ValueError):
+                weighted_sample_partition_resume_indices(
+                    self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, bad, 1)
+
+        ve(lambda s: s.pop("version"))
+        ve(lambda s: s.pop("sequence"))
+        ve(lambda s: s.update(extra=1))
+        ve(lambda s: s.update(start=-1))
+        ve(lambda s: s.update(start=True))
+        ve(lambda s: s.update(n=-1))
+        ve(lambda s: s.update(groups_count=-1))
+        ve(lambda s: s.update(groups_total=-1))
+        ve(lambda s: s.update(kind="schedule"))
+        ve(lambda s: s.update(groups_digest=1))
+        ve(lambda s: s.update(seed=["z", 1]))
+        ve(lambda s: s.update(sequence="not-a-list"))
+        ve(lambda s: s.update(digest=1))
+
+    def test_unsupported_version_raises_value_error(self):
+        state = weighted_sample_partition_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, self.SEED)
+        for bad_version in (0, 2, 99, True, "1", 1.0):
+            bad = dict(state)
+            bad["version"] = bad_version
+            with self.subTest(bad_version=bad_version):
+                with self.assertRaises(ValueError):
+                    weighted_sample_partition_resume_indices(
+                        self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, bad, 1)
+
+    def test_state_mismatch_with_inputs_raises_value_error(self):
+        state = weighted_sample_partition_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, self.SEED, start=1)
+
+        def ve(label, i2, w2, g2):
+            with self.subTest(label=label):
+                with self.assertRaises(ValueError):
+                    weighted_sample_partition_resume_indices(
+                        i2, w2, g2, state, 1)
+
+        ve("group size differs", self.ITEMS, self.WEIGHTS, [2, 1, 0, 2])
+        ve("group count differs", self.ITEMS, self.WEIGHTS, [2, 1, 1])
+        ve("items differ", list("abcdeg"), self.WEIGHTS, self.GROUP_SIZES)
+        ve("weights differ", self.ITEMS, [1, 3, 0, 2, 6, 0],
+           self.GROUP_SIZES)
+        # 同值不同类型(1 -> 1.0)可能改变抽样计划, 必须视为不匹配。
+        ve("weight type swap", self.ITEMS, [1.0, 3, 0, 2, 5, 0],
+           self.GROUP_SIZES)
+
+    def test_tampered_fields_without_valid_digest_raise_value_error(self):
+        import copy as _copy
+        state = weighted_sample_partition_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, self.SEED, start=1)
+
+        def ve(mutator):
+            bad = _copy.deepcopy(state)
+            mutator(bad)
+            with self.assertRaises(ValueError):
+                weighted_sample_partition_resume_indices(
+                    self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, bad, 1)
+
+        ve(lambda s: s.update(start=s["start"] + 1))
+        ve(lambda s: s.update(groups_total=s["groups_total"] + 1))
+        ve(lambda s: s["sequence"].pop())
+        ve(lambda s: s.update(digest="0" * 64))
+        ve(lambda s: s.update(seed=["i", 123]))
+
+    def test_invalid_sequence_rejected_even_with_digest(self):
+        # 即使重算了绑定摘要, 越界 / 重复 / 零权重位置也必须统一抛
+        # ValueError —— 与其他断点对 RNG 快照的结构化范围校验同理。
+        import copy as _copy
+        from app import _partition_checkpoint_binding_digest
+        state = weighted_sample_partition_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, self.SEED)
+
+        def rehash(bad):
+            bad["digest"] = _partition_checkpoint_binding_digest(
+                bad["seed"], bad["start"], bad["n"], bad["groups_count"],
+                bad["groups_total"], bad["groups_digest"],
+                bad["items_digest"], bad["weights_digest"], bad["exact"],
+                bad["sequence"])
+
+        for mutator in (
+            lambda s: s["sequence"].__setitem__(0, 99),   # 越界
+            lambda s: s["sequence"].__setitem__(0, -1),   # 负位置
+            lambda s: s["sequence"].__setitem__(0, True), # 布尔
+            lambda s: s["sequence"].__setitem__(0, 2),    # 零权重位置
+            lambda s: s["sequence"].__setitem__(
+                1, s["sequence"][0]),                     # 重复位置
+        ):
+            bad = _copy.deepcopy(state)
+            mutator(bad)
+            rehash(bad)
+            with self.assertRaises(ValueError):
+                weighted_sample_partition_resume_indices(
+                    self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, bad, 1)
+
+    def test_other_kinds_of_checkpoint_state_rejected(self):
+        # 其他会话的状态不能用于分组恢复, 反之亦然。
+        partition_state = weighted_sample_partition_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, self.SEED, start=1)
+        fixed_state = weighted_sample_checkpoint(
+            self.ITEMS, self.WEIGHTS, sum(self.GROUP_SIZES), self.SEED,
+            start=1)
+        excluding_state = weighted_sample_excluding_checkpoint(
+            self.ITEMS, self.WEIGHTS, sum(self.GROUP_SIZES), (), self.SEED,
+            start=1)
+        schedule = [[1, 3, 0, 2, 5, 0]]
+        schedule_state = weighted_sample_schedule_checkpoint(
+            self.ITEMS, schedule, 2, self.SEED, start=0)
+        with self.assertRaises(ValueError):
+            weighted_sample_partition_resume_indices(
+                self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, fixed_state, 1)
+        with self.assertRaises(ValueError):
+            weighted_sample_partition_resume_indices(
+                self.ITEMS, self.WEIGHTS, self.GROUP_SIZES,
+                excluding_state, 1)
+        with self.assertRaises(ValueError):
+            weighted_sample_partition_resume_indices(
+                self.ITEMS, self.WEIGHTS, self.GROUP_SIZES,
+                schedule_state, 1)
+        with self.assertRaises(ValueError):
+            weighted_sample_resume_indices(
+                self.ITEMS, self.WEIGHTS, sum(self.GROUP_SIZES),
+                partition_state, 1)
+        with self.assertRaises(ValueError):
+            weighted_sample_excluding_resume_indices(
+                self.ITEMS, self.WEIGHTS, sum(self.GROUP_SIZES), (),
+                partition_state, 1)
+        with self.assertRaises(ValueError):
+            weighted_sample_schedule_resume_indices(
+                self.ITEMS, schedule, 2, partition_state, 1)
+
+    def test_value_entry_validates_inputs_before_mapping(self):
+        # 值入口先按分组入口校验 items/weights/group_sizes, 再要求 state
+        # 是映射并校验 draws —— 损坏的状态不能掩盖非法输入。
+        with self.assertRaises(TypeError):
+            weighted_sample_partition_resume(
+                "abcdef", self.WEIGHTS, self.GROUP_SIZES, "not-a-mapping", 1)
+        with self.assertRaises(ValueError):
+            weighted_sample_partition_resume(
+                self.ITEMS, self.WEIGHTS, [-1], "not-a-mapping", 1)
+        state = weighted_sample_partition_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, self.SEED)
+        with self.assertRaises(TypeError):
+            weighted_sample_partition_resume(
+                self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, [], 1)
+        with self.assertRaises(TypeError):
+            weighted_sample_partition_resume(
+                self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, state, True)
+
+    def test_no_groups_partially_returned_on_failure(self):
+        # 恢复窗口越界时即使能抽出前面的组, 也不返回部分结果。
+        state = weighted_sample_partition_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, self.SEED, start=3)
+        with self.assertRaises(ValueError):
+            weighted_sample_partition_resume_indices(
+                self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, state, 2)
+
+    def test_resume_does_not_mutate_inputs_or_state(self):
+        import copy as _copy
+        items = list(self.ITEMS)
+        weights = list(self.WEIGHTS)
+        group_sizes = list(self.GROUP_SIZES)
+        state = weighted_sample_partition_checkpoint(
+            items, weights, group_sizes, self.SEED, start=1)
+        state_snapshot = _copy.deepcopy(state)
+        weighted_sample_partition_resume_indices(
+            items, weights, group_sizes, state, 2)
+        self.assertEqual(items, self.ITEMS)
+        self.assertEqual(weights, self.WEIGHTS)
+        self.assertEqual(group_sizes, self.GROUP_SIZES)
+        self.assertEqual(state, state_snapshot)
 
 
 if __name__ == "__main__":
