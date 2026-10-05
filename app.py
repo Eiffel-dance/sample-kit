@@ -54,6 +54,19 @@
         与 weighted_sample_schedule_indices 同规则(同一套校验顺序与
         异常类别), 但每轮按相同索引返回元素值列表, 两个入口逐轮逐项
         对应。
+    weighted_sample_schedule_counts(items, weights_schedule, k, draws,
+        seed=0, start=0)
+        weighted_sample_schedule_indices 的批量频次入口: 接受与该入口
+        相同的参数语义与固定校验顺序, 按同一随机流(每轮同一权重行与
+        同一抽样计划)生成窗口内的轮次, 返回长度等于 items 的整数 list
+        counts, counts[i] 是零基区间 [start, start+draws) 中原始位置 i
+        被选中的次数(每轮无放回, 相等的元素值仍按不同位置分别累计)。
+        结果等于把 weighted_sample_schedule_indices 对应窗口的全部轮次
+        按位置摊平计数; start 只跳过前置完整轮次并保持窗口切片语义。
+        draws=0 或 k=0 返回全零列表(仍完成全部校验, k=0 不消耗随机流),
+        任何失败都不给出部分计数。计数为任意精度整数, 可直接交给
+        serialize_metrics 并经 deserialize_metrics 精确往返。不修改入参
+        与 weights_schedule。
     weighted_sample_k_schedule_indices(items, weights, k_schedule, draws,
         seed=0, start=0)
         按轮样本数计划的批量入口: k_schedule 是有限非文本序列, 成员均为
@@ -1047,6 +1060,62 @@ def weighted_sample_schedule(
         items, weights_schedule, k, draws, seed, start
     )
     return [[items[i] for i in round_indices] for round_indices in rounds]
+
+
+def weighted_sample_schedule_counts(
+    items, weights_schedule, k, draws, seed=0, start=0
+):
+    """weighted_sample_schedule_indices 的批量频次入口: 直接按原始零基
+    位置累计窗口内的选中次数, 免去调用方逐轮遍历。
+
+    接受与 weighted_sample_schedule_indices 完全相同的 items、
+    weights_schedule、k、draws、seed、start 语义与固定校验顺序, 按同一条
+    由 seed 初始化的随机流先生成(并跳过)start 个完整轮次, 再生成 draws
+    轮; 返回长度等于 items 的 list, counts[i] 即零基区间
+    [start, start+draws) 内位置 i 被选中的总次数(每轮无放回, 同一位置每轮
+    至多计一次; 相等的元素值仍按不同位置分别累计)。因此对相同输入, 本入口
+    与逐轮调用 weighted_sample_schedule_indices 后再按位置摊平计数逐项
+    一致 —— 同一随机流、每轮同一权重行与同一抽样计划; 首轮、后续轮次、
+    相同种子以及 k=0 的轮次的随机流消耗都与对应索引入口逐项对齐, start
+    只跳过前置完整轮次, 保持窗口切片语义。
+
+    draws=0 或 k=0 返回全零列表(k=0 的轮次不消耗随机流), 但仍完成全部
+    结构、权重与可行性校验; 任一行在 k>0 时正权重位置不足 k 个、行长不符、
+    窗口越界、负权重、NaN 或无穷权重都在返回列表前抛 TypeError /
+    ValueError。全部失败都不返回部分计数。计数为任意精度整数, 可直接交给
+    serialize_metrics 并经 deserialize_metrics 精确往返。不修改入参与
+    weights_schedule。
+    """
+    n = _validate_schedule_inputs(
+        items, weights_schedule, k, draws, seed, start
+    )
+
+    counts = [0] * n
+    # draws=0: 全部校验已在上面完成, 直接返回全零列表, 不消耗随机流。
+    if draws == 0:
+        return counts
+
+    rng = random.Random(seed)
+    # 与 weighted_sample_schedule_indices 完全相同的计划选择、跳过与生成
+    # 节奏: 窗口 [0, start+draws) 内每一轮(含被跳过的轮次)都按自己那一行
+    # 的权重选择抽样计划, 每轮复制一份权重, 绝不修改 schedule; k=0 的轮次
+    # 不消耗随机流(_draw_indices_once 以 k=0 空转), draws=0 已提前返回
+    # —— 计数入口与索引入口的随机流消耗因此逐项对齐。
+    plans = [
+        _select_sampling_plan(list(weights_schedule[j]), k)
+        for j in range(start + draws)
+    ]
+    if k > 0:
+        for j in range(start):
+            planned_weights, use_exact = plans[j]
+            _draw_indices_once(n, planned_weights, k, rng, use_exact)
+    for j in range(start, start + draws):
+        planned_weights, use_exact = plans[j]
+        for position in _draw_indices_once(
+            n, planned_weights, k, rng, use_exact
+        ):
+            counts[position] += 1
+    return counts
 
 
 # ---------------------------------------------------------------------------

@@ -14,6 +14,7 @@ from app import (
     weighted_sample_many_indices,
     weighted_sample_schedule,
     weighted_sample_schedule_indices,
+    weighted_sample_schedule_counts,
     weighted_sample_schedule_checkpoint,
     weighted_sample_schedule_resume_indices,
     weighted_sample_schedule_resume,
@@ -5749,6 +5750,305 @@ class WeightedSampleScheduleTest(unittest.TestCase):
             serialize_metrics({"n": 10 ** 100}),
             '{"n":1' + "0" * 100 + "}",
         )
+
+
+class WeightedSampleScheduleCountsTest(unittest.TestCase):
+    """按轮次变化权重的批量频次入口
+    weighted_sample_schedule_counts。"""
+
+    ITEMS = list("abcd")
+    SCHEDULE = [
+        [1, 2, 3, 4],
+        [4, 3, 2, 1],
+        [0, 1, 3, 5],
+        [10 ** 100, 1, 1, 1],
+        [Fraction(1, 3), 2, 0, 1],
+        [Decimal("1E-50"), 1, 1, 1],
+    ]
+
+    def _flat(self, k, draws, seed=0, start=0):
+        rounds = weighted_sample_schedule_indices(
+            self.ITEMS, self.SCHEDULE, k, draws, seed, start)
+        flat = [0] * len(self.ITEMS)
+        for rd in rounds:
+            for pos in rd:
+                flat[pos] += 1
+        return flat
+
+    def test_counts_equal_flattened_schedule_rounds(self):
+        # seed=None 由系统熵播种, 不参与跨调用逐轮一致性比较。
+        for seed in (0, 1, 42, -7, 1.5, "s", b"s", bytearray(b"s"), True):
+            for k in (0, 1, 2, 3):
+                for draws in range(0, 7):
+                    with self.subTest(seed=seed, k=k, draws=draws):
+                        self.assertEqual(
+                            weighted_sample_schedule_counts(
+                                self.ITEMS, self.SCHEDULE, k, draws, seed),
+                            self._flat(k, draws, seed),
+                        )
+
+    def test_seed_none_keeps_random_semantics(self):
+        counts = weighted_sample_schedule_counts(
+            self.ITEMS, self.SCHEDULE, 3, 6, None)
+        self.assertEqual(len(counts), len(self.ITEMS))
+        self.assertEqual(sum(counts), 6 * 3)
+
+    def test_counts_shape_and_total(self):
+        counts = weighted_sample_schedule_counts(
+            self.ITEMS, self.SCHEDULE, 3, 6, 42)
+        self.assertIsInstance(counts, list)
+        self.assertEqual(len(counts), len(self.ITEMS))
+        self.assertTrue(all(isinstance(c, int) for c in counts))
+        self.assertEqual(sum(counts), 6 * 3)
+
+    def test_start_window_matches_slice_of_full_run(self):
+        # start 只跳过前置完整轮次: 窗口计数与完整序列切片摊平一致。
+        full_rounds = weighted_sample_schedule_indices(
+            self.ITEMS, self.SCHEDULE, 2, 6, 99)
+        for start in range(6):
+            for draws in range(0, 6 - start + 1):
+                flat = [0] * len(self.ITEMS)
+                for rd in full_rounds[start:start + draws]:
+                    for pos in rd:
+                        flat[pos] += 1
+                with self.subTest(start=start, draws=draws):
+                    self.assertEqual(
+                        weighted_sample_schedule_counts(
+                            self.ITEMS, self.SCHEDULE, 2, draws, 99, start),
+                        flat,
+                    )
+
+    def test_identical_rows_match_plain_counts(self):
+        # 各行权重相同时与 weighted_sample_counts 同参调用逐项一致。
+        cases = [
+            (list("abcdef"), [1, 3, 2, 5, 0, 2], 4),
+            (list(range(20)), [10 ** 80 + i for i in range(20)], 10),
+            (["p", "q"], [0.5, 1.5], 2),
+            (list("xyz"), [Fraction(1, 3), 2, Decimal("0.5")], 2),
+            (list("ab"), [10 ** 400, 1], 1),
+        ]
+        for items, weights, k in cases:
+            for seed in (0, 7, 123):
+                for draws, start in ((5, 0), (3, 2), (1, 4), (0, 0)):
+                    schedule = [list(weights) for _ in range(start + draws)]
+                    with self.subTest(k=k, seed=seed, draws=draws, start=start):
+                        self.assertEqual(
+                            weighted_sample_schedule_counts(
+                                items, schedule, k, draws, seed, start),
+                            weighted_sample_counts(
+                                items, weights, k, draws, seed, start),
+                        )
+
+    def test_zero_weight_positions_never_counted(self):
+        schedule = [[0, 5, 0], [1, 0, 0], [0, 0, 7]]
+        for seed in range(50):
+            counts = weighted_sample_schedule_counts(
+                list("abc"), schedule, 1, 3, seed)
+            self.assertEqual(counts, [1, 1, 1])
+
+    def test_duplicate_values_distinct_positions(self):
+        items = [1, 1, 1]
+        schedule = [[1, 1, 1], [3, 2, 1]]
+        counts = weighted_sample_schedule_counts(
+            items, schedule, 3, 2, 123)
+        # 每轮三个位置全部入选, 每个位置恰好 2 次。
+        self.assertEqual(counts, [2, 2, 2])
+
+    def test_k_zero_and_draws_zero_return_zeros_after_validation(self):
+        schedule = [[0, 0], [1, 2], [0, 0]]
+        self.assertEqual(
+            weighted_sample_schedule_counts(["a", "b"], schedule, 0, 3, 5),
+            [0, 0],
+        )
+        self.assertEqual(
+            weighted_sample_schedule_counts(
+                ["a", "b"], schedule, 0, 2, 5, start=1),
+            [0, 0],
+        )
+        self.assertEqual(
+            weighted_sample_schedule_counts(
+                ["a", "b"], [[1, 2], [3, 4]], 2, 0, 0),
+            [0, 0],
+        )
+        # k=0 时权重全零的行也合法。
+        self.assertEqual(
+            weighted_sample_schedule_counts([], [[]], 0, 1, 0), [])
+        # draws=0 / k=0 仍完成全部校验。
+        with self.assertRaises(TypeError):
+            weighted_sample_schedule_counts("ab", [[1, 2]], 1, 0, 0)
+        with self.assertRaises(TypeError):
+            weighted_sample_schedule_counts(["a", "b"], "xx", 1, 0, 0)
+        with self.assertRaises(TypeError):
+            weighted_sample_schedule_counts(
+                ["a", "b"], [[1, "x"]], 1, 0, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_schedule_counts(["a", "b"], [[1]], 0, 0, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_schedule_counts(
+                ["a"], [[float("nan")]], 0, 0, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_schedule_counts(
+                ["a", "b"], [[1, 0]], 2, 0, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_schedule_counts(
+                ["a", "b"], [[1, 2]], 1, 0, 0, start=2)
+
+    def test_validation_matches_schedule_entry(self):
+        schedule = [[1, 2], [2, 1]]
+        # draws / start 必须是非布尔整数。
+        for bad in (True, False, 1.0, "2", None, [2], 1 + 0j):
+            with self.subTest(bad=bad):
+                with self.assertRaises(TypeError):
+                    weighted_sample_schedule_counts(
+                        ["a", "b"], schedule, 1, bad, 0)
+                with self.assertRaises(TypeError):
+                    weighted_sample_schedule_counts(
+                        ["a", "b"], schedule, 1, 1, 0, start=bad)
+        with self.assertRaises(ValueError):
+            weighted_sample_schedule_counts(
+                ["a", "b"], schedule, 1, -1, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_schedule_counts(
+                ["a", "b"], schedule, 1, 1, 0, start=-1)
+        # 窗口越界。
+        with self.assertRaises(ValueError):
+            weighted_sample_schedule_counts(
+                ["a", "b"], schedule, 1, 3, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_schedule_counts(
+                ["a", "b"], schedule, 1, 1, 0, start=2)
+        # 结构错误。
+        for bad_schedule in (
+            "not a schedule",
+            b"bytes",
+            {0: [1, 2]},
+            {(1, 2)},
+            (w for w in [[1, 2]]),
+            [[1, 2], "row"],
+            [[1, 2], None],
+        ):
+            with self.assertRaises(TypeError):
+                weighted_sample_schedule_counts(
+                    ["a", "b"], bad_schedule, 1, 1, 0)
+        # 行长不符。
+        with self.assertRaises(ValueError):
+            weighted_sample_schedule_counts(
+                ["a", "b"], [[1, 2], [1, 2, 3]], 1, 2, 0)
+        # 权重成员类型错误。
+        with self.assertRaises(TypeError):
+            weighted_sample_schedule_counts(
+                ["a", "b"], [[1, True]], 1, 1, 0)
+        with self.assertRaises(TypeError):
+            weighted_sample_schedule_counts(
+                ["a", "b"], [[1, None]], 1, 1, 0)
+        # 权重取值错误(窗口外的行同样校验)。
+        for bad_schedule in (
+            [[1, -1], [1, 1]],
+            [[1, 1], [1, -1]],
+            [[1, float("nan")], [1, 1]],
+            [[1, 1], [float("inf"), 1]],
+            [[Decimal("NaN"), 1], [1, 1]],
+            [[Fraction(-1, 2), 1], [1, 1]],
+        ):
+            with self.assertRaises(ValueError):
+                weighted_sample_schedule_counts(
+                    ["a", "b"], bad_schedule, 1, 1, 0)
+        # 任一行(含窗口外行)正权重不足 k 个。
+        with self.assertRaises(ValueError):
+            weighted_sample_schedule_counts(
+                ["a", "b"], [[1, 0], [1, 1]], 2, 1, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_schedule_counts(
+                ["a", "b"], [[1, 1], [1, 0]], 2, 1, 0)
+        # k / seed 沿用既有规则。
+        with self.assertRaises(TypeError):
+            weighted_sample_schedule_counts(
+                ["a", "b"], schedule, True, 1, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_schedule_counts(
+                ["a", "b"], schedule, -1, 1, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_schedule_counts(
+                ["a", "b"], schedule, 3, 1, 0)
+        with self.assertRaises(TypeError):
+            weighted_sample_schedule_counts(
+                ["a", "b"], schedule, 1, 1, object())
+
+    def test_tiny_positive_weights_counted(self):
+        # 极小正权重保持候选资格: k=2 时每轮两位置都入选。
+        schedule = [
+            [Fraction(1, 10 ** 100), 1],
+            [Decimal("1E-100"), 1],
+        ]
+        counts = weighted_sample_schedule_counts(
+            ["x", "y"], schedule, 2, 2, 321)
+        self.assertEqual(counts, [2, 2])
+
+    def test_exact_path_counts_align_across_rows(self):
+        # 各行分别走浮点 / 纯整数路径时仍与摊平的索引入口逐项一致。
+        items = list("abcde")
+        schedule = [
+            [1, 0.5, 2, 1, 3],
+            [10 ** 400, 1, 1, 1, 1],
+            [Fraction(1, 3), 2, 0, 1, 1],
+            [Decimal("1E1000"), 1, 0, 2, 1],
+            [1, 2, 3, 4, 5],
+        ]
+        for k in (1, 2, 4):
+            for seed in (0, 42, -9):
+                for start in (0, 2):
+                    with self.subTest(k=k, seed=seed, start=start):
+                        self.assertEqual(
+                            weighted_sample_schedule_counts(
+                                items, schedule, k, 3, seed, start),
+                            self._flat_for(items, schedule, k, 3, seed, start),
+                        )
+
+    @staticmethod
+    def _flat_for(items, schedule, k, draws, seed, start):
+        rounds = weighted_sample_schedule_indices(
+            items, schedule, k, draws, seed, start)
+        flat = [0] * len(items)
+        for rd in rounds:
+            for pos in rd:
+                flat[pos] += 1
+        return flat
+
+    def test_inputs_not_mutated(self):
+        items = list("abc")
+        schedule = [[10 ** 100, 2, 3], [Fraction(1, 2), 0, 1],
+                    [Decimal("0.5"), 1, 1]]
+        items_snap = list(items)
+        schedule_snap = [list(row) for row in schedule]
+        weighted_sample_schedule_counts(items, schedule, 2, 3, 99)
+        weighted_sample_schedule_counts(items, schedule, 2, 2, -3, start=1)
+        self.assertEqual(items, items_snap)
+        self.assertEqual(schedule, schedule_snap)
+
+    def test_counts_serialize_exact_roundtrip(self):
+        # 计数是普通任意精度 int, 往返后数值与列表形状保持不变。
+        items = ["only", "skip"]
+        schedule = [[1, 0]] * 500
+        draws = 500
+        counts = weighted_sample_schedule_counts(
+            items, schedule, 1, draws, 0)
+        self.assertEqual(counts, [draws, 0])
+        text = serialize_metrics({"counts": counts})
+        self.assertNotIn("e", text.lower())
+        restored = deserialize_metrics(text)
+        self.assertEqual(restored, {"counts": [draws, 0]})
+        self.assertIsInstance(restored["counts"][0], int)
+        self.assertEqual(len(restored["counts"]), 2)
+
+    def test_deterministic_repeat_calls(self):
+        first = weighted_sample_schedule_counts(
+            self.ITEMS, self.SCHEDULE, 3, 6, 5)
+        for _ in range(4):
+            self.assertEqual(
+                weighted_sample_schedule_counts(
+                    self.ITEMS, self.SCHEDULE, 3, 6, 5),
+                first,
+            )
 
 
 class WeightedSampleScheduleCheckpointTest(unittest.TestCase):
