@@ -108,6 +108,40 @@
         计数。draws=0 返回全零列表(仍完成全部校验), 任何失败都不给出
         部分计数。计数为任意精度整数, 可直接交给 serialize_metrics 并经
         deserialize_metrics 精确往返。不修改入参与 k_schedule。
+    weighted_sample_plan_indices(items, weights_schedule, k_schedule, draws,
+        seed=0, start=0)
+        按轮权重与样本数联合计划的批量入口: weights_schedule 与
+        k_schedule 是等长的有限非文本序列, 前者每行与 items 等长, 后者
+        成员均为非布尔非负整数且不超过 items 长度; 第 start+j 轮(零基)
+        同时使用 weights_schedule[start+j] 的权重行与 k_schedule[start+j]
+        的样本数, 在位置中按权重无放回抽取。返回 draws 轮, 每轮是按抽样
+        先后排列的零基原始索引; 每轮从全部位置重新开始, 轮内无放回,
+        重复值按位置区分, 轮间恢复全部位置。所有轮共享由 seed 初始化的
+        一条随机流; start 只跳过完整轮次并消耗与从 0 生成时相同的随机流,
+        结果与 start=0 的完整调用按零基区间 [start, start+draws) 切片
+        逐项一致, 样本数为零的轮次返回空列表且不消耗随机流。权重各行
+        相同且计划各项都等于 k 时与 weighted_sample_many_indices 同参
+        完全一致。校验在返回任何轮次前完成: 两个计划或任一行结构非法、
+        计划成员类型错误抛 TypeError; 行长度不等于 items、计划成员为负
+        或超过位置数、两个计划不等长、窗口超出计划范围、负权重、NaN、
+        无穷权重, 或任一轮样本数超过对应行正权重位置数时抛 ValueError;
+        draws=0 仍完成全部校验并返回空列表。不修改入参与两个计划。
+    weighted_sample_plan(items, weights_schedule, k_schedule, draws, seed=0,
+        start=0)
+        与 weighted_sample_plan_indices 同规则(同一套校验顺序与异常
+        类别), 但每轮按相同索引返回元素值列表, 两个入口逐轮逐项对应。
+    weighted_sample_plan_counts(items, weights_schedule, k_schedule, draws,
+        seed=0, start=0)
+        weighted_sample_plan_indices 的批量频次入口: 接受与该入口相同的
+        参数语义与固定校验顺序, 按同一随机流(每轮同一权重行、同一样本数
+        与同一抽样计划)生成窗口内的轮次, 返回长度等于 items 的整数 list
+        counts, counts[i] 是零基区间 [start, start+draws) 中原始位置 i
+        被选中的次数(每轮无放回, 相等的元素值仍按不同位置分别累计)。
+        结果等于把 weighted_sample_plan_indices 对应窗口的全部轮次按
+        位置摊平计数。draws=0 返回全零列表(仍完成全部校验), 任何失败
+        都不给出部分计数。计数为任意精度整数, 可直接交给
+        serialize_metrics 并经 deserialize_metrics 精确往返。不修改入参
+        与两个计划。
     weighted_sample_k_schedule_checkpoint(items, weights, k_schedule,
         seed=0, start=0)
         创建按轮样本数计划采样会话的断点: 沿用 weighted_sample_k_schedule_
@@ -143,6 +177,43 @@
         weighted_sample_k_schedule_resume_indices 完全一致(同一套校验
         顺序与异常类别): 每轮按原始位置映射元素值(相同值的不同位置仍按
         位置区分), 返回的下一状态与按索引入口逐字段一致, 可互换续接,
+        也可经 serialize_metrics / deserialize_metrics 往返后继续恢复。
+    weighted_sample_plan_checkpoint(items, weights_schedule, k_schedule,
+        seed=0, start=0)
+        创建按轮权重与样本数联合计划采样会话的断点: 沿用
+        weighted_sample_plan_indices 的全部规则与固定校验顺序(items、
+        weights_schedule、k_schedule、seed、start; 两个计划均为有限非
+        文本序列且等长, 每个权重行与 items 等长, k_schedule 每项为非
+        布尔非负整数且不超过 items 长度, 权重接受 int/float/Fraction/
+        Decimal 并拒绝负数、NaN、无穷与错误结构, 任一轮样本数超过对应行
+        正权重位置数也拒绝), start 越过计划长度抛 ValueError; draws 恒按
+        0 处理, 创建时不产出轮次。校验通过后先完成 start 个完整轮次(被
+        跳过的第 j 轮按 weights_schedule[j] 的权重与 k_schedule[j] 的
+        样本数消耗同一条由 seed 初始化的随机流, 样本数为零的轮次不消耗
+        随机流), 再返回只含 JSON 原生值的状态映射; 状态绑定版本、kind、
+        position、n、计划长度、items / 完整 weights_schedule / 完整
+        k_schedule 指纹、标签化 seed、随机流快照与完整性摘要, 可直接
+        交给 serialize_metrics 落盘, 也可经 deserialize_metrics 还原
+        (甚至跨进程)后恢复。不修改入参与两个计划。
+    weighted_sample_plan_resume_indices(items, weights_schedule, k_schedule,
+        state, draws)
+        联合计划会话的按索引恢复入口: 传入与创建断点时相同的 items、
+        weights_schedule、k_schedule 与状态, 返回 (索引轮次列表, 下一
+        状态)。第一轮从断点位置开始, 逐轮等于一次性
+        weighted_sample_plan_indices 的零基区间 [pos, pos+draws);
+        多次连续续接与一次性生成逐项相同, 恢复时无需从头重放随机流。
+        draws 必须是非布尔非负整数(TypeError / ValueError), 恢复窗口
+        超出计划范围抛 ValueError; draws=0 返回空轮次与位置、随机状态
+        不变的状态副本, 样本数为零的轮次只推进 position 且不消耗随机流。
+        状态不是映射抛 TypeError; 字段缺失或未知、版本或 kind 不支持、
+        摘要或输入(items、完整 weights_schedule、完整 k_schedule)不
+        匹配统一抛 ValueError, 且绝不产生部分轮次。不修改入参与状态。
+    weighted_sample_plan_resume(items, weights_schedule, k_schedule, state,
+        draws)
+        联合计划会话的按元素值恢复入口, 规则与
+        weighted_sample_plan_resume_indices 完全一致(同一套校验顺序
+        与异常类别): 每轮按原始位置映射元素值(相同值的不同位置仍按位置
+        区分), 返回的下一状态与按索引入口逐字段一致, 可互换续接,
         也可经 serialize_metrics / deserialize_metrics 往返后继续恢复。
     weighted_sample_schedule_checkpoint(items, weights_schedule, k, seed=0,
         start=0)
@@ -1358,6 +1429,209 @@ def weighted_sample_k_schedule_counts(
         rng = random.Random(seed)
         plans = [
             _select_sampling_plan(pool_weights, k_schedule[j])
+            for j in range(start + draws)
+        ]
+        for j in range(start):
+            if k_schedule[j] > 0:
+                planned_weights, use_exact = plans[j]
+                _draw_indices_once(
+                    n, planned_weights, k_schedule[j], rng, use_exact
+                )
+        for j in range(start, start + draws):
+            if k_schedule[j] > 0:
+                planned_weights, use_exact = plans[j]
+                for position in _draw_indices_once(
+                    n, planned_weights, k_schedule[j], rng, use_exact
+                ):
+                    counts[position] += 1
+    return counts
+
+
+# ---------------------------------------------------------------------------
+# 按轮权重与样本数联合计划(每轮权重行与样本数都不同)
+# ---------------------------------------------------------------------------
+
+def _validate_plan_inputs(items, weights_schedule, k_schedule, draws, seed,
+                          start):
+    """联合计划入口共用的全部前置校验, 返回位置数 n。
+
+    校验顺序固定: 先 items、seed 的结构/类型(与既有采样入口同一套规则,
+    TypeError), 再 weights_schedule 及其每一行的结构(非文本且长度可确定
+    的序列, TypeError), 然后 k_schedule 的结构(有限非文本且长度可确定的
+    序列)与每个成员的类型(非布尔整数, TypeError), 最后 draws、start
+    (非布尔非负整数); 随后每一行长度与 items 一致、每个计划成员落在
+    [0, n] 内、两个计划等长、窗口 [start, start+draws) 不超出计划范围
+    (ValueError); 接着对每一行权重做与单轮入口完全相同的元素类型
+    (TypeError)与取值(ValueError)校验; 最后对每一轮做正权重可行性检查
+    (第 j 轮样本数 k_schedule[j] 超过第 j 行正权重位置数时抛 ValueError)。
+    全部校验在产生任何一轮之前完成, draws=0 也不例外; 不修改入参。
+    """
+    # ---- 1. 结构与参数类型 (TypeError) ----
+    if not _is_length_determinable_sequence(items):
+        raise TypeError("items must be a length-determinable sequence")
+    if not isinstance(seed, _SEED_TYPES):
+        raise TypeError("unsupported seed type: %s" % type(seed).__name__)
+    if not _is_length_determinable_sequence(weights_schedule):
+        raise TypeError(
+            "weights_schedule must be a length-determinable sequence"
+        )
+    for row in weights_schedule:
+        if not _is_length_determinable_sequence(row):
+            raise TypeError(
+                "weights_schedule rows must be length-determinable sequences"
+            )
+    if not _is_length_determinable_sequence(k_schedule):
+        raise TypeError("k_schedule must be a length-determinable sequence")
+    for member in k_schedule:
+        if isinstance(member, bool) or not isinstance(member, int):
+            raise TypeError(
+                "k_schedule members must be non-boolean integers"
+            )
+    _validate_draws(draws)
+    _validate_start(start)
+
+    # ---- 2. 行长度、计划成员取值、计划等长与窗口范围 (ValueError) ----
+    n = len(items)
+    for row in weights_schedule:
+        if len(row) != n:
+            raise ValueError("invalid sample size")
+    for member in k_schedule:
+        if member < 0 or member > n:
+            raise ValueError("invalid sample size")
+    if len(weights_schedule) != len(k_schedule):
+        raise ValueError("schedule length mismatch")
+    if start + draws > len(k_schedule):
+        raise ValueError("schedule window out of range")
+
+    # ---- 3. 每一行的权重元素类型与取值 (TypeError / ValueError) ----
+    for row in weights_schedule:
+        _validate_weight_elements(row)
+
+    # ---- 4. 每一轮的正权重可行性 (ValueError) ----
+    # 第 j 轮以 weights_schedule[j] 抽取 k_schedule[j] 个位置: 任一轮的
+    # 样本数超过对应行正权重位置数都在产生任何一轮之前确定抛 ValueError;
+    # 样本数为零的轮次始终合法。
+    for j, row in enumerate(weights_schedule):
+        if k_schedule[j] > _count_positive_weights(row):
+            raise ValueError("no positive weight")
+    return n
+
+
+def weighted_sample_plan_indices(items, weights_schedule, k_schedule, draws,
+                                 seed=0, start=0):
+    """按轮权重与样本数联合计划的批量入口: 第 j 轮同时使用
+    weights_schedule[start+j] 的权重行与 k_schedule[start+j] 的样本数。
+
+    weights_schedule 是有限非文本序列, 成员均为与 items 等长的权重序列;
+    k_schedule 是等长的有限非文本序列, 成员均为非布尔非负整数且不超过
+    items 长度。返回长度等于 draws 的外层 list, 每个元素是一轮按抽样先后
+    排列的零基原始索引。每轮都从全部原始位置重新开始(同一轮内位置最多
+    出现一次, 重复值按位置区分, 轮次之间允许再次选中同一位置); 所有轮次
+    共享同一个由 seed 初始化的随机流。权重各行相同且计划各项都等于 k 时,
+    与 weighted_sample_many_indices 同参调用逐轮逐项一致; 仅 k_schedule
+    各项都等于 k 时与 weighted_sample_schedule_indices 一致, 仅权重各行
+    相同时与 weighted_sample_k_schedule_indices 一致。
+
+    可选的 start(默认 0)表示先从该 seed 对应的轮次流开始跳过 start 个
+    完整轮次 —— 被跳过的第 j 轮同样按 weights_schedule[j] 的权重与
+    k_schedule[j] 的样本数消耗同一条确定性随机流, 不改变任何选择规则 ——
+    再生成 draws 轮; 结果与 start=0 的完整调用按零基区间
+    [start, start+draws) 切片逐项一致。样本数为零的轮次返回空列表且不
+    消耗随机流。
+
+    全部校验在返回任何轮次前完成: items、seed 沿用既有采样入口规则;
+    draws、start 必须是非布尔非负整数; weights_schedule / k_schedule 非
+    长度可确定的非文本序列、任一行不是同类序列、或任一计划成员不是非布尔
+    整数时抛 TypeError; 行长度与 items 不一致、计划成员为负或超过位置数、
+    两个计划不等长、窗口 [start, start+draws) 超出计划范围、负权重、
+    NaN、无穷权重, 或任一轮样本数超过对应行正权重位置数时抛 ValueError。
+    权重元素规则与既有入口相同(非布尔 int、有限非负 float、Fraction、
+    Decimal, 可混合; 零权重永不被选中; 超大整数、Fraction、Decimal 全程
+    不经过浮点)。draws=0 仍完成全部校验并返回空 list。seed=None 保留
+    现有随机语义。不修改入参与两个计划。
+    """
+    n = _validate_plan_inputs(
+        items, weights_schedule, k_schedule, draws, seed, start
+    )
+
+    # draws=0: 全部校验已在上面完成, 直接返回空结果, 不消耗随机流。
+    if draws == 0:
+        return []
+
+    rng = random.Random(seed)
+    # 窗口 [0, start+draws) 内每一轮(含被跳过的轮次)都按自己那一行的权重
+    # 与自己那一项的样本数选择抽样计划: 每轮复制一份权重, 绝不修改两个
+    # 计划; 被跳过的第 j 轮同样按第 j 轮的计划消耗随机流, 因此跳过 start
+    # 个完整轮次与从 0 生成时消耗的随机流完全相同。
+    plans = [
+        _select_sampling_plan(list(weights_schedule[j]), k_schedule[j])
+        for j in range(start + draws)
+    ]
+
+    # 先跳过 start 个完整轮次: 与完整序列消耗同一条确定性随机流。样本数
+    # 为零的轮次不消耗随机流, 无需空转 —— 与既有批量入口同一节奏。
+    for j in range(start):
+        if k_schedule[j] > 0:
+            planned_weights, use_exact = plans[j]
+            _draw_indices_once(
+                n, planned_weights, k_schedule[j], rng, use_exact
+            )
+
+    rounds = []
+    for j in range(start, start + draws):
+        planned_weights, use_exact = plans[j]
+        rounds.append(
+            _draw_indices_once(
+                n, planned_weights, k_schedule[j], rng, use_exact
+            )
+        )
+    return rounds
+
+
+def weighted_sample_plan(items, weights_schedule, k_schedule, draws, seed=0,
+                         start=0):
+    """weighted_sample_plan_indices 的元素值入口: 规则、校验顺序与异常
+    类别完全一致, 区别仅在于每轮按相同索引返回元素值列表; 两个入口逐轮
+    逐项对应(相同值的不同位置仍按位置独立处理)。
+    """
+    rounds = weighted_sample_plan_indices(
+        items, weights_schedule, k_schedule, draws, seed, start
+    )
+    return [[items[i] for i in round_indices] for round_indices in rounds]
+
+
+def weighted_sample_plan_counts(items, weights_schedule, k_schedule, draws,
+                                seed=0, start=0):
+    """weighted_sample_plan_indices 的批量频次入口: 直接按原始零基位置
+    累计窗口内的选中次数, 免去调用方逐轮遍历。
+
+    接受与 weighted_sample_plan_indices 完全相同的 items、
+    weights_schedule、k_schedule、draws、seed、start 语义与固定校验顺序,
+    按同一条由 seed 初始化的随机流先生成(并跳过)start 个完整轮次, 再生成
+    draws 轮; 返回长度等于 items 的 list, counts[i] 即零基区间
+    [start, start+draws) 内位置 i 被选中的总次数(每轮无放回, 同一位置
+    每轮至多计一次; 相等的元素值仍按不同位置分别累计)。因此对相同输入,
+    本入口与逐轮调用 weighted_sample_plan_indices 后再按位置摊平计数逐项
+    一致 —— 同一随机流、每轮同一权重行、同一样本数与同一抽样计划; 样本数
+    为零的轮次的随机流消耗与对应索引入口逐项对齐。
+
+    draws=0 返回全零列表(仍完成全部校验); 任一轮样本数超过对应行正权重
+    位置数时在返回列表前抛 ValueError。全部失败都不返回部分计数。计数为
+    任意精度整数, 可直接交给 serialize_metrics 并经 deserialize_metrics
+    精确往返。不修改入参与两个计划。
+    """
+    n = _validate_plan_inputs(
+        items, weights_schedule, k_schedule, draws, seed, start
+    )
+
+    counts = [0] * n
+    # 与 weighted_sample_plan_indices 完全相同的跳过与生成节奏: 样本数为
+    # 零的轮次不消耗随机流, draws=0 时跳过与否都不影响全零结果 —— 计数
+    # 入口与索引入口的随机流消耗因此逐项对齐。
+    if draws > 0:
+        rng = random.Random(seed)
+        plans = [
+            _select_sampling_plan(list(weights_schedule[j]), k_schedule[j])
             for j in range(start + draws)
         ]
         for j in range(start):
@@ -3214,6 +3488,347 @@ def weighted_sample_k_schedule_resume(items, weights, k_schedule, state,
     # 同一个已校验核心, 因此轮次内容、下一状态、异常类别与其逐项一致。
     index_rounds, next_state = _resume_k_schedule_rounds_indices(
         items, weights, k_schedule, state, draws
+    )
+    # 按每轮原始位置逐项映射为元素值: 相同值的不同位置各自独立映射,
+    # 轮内不重复位置这一性质随索引结果原样保留。只读取 items, 不修改入参。
+    rounds = [[items[i] for i in round_indices] for round_indices in index_rounds]
+    return rounds, next_state
+
+
+# ---------------------------------------------------------------------------
+# 可暂停 / 恢复的按轮权重与样本数联合计划采样会话
+# ---------------------------------------------------------------------------
+
+_PLAN_CHECKPOINT_KIND = "plan"
+
+
+def _plan_checkpoint_binding_digest(
+    seed_tagged, position, n, schedule_length, items_digest,
+    schedule_digest, k_schedule_digest, rng_payload,
+):
+    """把联合计划断点各字段绑定为一个防篡改摘要。
+
+    与 _checkpoint_binding_digest 同一构造(serialize_metrics 规范化后
+    sha256), 绑定标签 kind、position、n、计划长度、items / 完整
+    weights_schedule / 完整 k_schedule 的指纹、标签化 seed 与 RNG 快照:
+    任一字段被改动而不重算摘要时, 恢复都会在产出任何轮次前发现, 因此
+    长计划分段交接无需从头重放随机流。
+    """
+    return _hash_text(serialize_metrics({
+        "kind": _PLAN_CHECKPOINT_KIND,
+        "seed": seed_tagged,
+        "position": position,
+        "n": n,
+        "schedule_length": schedule_length,
+        "items_digest": items_digest,
+        "schedule_digest": schedule_digest,
+        "k_schedule_digest": k_schedule_digest,
+        "rng": rng_payload,
+    }))
+
+
+def _prepare_validated_plan_session(items, weights_schedule, k_schedule,
+                                    seed, start):
+    """联合计划断点入口共用的前置准备: 与批量入口一致的校验与跳轮。
+
+    以 draws=0 复用联合计划的全部前置校验(items、seed、两个计划的结构与
+    成员类型/取值、计划等长、窗口范围、每一行权重取值与每一轮的正权重
+    可行性), 因此创建断点不产出任何轮次却仍完成全部校验; 随后把随机流
+    推进到 "已完成 start 轮" 的位置 —— 被跳过的第 j 轮按
+    weights_schedule[j] 的权重与 k_schedule[j] 的样本数消耗同一条由
+    seed 初始化的随机流, 样本数为零的轮次不消耗随机流, 与一次性批量入口
+    的跳过节奏完全一致。返回 (n, rng); 每行权重都复制为本地计划, 绝不
+    修改入参与两个计划。
+    """
+    n = _validate_plan_inputs(
+        items, weights_schedule, k_schedule, 0, seed, start
+    )
+    rng = random.Random(seed)
+    # 只构造被跳过轮次的计划; 每行复制一份权重, 绝不修改 schedule。
+    for j in range(start):
+        member = k_schedule[j]
+        if member > 0:
+            planned_weights, use_exact = _select_sampling_plan(
+                list(weights_schedule[j]), member
+            )
+            _draw_indices_once(n, planned_weights, member, rng, use_exact)
+    return n, rng
+
+
+def weighted_sample_plan_checkpoint(items, weights_schedule, k_schedule,
+                                    seed=0, start=0):
+    """创建按轮权重与样本数联合计划采样会话的断点(只含 JSON 原生值的
+    状态映射)。
+
+    校验沿用 weighted_sample_plan_indices 的全部规则与固定顺序: items、
+    seed 与既有采样入口一致; weights_schedule 必须是有限非文本且长度可
+    确定的序列, 每个成员都是与 items 等长的同类序列; k_schedule 是等长
+    的有限非文本序列, 每个成员都是非布尔非负整数且不超过 items 长度;
+    权重元素继续接受非布尔 int、有限非负 float、Fraction、Decimal(可
+    混合, 超大整数、Fraction、Decimal 不经过浮点); 负数、NaN、无穷权重、
+    错误结构、两个计划不等长或任一轮样本数超过对应行正权重位置数一律
+    拒绝。draws 恒按 0 处理(本入口不产出轮次), start 必须是非布尔非负
+    整数且不越过计划长度(start == 计划长度允许, 表示整批已完成)。全部
+    校验在返回状态前完成, 失败不返回部分结果, 也不修改入参与两个计划。
+
+    校验通过后先完成 start 个完整轮次(第 j 轮按 weights_schedule[j] 的
+    权重与 k_schedule[j] 的样本数消耗同一条由 seed 初始化的随机流,
+    样本数为零的轮次不消耗随机流), 再返回当前位置与只含 JSON 原生值的
+    状态; 状态绑定版本、标签 kind、position、n、计划长度、items / 完整
+    weights_schedule / 完整 k_schedule 指纹、标签化 seed、随机流快照与
+    完整性摘要, 可直接交给 serialize_metrics 落盘, 也可经
+    deserialize_metrics 还原(甚至跨进程)后交给
+    weighted_sample_plan_resume_indices 恢复。
+    """
+    n, rng = _prepare_validated_plan_session(
+        items, weights_schedule, k_schedule, seed, start
+    )
+    seed_tagged = _seed_to_tagged_value(seed)
+    rng_payload = _rng_state_to_jsonable(rng.getstate())
+    items_digest = _items_fingerprint(items)
+    schedule_digest = _weights_schedule_fingerprint(weights_schedule)
+    k_schedule_digest = _k_schedule_fingerprint(k_schedule)
+    schedule_length = len(k_schedule)
+    state = {
+        "version": _CHECKPOINT_VERSION,
+        "kind": _PLAN_CHECKPOINT_KIND,
+        "position": start,
+        "n": n,
+        "schedule_length": schedule_length,
+        "items_digest": items_digest,
+        "schedule_digest": schedule_digest,
+        "k_schedule_digest": k_schedule_digest,
+        "seed": seed_tagged,
+        "rng": rng_payload,
+    }
+    state["digest"] = _plan_checkpoint_binding_digest(
+        seed_tagged, start, n, schedule_length, items_digest,
+        schedule_digest, k_schedule_digest, rng_payload,
+    )
+    return state
+
+
+def _validate_plan_checkpoint_state(state):
+    """校验联合计划断点状态本身的结构与版本, 返回规范化字段。
+
+    调用前须已确认 state 是映射(否则 TypeError 在外层抛出)。字段缺失、
+    未知(多余)字段、类型错误、非法取值、版本不支持、kind 不符等一切
+    结构问题统一抛 ValueError。
+    """
+    required = ("version", "kind", "position", "n", "schedule_length",
+                "items_digest", "schedule_digest", "k_schedule_digest",
+                "seed", "rng", "digest")
+    if not all(key in state for key in required):
+        raise ValueError("invalid checkpoint state: missing fields")
+    if set(state) != set(required):
+        raise ValueError("invalid checkpoint state: unexpected fields")
+
+    version = state["version"]
+    if (isinstance(version, bool) or not isinstance(version, int)
+            or version != _CHECKPOINT_VERSION):
+        raise ValueError("unsupported checkpoint version: %r" % (version,))
+    if state["kind"] != _PLAN_CHECKPOINT_KIND:
+        raise ValueError("invalid checkpoint state: unexpected kind")
+    position = state["position"]
+    n = state["n"]
+    schedule_length = state["schedule_length"]
+    for name, value in (("position", position), ("n", n),
+                        ("schedule_length", schedule_length)):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError("invalid checkpoint state: %s" % name)
+    for name in ("items_digest", "schedule_digest", "k_schedule_digest",
+                 "digest"):
+        if not isinstance(state[name], str):
+            raise ValueError("invalid checkpoint state: %s" % name)
+
+    # 状态可能经 serialize_metrics + deserialize_metrics 还原: 其中的
+    # Decimal 载荷先还原为创建时的等值 float, 再解码与核对摘要 —— 两条
+    # 文本路径(json / serialize_metrics)解析出的状态因此可互换恢复。
+    seed_payload = _normalize_checkpoint_numbers(state["seed"])
+    rng_payload = _normalize_checkpoint_numbers(state["rng"])
+
+    # 两个逆运算对内部结构问题统一抛 ValueError。
+    seed = _tagged_value_to_seed(seed_payload)
+    rng_state = _rng_state_from_jsonable(rng_payload)
+
+    # 绑定摘要: 任何对字段的篡改(position、kind、计划长度、seed、RNG
+    # 快照、指纹)若不附带重算的摘要, 都会在这里被发现 —— 因此恢复时
+    # 不必从头重放随机流。
+    expected_digest = _plan_checkpoint_binding_digest(
+        seed_payload, position, n, schedule_length,
+        state["items_digest"], state["schedule_digest"],
+        state["k_schedule_digest"], rng_payload,
+    )
+    if not hmac.compare_digest(expected_digest, state["digest"]):
+        raise ValueError("invalid checkpoint state: digest mismatch")
+    return (position, n, schedule_length, seed, rng_state, seed_payload)
+
+
+def _resume_plan_rounds_indices(items, weights_schedule, k_schedule, state,
+                                draws):
+    """两个联合计划恢复入口共用的已校验核心: 只产出索引轮次与下一状态。
+
+    调用约定与 _resume_rounds_indices 相同: 外层已确认 state 是映射并
+    校验过 draws。先用状态携带的 seed 按 weighted_sample_plan_indices 的
+    固定顺序完成 items、weights_schedule、k_schedule、窗口
+    [position, position+draws) 的全部校验(恢复窗口超出计划范围在此以
+    既有 ValueError 拒绝), 再核对状态与当前输入的绑定(n、计划长度、
+    items 指纹、完整 weights_schedule 指纹、完整 k_schedule 指纹); 任一
+    失败都在物化任何轮次之前抛出既有 TypeError / ValueError, JSON /
+    Decimal / random 层面的意外异常统一收敛为 ValueError。全部通过后
+    直接从 RNG 快照续接, 每轮按该行的权重与该轮的样本数重建确定性抽样
+    计划后抽样, 样本数为零的轮次产出空列表且不消耗随机流, 返回
+    (索引轮次, 下一状态); 不修改入参, 也不修改传入的状态映射与两个计划。
+    """
+    (position, state_n, schedule_length, seed, rng_state,
+     seed_payload) = _validate_plan_checkpoint_state(state)
+
+    # 与一次性批量入口同一套校验与窗口语义: draws/start 规则、行长度、
+    # 计划等长、成员取值、权重取值与每一轮可行性都在此确定;
+    # start=position、draws=draws 时窗口越界以 "schedule window out of
+    # range" 拒绝。
+    n = _validate_plan_inputs(
+        items, weights_schedule, k_schedule, draws, seed, position
+    )
+
+    # 状态与当前采样输入的一致性: 计划长度先比, 再逐项核对完整指纹。
+    if state_n != n:
+        raise ValueError("checkpoint state does not match items/schedules")
+    if schedule_length != len(k_schedule):
+        raise ValueError("checkpoint state does not match schedules")
+    if state["items_digest"] != _items_fingerprint(items):
+        raise ValueError("checkpoint state does not match items")
+    if state["schedule_digest"] != _weights_schedule_fingerprint(
+        weights_schedule
+    ):
+        raise ValueError("checkpoint state does not match weights schedule")
+    if state["k_schedule_digest"] != _k_schedule_fingerprint(k_schedule):
+        raise ValueError("checkpoint state does not match k_schedule")
+
+    # 全部校验通过后才物化轮次: 直接从快照状态继续。每轮的抽样计划由
+    # (该行权重, 该轮样本数) 唯一确定, 与创建断点及一次性入口算出的计划
+    # 逐轮相同, 因此恢复结果与 weighted_sample_plan_indices 的对应区间
+    # 逐轮一致。RNG 快照与 (seed, position) 的绑定已由状态摘要保证未被
+    # 篡改, 故恢复直接从快照继续, 无需从头重放。
+    rng = random.Random()
+    try:
+        rng.setstate(rng_state)
+    except ValueError:
+        raise
+    except Exception as exc:
+        # 结构与取值范围已在上游校验; 任何解释器层面的额外拒绝都统一成
+        # ValueError, 绝不泄漏其他异常类型, 也不会已产出部分轮次。
+        raise ValueError("invalid checkpoint RNG state") from exc
+    rounds = []
+    for j in range(position, position + draws):
+        member = k_schedule[j]
+        if member > 0:
+            planned_weights, use_exact = _select_sampling_plan(
+                list(weights_schedule[j]), member
+            )
+            rounds.append(
+                _draw_indices_once(n, planned_weights, member, rng, use_exact)
+            )
+        else:
+            # 样本数为零的轮次返回空列表且不消耗随机流。
+            rounds.append([])
+
+    next_state = dict(state)
+    next_rng_payload = _rng_state_to_jsonable(rng.getstate())
+    next_position = position + draws
+    next_state["position"] = next_position
+    next_state["rng"] = next_rng_payload
+    # seed 载荷使用校验时规范化后的形式: 经 deserialize_metrics 还原的
+    # 状态其 Decimal 已回到等值 float, 下一状态因此与 JSON 原生状态链
+    # 逐字段一致, 可继续经任一文本路径序列化/解析后再恢复。
+    next_state["seed"] = seed_payload
+    # 摘要必须随 position / RNG 一并刷新, 否则链式再恢复时会因摘要失配
+    # 而失败(其余字段与原状态相同)。
+    next_state["digest"] = _plan_checkpoint_binding_digest(
+        seed_payload, next_position, n, schedule_length,
+        state["items_digest"], state["schedule_digest"],
+        state["k_schedule_digest"], next_rng_payload,
+    )
+    return rounds, next_state
+
+
+def weighted_sample_plan_resume_indices(items, weights_schedule, k_schedule,
+                                        state, draws):
+    """从联合计划断点继续产出索引轮次, 返回 (轮次列表, 下一状态)。
+
+    第一轮从断点记录的位置开始; 逐轮结果与
+    weighted_sample_plan_indices(items, weights_schedule, k_schedule,
+    draws, seed, start=position) 完全一致, 即等于一次性批量序列的零基
+    区间 [position, position+draws); 多次连续续接与一次性生成逐项相同,
+    恢复时无需从头重放随机流。返回前完成与联合计划批量入口一致的全部
+    输入校验(含恢复窗口不超出计划范围), 并核对状态与 items、完整
+    weights_schedule、完整 k_schedule 及 (seed, 位置, RNG 快照) 的
+    自洽性: 状态不是映射抛 TypeError; 字段缺失或未知、版本或 kind 不
+    支持、摘要或输入不匹配统一抛 ValueError; items / weights_schedule /
+    k_schedule / draws 的错误沿用既有 TypeError / ValueError。所有失败
+    都在任何轮次物化之前确定, 绝不返回部分轮次。draws=0 返回空轮次与
+    位置不变的新状态; 样本数为零的轮次返回空列表, 位置仍逐轮加一且不
+    消耗随机流。状态可经 serialize_metrics / deserialize_metrics 往返后
+    继续恢复。不修改入参, 也不修改传入的状态映射与两个计划。
+    """
+    # 状态不是映射: TypeError(文档约定的明确分类)。映射前提下的一切
+    # 结构/版本/摘要问题在 _validate_plan_checkpoint_state 中统一为
+    # ValueError。
+    if not isinstance(state, collections.abc.Mapping):
+        raise TypeError("checkpoint state must be a mapping")
+    # draws 的类型/取值规则独立于状态, 先按既有规则校验(TypeError /
+    # ValueError), 再解析状态。
+    _validate_draws(draws)
+    return _resume_plan_rounds_indices(
+        items, weights_schedule, k_schedule, state, draws
+    )
+
+
+def weighted_sample_plan_resume(items, weights_schedule, k_schedule, state,
+                                draws):
+    """按元素值从联合计划断点继续, 返回 (元素值轮次列表, 下一状态)。
+
+    校验顺序按恢复入口约定固定: 调用开始先按现有联合计划入口完成
+    items、weights_schedule、k_schedule 的结构、成员类型/取值、计划等长、
+    权重取值与每一轮正权重可行性校验(这部分与 seed 无关, 以合法种子 0
+    试跑; state 携带的 seed 其标签化编码随后随 state 一并校验), 再按
+    现有恢复入口校验 state 的映射类型、版本、kind、字段集合、摘要、
+    随机数状态以及 state 与当前输入的绑定(含恢复窗口范围), draws 必须是
+    非布尔非负整数。状态不是映射抛 TypeError; 非法状态、版本或 kind 不
+    支持、状态与输入不匹配、正权重不足或恢复窗口超出计划范围等一律抛
+    ValueError; 其余输入错误沿用既有 TypeError / ValueError。所有失败
+    都在产生任何轮次之前确定, JSON / Decimal / random 的异常不会以其他
+    类型泄漏。
+
+    每轮返回元素值列表, 与 weighted_sample_plan_resume_indices 返回的
+    每轮原始位置逐项对应(第 j 个值恰为 items[第 j 个索引]): 相同值的
+    不同位置分别消耗, 轮内不会出现重复位置。返回的下一状态与按索引入口
+    产出的完全相同(position、RNG 快照、digest 一致), 只含 JSON 原生值,
+    可直接再次传入本入口或按索引入口, 或经 serialize_metrics /
+    deserialize_metrics 往返后继续恢复。draws=0 返回空轮次与位置、随机
+    状态不变的状态副本; 样本数为零的轮次生成空列表并按轮数推进
+    position, 不消耗随机流。不修改入参, 也不修改传入的状态映射与两个
+    计划。
+    """
+    # 第一步: 先按现有联合计划入口完成 items、weights_schedule、
+    # k_schedule 的结构、成员类型/取值、权重取值与可行性校验(draws/start
+    # 以 0 试跑, 窗口必然合法)。这些检查只用到 seed 的类型, 与 state 中
+    # seed 的具体值无关; 因此即使 state 本身已损坏, 非法
+    # items/weights_schedule/k_schedule 仍优先以联合计划入口的异常类别
+    # 报告。
+    _validate_plan_inputs(items, weights_schedule, k_schedule, 0, 0, 0)
+
+    # 第二步: 恢复入口的映射类型检查与 draws 规则(TypeError / ValueError)。
+    if not isinstance(state, collections.abc.Mapping):
+        raise TypeError("checkpoint state must be a mapping")
+    _validate_draws(draws)
+
+    # 第三步: 状态结构/版本/kind/字段/摘要/RNG、state 与输入绑定(含从
+    # 状态解出的 seed 再跑一次完整联合计划校验与窗口检查), 全部通过后从
+    # RNG 快照续接产出索引轮次。与按索引入口共用同一个已校验核心, 因此
+    # 轮次内容、下一状态、异常类别与其逐项一致。
+    index_rounds, next_state = _resume_plan_rounds_indices(
+        items, weights_schedule, k_schedule, state, draws
     )
     # 按每轮原始位置逐项映射为元素值: 相同值的不同位置各自独立映射,
     # 轮内不重复位置这一性质随索引结果原样保留。只读取 items, 不修改入参。

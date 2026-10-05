@@ -25,6 +25,12 @@ from app import (
     weighted_sample_k_schedule_checkpoint,
     weighted_sample_k_schedule_resume_indices,
     weighted_sample_k_schedule_resume,
+    weighted_sample_plan_indices,
+    weighted_sample_plan,
+    weighted_sample_plan_counts,
+    weighted_sample_plan_checkpoint,
+    weighted_sample_plan_resume_indices,
+    weighted_sample_plan_resume,
     weighted_sample_partition_indices,
     weighted_sample_partition,
     weighted_sample_partition_checkpoint,
@@ -7546,6 +7552,522 @@ class WeightedSamplePartitionTest(unittest.TestCase):
         self.assertEqual(items, self.ITEMS)
         self.assertEqual(weights, self.WEIGHTS)
         self.assertEqual(group_sizes, self.GROUP_SIZES)
+        self.assertEqual(state, state_snapshot)
+
+
+class WeightedSamplePlanTest(unittest.TestCase):
+    """按轮权重与样本数联合计划的批量入口:
+    weighted_sample_plan_indices / weighted_sample_plan /
+    weighted_sample_plan_counts。"""
+
+    ITEMS = list("aabbcc")
+    WEIGHTS_SCHEDULE = [
+        [1, 2, 3, 0, 1, 2],
+        [2, 2, 2, 2, 2, 2],
+        [Fraction(1, 2), 1, 0, 3, 2, 1],
+        [1, 1, 1, 1, 1, 1],
+        [Decimal("0.5"), 2, 1, 0, 1, 3],
+    ]
+    K_SCHEDULE = [2, 0, 3, 1, 2]
+    SEED = 7
+
+    def _full(self):
+        return weighted_sample_plan_indices(
+            self.ITEMS, self.WEIGHTS_SCHEDULE, self.K_SCHEDULE,
+            len(self.K_SCHEDULE), self.SEED)
+
+    def test_outer_shape_and_round_lengths(self):
+        rounds = self._full()
+        self.assertEqual(len(rounds), len(self.K_SCHEDULE))
+        for j, round_indices in enumerate(rounds):
+            self.assertEqual(len(round_indices), self.K_SCHEDULE[j])
+            self.assertEqual(len(set(round_indices)), len(round_indices))
+            for position in round_indices:
+                self.assertIn(position, range(len(self.ITEMS)))
+
+    def test_zero_weight_never_chosen_and_zero_k_round_empty(self):
+        rounds = self._full()
+        # 第 0 行位置 3 权重为零, 永不入选; 第 1 轮样本数为零, 为空列表。
+        for position in rounds[0]:
+            self.assertNotEqual(position, 3)
+        self.assertEqual(rounds[1], [])
+
+    def test_values_entry_corresponds_round_by_round(self):
+        index_rounds = self._full()
+        value_rounds = weighted_sample_plan(
+            self.ITEMS, self.WEIGHTS_SCHEDULE, self.K_SCHEDULE,
+            len(self.K_SCHEDULE), self.SEED)
+        self.assertEqual(
+            value_rounds,
+            [[self.ITEMS[i] for i in round_indices]
+             for round_indices in index_rounds],
+        )
+
+    def test_duplicate_values_distinct_positions(self):
+        rounds = weighted_sample_plan_indices(
+            ["x", "x", "x"], [[1, 1, 1]] * 3, [3, 3, 3], 3, seed=5)
+        for round_indices in rounds:
+            self.assertEqual(sorted(round_indices), [0, 1, 2])
+
+    def test_start_equals_slice_of_full_run(self):
+        full = self._full()
+        for start in range(len(self.K_SCHEDULE) + 1):
+            for draws in range(0, len(self.K_SCHEDULE) - start + 1):
+                with self.subTest(start=start, draws=draws):
+                    self.assertEqual(
+                        weighted_sample_plan_indices(
+                            self.ITEMS, self.WEIGHTS_SCHEDULE,
+                            self.K_SCHEDULE, draws, self.SEED, start),
+                        full[start:start + draws],
+                    )
+
+    def test_same_seed_same_result(self):
+        self.assertEqual(self._full(), self._full())
+
+    def test_uniform_plan_matches_fixed_entries(self):
+        # 权重各行相同且计划各项都等于 k 时, 与固定权重批量入口逐轮一致。
+        uniform_rows = [[1, 2, 3, 0, 1, 2]] * 4
+        uniform_ks = [2] * 4
+        self.assertEqual(
+            weighted_sample_plan_indices(
+                self.ITEMS, uniform_rows, uniform_ks, 4, seed=3),
+            weighted_sample_many_indices(
+                self.ITEMS, uniform_rows[0], 2, 4, seed=3),
+        )
+
+    def test_constant_k_matches_weights_schedule_entry(self):
+        uniform_ks = [2] * len(self.K_SCHEDULE)
+        self.assertEqual(
+            weighted_sample_plan_indices(
+                self.ITEMS, self.WEIGHTS_SCHEDULE, uniform_ks,
+                len(uniform_ks), self.SEED),
+            weighted_sample_schedule_indices(
+                self.ITEMS, self.WEIGHTS_SCHEDULE, 2,
+                len(uniform_ks), self.SEED),
+        )
+
+    def test_constant_rows_matches_k_schedule_entry(self):
+        uniform_rows = [[1, 2, 3, 0, 1, 2]] * len(self.K_SCHEDULE)
+        self.assertEqual(
+            weighted_sample_plan_indices(
+                self.ITEMS, uniform_rows, self.K_SCHEDULE,
+                len(self.K_SCHEDULE), self.SEED),
+            weighted_sample_k_schedule_indices(
+                self.ITEMS, uniform_rows[0], self.K_SCHEDULE,
+                len(self.K_SCHEDULE), self.SEED),
+        )
+
+    def test_counts_match_flattened_index_rounds(self):
+        full = self._full()
+        for start in range(len(self.K_SCHEDULE) + 1):
+            for draws in range(0, len(self.K_SCHEDULE) - start + 1):
+                with self.subTest(start=start, draws=draws):
+                    counts = weighted_sample_plan_counts(
+                        self.ITEMS, self.WEIGHTS_SCHEDULE,
+                        self.K_SCHEDULE, draws, self.SEED, start)
+                    flat = [0] * len(self.ITEMS)
+                    for round_indices in full[start:start + draws]:
+                        for position in round_indices:
+                            flat[position] += 1
+                    self.assertEqual(counts, flat)
+
+    def test_counts_are_exact_integers_and_serialize_roundtrip(self):
+        counts = weighted_sample_plan_counts(
+            self.ITEMS, self.WEIGHTS_SCHEDULE, self.K_SCHEDULE,
+            len(self.K_SCHEDULE), self.SEED)
+        self.assertTrue(all(isinstance(c, int) for c in counts))
+        self.assertEqual(
+            deserialize_metrics(serialize_metrics(counts)), counts)
+
+    def test_draws_zero_returns_empty_after_full_validation(self):
+        self.assertEqual(
+            weighted_sample_plan_indices(
+                self.ITEMS, self.WEIGHTS_SCHEDULE, self.K_SCHEDULE,
+                0, self.SEED), [])
+        self.assertEqual(
+            weighted_sample_plan(
+                self.ITEMS, self.WEIGHTS_SCHEDULE, self.K_SCHEDULE,
+                0, self.SEED), [])
+        self.assertEqual(
+            weighted_sample_plan_counts(
+                self.ITEMS, self.WEIGHTS_SCHEDULE, self.K_SCHEDULE,
+                0, self.SEED),
+            [0] * len(self.ITEMS))
+        # draws=0 仍完成全部校验。
+        with self.assertRaises(ValueError):
+            weighted_sample_plan_indices(
+                self.ITEMS, self.WEIGHTS_SCHEDULE, self.K_SCHEDULE,
+                0, self.SEED, len(self.K_SCHEDULE) + 1)
+        with self.assertRaises(TypeError):
+            weighted_sample_plan_indices(
+                self.ITEMS, self.WEIGHTS_SCHEDULE,
+                [True] * len(self.K_SCHEDULE), 0, self.SEED)
+        with self.assertRaises(ValueError):
+            weighted_sample_plan_counts(
+                self.ITEMS, [[0] * len(self.ITEMS)] * len(self.K_SCHEDULE),
+                [1] * len(self.K_SCHEDULE), 0, self.SEED)
+
+    def test_structure_errors_raise_type_error(self):
+        ws = self.WEIGHTS_SCHEDULE
+        ks = self.K_SCHEDULE
+        with self.assertRaises(TypeError):
+            weighted_sample_plan_indices("aabbcc", ws, ks, 1)
+        with self.assertRaises(TypeError):
+            weighted_sample_plan_indices(self.ITEMS, "not-seq", ks, 1)
+        with self.assertRaises(TypeError):
+            weighted_sample_plan_indices(self.ITEMS, [1, 2], ks[:2], 1)
+        with self.assertRaises(TypeError):
+            weighted_sample_plan_indices(self.ITEMS, ws, "ks", 1)
+        with self.assertRaises(TypeError):
+            weighted_sample_plan_indices(self.ITEMS, ws, [1.5] * 5, 1)
+        with self.assertRaises(TypeError):
+            weighted_sample_plan_indices(self.ITEMS, ws, [True] * 5, 1)
+        with self.assertRaises(TypeError):
+            weighted_sample_plan_indices(self.ITEMS, ws, ks, 1.5)
+        with self.assertRaises(TypeError):
+            weighted_sample_plan_indices(self.ITEMS, ws, ks, True)
+        with self.assertRaises(TypeError):
+            weighted_sample_plan_indices(self.ITEMS, ws, ks, 1, 0, 1.5)
+        with self.assertRaises(TypeError):
+            weighted_sample_plan_indices(self.ITEMS, ws, ks, 1, object())
+        with self.assertRaises(TypeError):
+            weighted_sample_plan_indices(
+                self.ITEMS, [[True] * 6] * 5, ks, 1)
+        with self.assertRaises(TypeError):
+            weighted_sample_plan_indices(
+                self.ITEMS, [["x"] * 6] * 5, ks, 1)
+
+    def test_value_errors(self):
+        ws = self.WEIGHTS_SCHEDULE
+        ks = self.K_SCHEDULE
+        n = len(self.ITEMS)
+        # 负 draws / 负 start / 窗口越界。
+        with self.assertRaises(ValueError):
+            weighted_sample_plan_indices(self.ITEMS, ws, ks, -1)
+        with self.assertRaises(ValueError):
+            weighted_sample_plan_indices(self.ITEMS, ws, ks, 1, 0, -1)
+        with self.assertRaises(ValueError):
+            weighted_sample_plan_indices(self.ITEMS, ws, ks, len(ks) + 1)
+        with self.assertRaises(ValueError):
+            weighted_sample_plan_indices(self.ITEMS, ws, ks, 2, 0, len(ks) - 1)
+        # 两个计划不等长。
+        with self.assertRaises(ValueError):
+            weighted_sample_plan_indices(self.ITEMS, ws, ks + [1], 1)
+        with self.assertRaises(ValueError):
+            weighted_sample_plan_indices(self.ITEMS, ws + [ws[0]], ks, 1)
+        # 行长度不等于 items。
+        with self.assertRaises(ValueError):
+            weighted_sample_plan_indices(self.ITEMS, [[1, 2]] * 5, ks, 1)
+        # 计划成员为负或超过位置数。
+        with self.assertRaises(ValueError):
+            weighted_sample_plan_indices(self.ITEMS, ws, [-1] * 5, 1)
+        with self.assertRaises(ValueError):
+            weighted_sample_plan_indices(self.ITEMS, ws, [n + 1] * 5, 1)
+        # 负权重 / NaN / 无穷。
+        with self.assertRaises(ValueError):
+            weighted_sample_plan_indices(self.ITEMS, [[-1] * n] * 5, ks, 1)
+        with self.assertRaises(ValueError):
+            weighted_sample_plan_indices(
+                self.ITEMS, [[float("nan")] * n] * 5, ks, 1)
+        with self.assertRaises(ValueError):
+            weighted_sample_plan_indices(
+                self.ITEMS, [[float("inf")] * n] * 5, ks, 1)
+        # 对应轮正权重不足。
+        with self.assertRaises(ValueError):
+            weighted_sample_plan_indices(
+                self.ITEMS, [[0] * n] * 5, [1, 0, 0, 0, 0], 1)
+        with self.assertRaises(ValueError):
+            weighted_sample_plan_indices(
+                self.ITEMS, [[1, 0, 0, 0, 0, 0]] * 5, [2, 0, 0, 0, 0], 1)
+
+    def test_zero_k_rounds_do_not_consume_rng(self):
+        import random as _random
+        fresh = app._rng_state_to_jsonable(_random.Random(11).getstate())
+        # 全零样本数计划: 跳轮不消耗随机流, 结果与从 0 生成的切片一致。
+        zero_ks = [0] * 5
+        full = weighted_sample_plan_indices(
+            self.ITEMS, self.WEIGHTS_SCHEDULE, zero_ks, 5, seed=11)
+        self.assertEqual(full, [[]] * 5)
+        shifted = weighted_sample_plan_indices(
+            self.ITEMS, self.WEIGHTS_SCHEDULE, zero_ks, 2, seed=11, start=3)
+        self.assertEqual(shifted, [[]] * 2)
+        # 对照: 全零计划下断点的 RNG 快照与全新随机流一致(见断点测试)。
+        self.assertIsNotNone(fresh)
+
+    def test_inputs_not_mutated(self):
+        items = list(self.ITEMS)
+        ws = [list(row) for row in self.WEIGHTS_SCHEDULE]
+        ks = list(self.K_SCHEDULE)
+        weighted_sample_plan_indices(items, ws, ks, len(ks), self.SEED)
+        weighted_sample_plan(items, ws, ks, len(ks), self.SEED)
+        weighted_sample_plan_counts(items, ws, ks, len(ks), self.SEED)
+        self.assertEqual(items, self.ITEMS)
+        self.assertEqual(ws, [list(row) for row in self.WEIGHTS_SCHEDULE])
+        self.assertEqual(ks, self.K_SCHEDULE)
+
+    def test_fraction_decimal_and_huge_integer_weights(self):
+        items = list("abcd")
+        ws = [
+            [Fraction(1, 10**100), 1, 0, 2],
+            [Decimal("1E-100"), 1, 1, 0],
+            [10**400, 1, 1, 1],
+        ]
+        ks = [1, 2, 3]
+        rounds = weighted_sample_plan_indices(items, ws, ks, 3, seed=9)
+        self.assertEqual(rounds, weighted_sample_plan_indices(
+            items, ws, ks, 3, seed=9))
+        for j, round_indices in enumerate(rounds):
+            self.assertEqual(len(round_indices), ks[j])
+        # 微小正权重位置仍保留候选资格: 精确路径下零权重位置绝不出现。
+        for position in rounds[0]:
+            self.assertNotEqual(position, 2)
+
+
+class WeightedSamplePlanCheckpointTest(unittest.TestCase):
+    """按轮权重与样本数联合计划的可暂停 / 恢复会话:
+    weighted_sample_plan_checkpoint /
+    weighted_sample_plan_resume_indices /
+    weighted_sample_plan_resume。"""
+
+    ITEMS = list("aabbcc")
+    WEIGHTS_SCHEDULE = [
+        [1, 2, 3, 0, 1, 2],
+        [2, 2, 2, 2, 2, 2],
+        [Fraction(1, 2), 1, 0, 3, 2, 1],
+        [1, 1, 1, 1, 1, 1],
+        [Decimal("0.5"), 2, 1, 0, 1, 3],
+    ]
+    K_SCHEDULE = [2, 0, 3, 1, 2]
+    SEED = 42
+
+    def _full(self):
+        return weighted_sample_plan_indices(
+            self.ITEMS, self.WEIGHTS_SCHEDULE, self.K_SCHEDULE,
+            len(self.K_SCHEDULE), self.SEED)
+
+    def test_checkpoint_state_is_json_native(self):
+        state = weighted_sample_plan_checkpoint(
+            self.ITEMS, self.WEIGHTS_SCHEDULE, self.K_SCHEDULE,
+            self.SEED, start=2)
+        self.assertEqual(state["version"], 1)
+        self.assertEqual(state["kind"], "plan")
+        self.assertEqual(state["position"], 2)
+        self.assertEqual(state["n"], len(self.ITEMS))
+        self.assertEqual(
+            state["schedule_length"], len(self.K_SCHEDULE))
+        self.assertTrue(json.loads(json.dumps(state)) == state)
+
+    def test_resume_window_equals_one_shot_slice(self):
+        full = self._full()
+        for start in range(len(self.K_SCHEDULE) + 1):
+            state = weighted_sample_plan_checkpoint(
+                self.ITEMS, self.WEIGHTS_SCHEDULE, self.K_SCHEDULE,
+                self.SEED, start=start)
+            for draws in range(0, len(self.K_SCHEDULE) - start + 1):
+                with self.subTest(start=start, draws=draws):
+                    rounds, next_state = weighted_sample_plan_resume_indices(
+                        self.ITEMS, self.WEIGHTS_SCHEDULE,
+                        self.K_SCHEDULE, state, draws)
+                    self.assertEqual(rounds, full[start:start + draws])
+                    self.assertEqual(next_state["position"], start + draws)
+
+    def test_chained_resumes_equal_one_shot_run(self):
+        full = self._full()
+        state = weighted_sample_plan_checkpoint(
+            self.ITEMS, self.WEIGHTS_SCHEDULE, self.K_SCHEDULE, self.SEED)
+        chunks = []
+        for draws in (1, 2, 0, 1, 1, 0):
+            rounds, state = weighted_sample_plan_resume_indices(
+                self.ITEMS, self.WEIGHTS_SCHEDULE, self.K_SCHEDULE,
+                state, draws)
+            chunks.extend(rounds)
+        self.assertEqual(chunks, full)
+        self.assertEqual(state["position"], len(self.K_SCHEDULE))
+
+    def test_value_resume_matches_index_resume(self):
+        state = weighted_sample_plan_checkpoint(
+            self.ITEMS, self.WEIGHTS_SCHEDULE, self.K_SCHEDULE,
+            self.SEED, start=1)
+        index_rounds, index_next = weighted_sample_plan_resume_indices(
+            self.ITEMS, self.WEIGHTS_SCHEDULE, self.K_SCHEDULE, state, 3)
+        value_rounds, value_next = weighted_sample_plan_resume(
+            self.ITEMS, self.WEIGHTS_SCHEDULE, self.K_SCHEDULE, state, 3)
+        self.assertEqual(
+            value_rounds,
+            [[self.ITEMS[i] for i in round_indices]
+             for round_indices in index_rounds])
+        # 两个入口的下一状态逐字段一致, 可互换续接。
+        self.assertEqual(index_next, value_next)
+        tail_a, _ = weighted_sample_plan_resume_indices(
+            self.ITEMS, self.WEIGHTS_SCHEDULE, self.K_SCHEDULE,
+            value_next, 1)
+        tail_b, _ = weighted_sample_plan_resume(
+            self.ITEMS, self.WEIGHTS_SCHEDULE, self.K_SCHEDULE,
+            index_next, 1)
+        self.assertEqual(
+            tail_b, [[self.ITEMS[i] for i in r] for r in tail_a])
+
+    def test_state_roundtrip_via_serialize_metrics(self):
+        state = weighted_sample_plan_checkpoint(
+            self.ITEMS, self.WEIGHTS_SCHEDULE, self.K_SCHEDULE,
+            self.SEED, start=2)
+        restored = deserialize_metrics(serialize_metrics(state))
+        expected, _ = weighted_sample_plan_resume_indices(
+            self.ITEMS, self.WEIGHTS_SCHEDULE, self.K_SCHEDULE, state, 2)
+        actual, _ = weighted_sample_plan_resume_indices(
+            self.ITEMS, self.WEIGHTS_SCHEDULE, self.K_SCHEDULE, restored, 2)
+        self.assertEqual(actual, expected)
+        # json 文本路径同样可恢复。
+        via_json = json.loads(json.dumps(state))
+        actual_json, _ = weighted_sample_plan_resume_indices(
+            self.ITEMS, self.WEIGHTS_SCHEDULE, self.K_SCHEDULE, via_json, 2)
+        self.assertEqual(actual_json, expected)
+
+    def test_draws_zero_returns_empty_and_unchanged_state_copy(self):
+        state = weighted_sample_plan_checkpoint(
+            self.ITEMS, self.WEIGHTS_SCHEDULE, self.K_SCHEDULE,
+            self.SEED, start=3)
+        rounds, next_state = weighted_sample_plan_resume_indices(
+            self.ITEMS, self.WEIGHTS_SCHEDULE, self.K_SCHEDULE, state, 0)
+        self.assertEqual(rounds, [])
+        self.assertEqual(next_state, state)
+        self.assertIsNot(next_state, state)
+
+    def test_zero_k_rounds_do_not_consume_rng(self):
+        import random as _random
+        fresh = app._rng_state_to_jsonable(_random.Random(7).getstate())
+        zero_ks = [0, 0, 0]
+        ws = self.WEIGHTS_SCHEDULE[:3]
+        state = weighted_sample_plan_checkpoint(
+            self.ITEMS, ws, zero_ks, seed=7, start=2)
+        self.assertEqual(state["rng"], fresh)
+        rounds, next_state = weighted_sample_plan_resume_indices(
+            self.ITEMS, ws, zero_ks, state, 1)
+        self.assertEqual(rounds, [[]])
+        self.assertEqual(next_state["rng"], fresh)
+        self.assertEqual(next_state["position"], 3)
+
+    def test_checkpoint_validates_like_batch_entry(self):
+        ws = self.WEIGHTS_SCHEDULE
+        ks = self.K_SCHEDULE
+        n = len(self.ITEMS)
+        with self.assertRaises(TypeError):
+            weighted_sample_plan_checkpoint(self.ITEMS, ws, [True] * 5)
+        with self.assertRaises(TypeError):
+            weighted_sample_plan_checkpoint(self.ITEMS, "bad", ks)
+        with self.assertRaises(ValueError):
+            weighted_sample_plan_checkpoint(self.ITEMS, ws, ks + [1])
+        with self.assertRaises(ValueError):
+            weighted_sample_plan_checkpoint(
+                self.ITEMS, [[0] * n] * 5, [1, 0, 0, 0, 0])
+        with self.assertRaises(ValueError):
+            weighted_sample_plan_checkpoint(
+                self.ITEMS, ws, ks, self.SEED, len(ks) + 1)
+        # start == 计划长度允许, 表示整批已完成。
+        state = weighted_sample_plan_checkpoint(
+            self.ITEMS, ws, ks, self.SEED, len(ks))
+        self.assertEqual(state["position"], len(ks))
+
+    def test_resume_rejects_non_mapping_state(self):
+        with self.assertRaises(TypeError):
+            weighted_sample_plan_resume_indices(
+                self.ITEMS, self.WEIGHTS_SCHEDULE, self.K_SCHEDULE,
+                "not-a-mapping", 1)
+        with self.assertRaises(TypeError):
+            weighted_sample_plan_resume(
+                self.ITEMS, self.WEIGHTS_SCHEDULE, self.K_SCHEDULE, 42, 1)
+
+    def test_resume_rejects_bad_draws(self):
+        state = weighted_sample_plan_checkpoint(
+            self.ITEMS, self.WEIGHTS_SCHEDULE, self.K_SCHEDULE, self.SEED)
+        with self.assertRaises(TypeError):
+            weighted_sample_plan_resume_indices(
+                self.ITEMS, self.WEIGHTS_SCHEDULE, self.K_SCHEDULE,
+                state, 1.5)
+        with self.assertRaises(TypeError):
+            weighted_sample_plan_resume_indices(
+                self.ITEMS, self.WEIGHTS_SCHEDULE, self.K_SCHEDULE,
+                state, True)
+        with self.assertRaises(ValueError):
+            weighted_sample_plan_resume_indices(
+                self.ITEMS, self.WEIGHTS_SCHEDULE, self.K_SCHEDULE,
+                state, -1)
+
+    def test_resume_rejects_structurally_invalid_state(self):
+        state = weighted_sample_plan_checkpoint(
+            self.ITEMS, self.WEIGHTS_SCHEDULE, self.K_SCHEDULE, self.SEED)
+        # 字段缺失。
+        for key in state:
+            broken = dict(state)
+            del broken[key]
+            with self.subTest(missing=key):
+                with self.assertRaises(ValueError):
+                    weighted_sample_plan_resume_indices(
+                        self.ITEMS, self.WEIGHTS_SCHEDULE,
+                        self.K_SCHEDULE, broken, 1)
+        # 额外字段。
+        broken = dict(state)
+        broken["extra"] = 1
+        with self.assertRaises(ValueError):
+            weighted_sample_plan_resume_indices(
+                self.ITEMS, self.WEIGHTS_SCHEDULE, self.K_SCHEDULE,
+                broken, 1)
+        # 版本 / kind 不支持。
+        for key, value in (("version", 99), ("kind", "k_schedule"),
+                           ("kind", "schedule")):
+            broken = dict(state)
+            broken[key] = value
+            with self.subTest(**{key: value}):
+                with self.assertRaises(ValueError):
+                    weighted_sample_plan_resume_indices(
+                        self.ITEMS, self.WEIGHTS_SCHEDULE,
+                        self.K_SCHEDULE, broken, 1)
+        # 篡改字段但摘要未重算。
+        broken = dict(state)
+        broken["position"] = state["position"] + 1
+        with self.assertRaises(ValueError):
+            weighted_sample_plan_resume_indices(
+                self.ITEMS, self.WEIGHTS_SCHEDULE, self.K_SCHEDULE,
+                broken, 1)
+
+    def test_resume_rejects_mismatched_inputs(self):
+        state = weighted_sample_plan_checkpoint(
+            self.ITEMS, self.WEIGHTS_SCHEDULE, self.K_SCHEDULE, self.SEED)
+        with self.assertRaises(ValueError):
+            weighted_sample_plan_resume_indices(
+                list("abcdef"), self.WEIGHTS_SCHEDULE, self.K_SCHEDULE,
+                state, 1)
+        with self.assertRaises(ValueError):
+            weighted_sample_plan_resume_indices(
+                self.ITEMS, [[9] * len(self.ITEMS)] * 5, self.K_SCHEDULE,
+                state, 1)
+        with self.assertRaises(ValueError):
+            weighted_sample_plan_resume_indices(
+                self.ITEMS, self.WEIGHTS_SCHEDULE, [2, 0, 3, 1, 1],
+                state, 1)
+        with self.assertRaises(ValueError):
+            weighted_sample_plan_resume_indices(
+                self.ITEMS, self.WEIGHTS_SCHEDULE,
+                self.K_SCHEDULE + [1], state, 1)
+        # 恢复窗口超出计划范围。
+        with self.assertRaises(ValueError):
+            weighted_sample_plan_resume_indices(
+                self.ITEMS, self.WEIGHTS_SCHEDULE, self.K_SCHEDULE,
+                state, len(self.K_SCHEDULE) + 1)
+
+    def test_resume_does_not_mutate_inputs_or_state(self):
+        import copy as _copy
+        items = list(self.ITEMS)
+        ws = [list(row) for row in self.WEIGHTS_SCHEDULE]
+        ks = list(self.K_SCHEDULE)
+        state = weighted_sample_plan_checkpoint(
+            items, ws, ks, self.SEED, start=1)
+        state_snapshot = _copy.deepcopy(state)
+        weighted_sample_plan_resume_indices(items, ws, ks, state, 2)
+        weighted_sample_plan_resume(items, ws, ks, state, 2)
+        self.assertEqual(items, self.ITEMS)
+        self.assertEqual(ws, [list(row) for row in self.WEIGHTS_SCHEDULE])
+        self.assertEqual(ks, self.K_SCHEDULE)
         self.assertEqual(state, state_snapshot)
 
 
