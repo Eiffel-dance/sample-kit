@@ -127,6 +127,60 @@
         与异常类别): 每轮按原始位置映射元素值(相同值的不同位置仍按位置
         区分), 返回的下一状态与按索引入口逐字段一致, 可互换续接, 也可经
         serialize_metrics / deserialize_metrics 往返后继续恢复。
+    weighted_sample_partition_indices(items, weights, group_sizes, seed=0)
+        分组采样入口: 把同一条无放回加权序列切成多个互不重叠的样本组。
+        group_sizes 是有限非文本序列, 成员为非布尔非负整数; 返回长度等于
+        len(group_sizes) 的外层 list, 第 j 组是 group_sizes[j] 个按抽样
+        先后排列的零基原始位置, 所有组互不重复, 零权重位置永不出现。
+        依次拼接各组必须逐项等于 weighted_sample_indices(items, weights,
+        sum(group_sizes), seed) 的结果按 group_sizes 切片 —— 即各组共享
+        同一条由 seed 初始化的随机流, 只是按计划分段消费(后一组在前一组
+        抽剩的位置中继续)。items、weights 与 seed 沿用单轮入口规则;
+        group_sizes 结构或成员类型错误抛 TypeError; weights 与 items
+        长度不一致、组大小为负、sum(group_sizes) 超过正权重位置数、负
+        权重、NaN 或无穷权重抛 ValueError。空计划、全零组大小及总抽取数
+        为零时仍完成全部校验并返回对应数量的空组(空计划返回空 list)。
+        不修改入参。
+    weighted_sample_partition(items, weights, group_sizes, seed=0)
+        与 weighted_sample_partition_indices 同规则(同一套校验顺序与
+        异常类别), 但每组按原始位置映射 items 元素, 两个入口逐组逐项
+        对应(重复值的不同位置仍按位置独立处理)。
+    weighted_sample_partition_checkpoint(items, weights, group_sizes,
+        seed=0, start=0)
+        创建分组采样会话的断点: 沿用 weighted_sample_partition_indices
+        的全部规则与固定校验顺序(items、weights、group_sizes、seed;
+        group_sizes 必须是有限非文本序列, 成员为非布尔非负整数,
+        sum(group_sizes) 不超过正权重位置数, 权重接受 int/float/Fraction/
+        Decimal 并拒绝负数、NaN、无穷与错误结构), start 越过组计划长度
+        抛 ValueError(start == 组数允许, 表示全部组已消费完); 本入口不
+        产出组。校验通过后沿同一条无放回序列先消费 start 个完整组(前一组
+        抽走的位置在后一组保持缺席, 零大小组不消耗随机流), 再返回只含
+        JSON 原生值的状态映射; 状态绑定版本、标签 kind、position、n、
+        组数、items/weights/group_sizes 指纹、已抽组位置(按抽取先后排列
+        的零基原始位置)、标签化 seed、抽样计划、随机流快照与完整性摘要,
+        可直接交给 serialize_metrics 落盘, 也可经 deserialize_metrics
+        还原(甚至跨进程)后恢复。不修改入参。
+    weighted_sample_partition_resume_indices(items, weights, group_sizes,
+        state, draws)
+        分组会话的按索引恢复入口: 传入与创建断点时相同的 items、weights、
+        group_sizes 与状态, 返回 (索引组列表, 下一状态)。第一组从断点
+        position 开始, 逐组等于一次性 weighted_sample_partition_indices
+        分组结果的零基区间 [pos, pos+draws); 多次连续续接与一次性分组逐项
+        相同, 恢复时无需从头重放随机流(从全新位置池移除已抽位置还原剩余
+        池后直接从 RNG 快照续接)。draws 必须是非布尔非负整数(TypeError /
+        ValueError), 恢复窗口超出组计划范围抛 ValueError; draws=0 返回
+        空组列表与位置、已抽位置、随机状态不变的状态副本, 零大小组只推进
+        position 且不消耗随机流。状态不是映射抛 TypeError; 字段缺失或
+        未知、版本不支持、已抽位置与其长度/唯一性不符、摘要或输入(items、
+        weights、group_sizes)不匹配统一抛 ValueError, 且绝不产生部分组。
+        不修改入参与状态。
+    weighted_sample_partition_resume(items, weights, group_sizes, state,
+        draws)
+        分组会话的按元素值恢复入口, 规则与
+        weighted_sample_partition_resume_indices 完全一致(同一套校验顺序
+        与异常类别): 每组按原始位置映射元素值(相同值的不同位置仍按位置
+        区分), 返回的下一状态与按索引入口逐字段一致, 可互换续接, 也可经
+        serialize_metrics / deserialize_metrics 往返后继续恢复。
     weighted_sample_counts(items, weights, k, draws, seed=0, start=0)
         weighted_sample_many_indices 的批量频次入口: 接受与该入口相同
         的 items、weights、k、draws、seed、start 语义与校验顺序, 按同一
@@ -2701,6 +2755,521 @@ def weighted_sample_schedule_resume(items, weights_schedule, k, state, draws):
     # 轮内不重复位置这一性质随索引结果原样保留。只读取 items, 不修改入参。
     rounds = [[items[i] for i in round_indices] for round_indices in index_rounds]
     return rounds, next_state
+
+
+# ---------------------------------------------------------------------------
+# 分组采样: 把一条无放回加权序列切成多个互不重叠的样本组
+# ---------------------------------------------------------------------------
+
+# 分组会话状态的标签 kind。
+_PARTITION_CHECKPOINT_KIND = "partition"
+
+
+def _validate_group_sizes(group_sizes):
+    """group_sizes 必须是有限非文本且长度可确定的序列, 每个成员都是非布尔
+    非负整数。结构错误(或任意成员不是非布尔整数)统一抛 TypeError, 与
+    k_schedule 入口对计划成员的类型规则一致; 成员为负在此不判定(由调用方
+    在取值阶段按固定顺序抛 ValueError)。返回成员的本地 list 副本, 绝不
+    修改入参。
+    """
+    if not _is_length_determinable_sequence(group_sizes):
+        raise TypeError("group_sizes must be a length-determinable sequence")
+    sizes = []
+    for member in group_sizes:
+        if isinstance(member, bool) or not isinstance(member, int):
+            raise TypeError("group_sizes members must be non-boolean integers")
+        sizes.append(member)
+    return sizes
+
+
+def _validate_partition_inputs(items, weights, group_sizes, seed):
+    """分组入口共用的全部前置校验, 返回 (n, sizes)。
+
+    校验顺序固定: 先 items、weights、seed 的结构/类型(与既有采样入口同一
+    套规则; 这里没有单轮 k, 故 k 的类型与范围不参与), 再 group_sizes 的
+    结构(有限非文本且长度可确定的序列)与每个成员的类型(非布尔整数,
+    TypeError); 随后 weights 长度与 items 一致(ValueError), 组大小取非
+    负值并使总和不超过正权重位置数(ValueError); 最后权重元素类型
+    (TypeError)与取值(ValueError)校验。全部校验在产生任何结果前完成,
+    空计划、全零组大小及总量为零(无正权重位置)也不例外; 不修改入参。
+    """
+    # ---- 1. 结构与参数类型 (TypeError) ----
+    if not _is_length_determinable_sequence(items):
+        raise TypeError("items must be a length-determinable sequence")
+    if not _is_length_determinable_sequence(weights):
+        raise TypeError("weights must be a length-determinable sequence")
+    if not isinstance(seed, _SEED_TYPES):
+        raise TypeError("unsupported seed type: %s" % type(seed).__name__)
+    sizes = _validate_group_sizes(group_sizes)
+
+    # ---- 2. 长度、组大小取值与可行性 (ValueError) ----
+    n = len(items)
+    if len(weights) != n:
+        raise ValueError("invalid sample size")
+    for size in sizes:
+        if size < 0:
+            raise ValueError("negative group size")
+    total = sum(sizes)
+    if total > n:
+        raise ValueError("group sizes exceed available positions")
+
+    # ---- 3. 权重元素类型与取值 (TypeError / ValueError) ----
+    _validate_weight_elements(weights)
+
+    # ---- 4. 正权重可行性 (ValueError) ----
+    # 全部组拼起来是 sum(group_sizes) 个互不重复的位置, 故正权重位置数
+    # 至少要等于总抽取数; 等价于 weighted_sample_indices(items, weights,
+    # sum(group_sizes), seed) 可行。空计划与全零组大小时 total 为 0,
+    # 即使权重全部为零也合法。
+    if total > _count_positive_weights(weights):
+        raise ValueError("no positive weight")
+    return n, sizes
+
+
+def _split_groups(sequence, sizes):
+    """把扁平序列按组大小依次切成多组(本地实现, 不修改入参)。"""
+    groups = []
+    cursor = 0
+    for size in sizes:
+        groups.append(sequence[cursor:cursor + size])
+        cursor += size
+    return groups
+
+
+def weighted_sample_partition_indices(items, weights, group_sizes, seed=0):
+    """把无放回加权序列切成多个互不重叠的样本组, 返回零基原始位置组。
+
+    group_sizes 是有限非文本序列, 成员为非布尔非负整数; 先完成与
+    weighted_sample_indices 一致的 items、weights、seed 及权重有限性/
+    非负性校验(单轮 k 取 sum(group_sizes)), 再校验组大小: 结构或成员
+    类型错误抛 TypeError; weights 与 items 长度不一致、组大小为负、
+    sum(group_sizes) 超过正权重位置数、负权重、NaN 或无穷权重抛
+    ValueError。全部校验在产生任何组之前完成 —— 空计划(空序列)、全零组
+    大小及总抽取数为零时, 仍完成全部校验并分别返回对应数量的空组
+    (空计划返回空 list, 全零组返回 len(group_sizes) 个空 list)。
+
+    返回长度等于 len(group_sizes) 的 list, 第 j 组长度恰为
+    group_sizes[j] 个零基原始位置; 所有组互不重复, 零权重位置永不出现;
+    依次拼接各组与 weighted_sample_indices(items, weights,
+    sum(group_sizes), seed) 的结果按 group_sizes 切片逐项相同 —— 即所有
+    组共享同一条由 seed 初始化的随机流, 只是按计划分段消费。不修改入参。
+    """
+    n, sizes = _validate_partition_inputs(items, weights, group_sizes, seed)
+    total = sum(sizes)
+    sequence = weighted_sample_indices(items, weights, total, seed)
+    return _split_groups(sequence, sizes)
+
+
+def weighted_sample_partition(items, weights, group_sizes, seed=0):
+    """weighted_sample_partition_indices 的元素值入口: 规则、校验顺序与
+    异常类别完全一致, 第 j 组按该组的原始位置映射 items; 两个入口逐组逐项
+    对应(相同值的不同位置仍按位置独立处理)。"""
+    n, sizes = _validate_partition_inputs(items, weights, group_sizes, seed)
+    total = sum(sizes)
+    sequence = weighted_sample_indices(items, weights, total, seed)
+    groups = _split_groups(sequence, sizes)
+    return [[items[i] for i in group_indices] for group_indices in groups]
+
+
+def _group_sizes_fingerprint(group_sizes):
+    """对组大小计划取指纹: 逐位置规范化后整体 sha256。
+
+    成员均为已通过类型校验的非布尔整数(允许为负的情形在指纹之前已被
+    取值校验拒绝), 走任意精度整数的精确十进制文本, 与权重指纹的整数
+    行同一格式。
+    """
+    body = "\n".join(
+        "%d:i:%s" % (index, _int_to_decimal_text(size))
+        for index, size in enumerate(group_sizes)
+    )
+    return _hash_text(body)
+
+
+def _partition_pull(pool, weights, k, rng, use_exact):
+    """在同一条分组序列上连续抽取 k 个位置。
+
+    与每轮重建位置池的 _draw_indices_once 不同, 本函数直接在调用方持有的
+    pool / weights 上就地弹出: 分组采样的所有组是同一条无放回加权序列的
+    连续切片, 前一组抽走的位置必须保持缺席, 后一组只能在剩余位置中继续。
+    抽样器就地弹出只作用于这里传入的(由调用方复制的)列表。
+    """
+    if use_exact:
+        return _sample_indices_exact_integer(pool, weights, k, rng)
+    return _sample_indices_float(pool, weights, k, rng)
+
+
+def _partition_remove_drawn(pool, weights, drawn):
+    """按抽取顺序从全新位置池中移除已抽位置, 还原断点处的剩余池。
+
+    抽样器每轮按当前下标弹出被选位置; 从全新 pool/weights 出发, 依抽取
+    顺序依次定位并弹出每个已抽位置, 得到的剩余位置与剩余权重与连续抽样
+    到该点时的池逐元素相同(剩余位置始终保持原始相对顺序)。调用方传入的
+    pool / weights 须为全新副本; 不修改 drawn。
+    """
+    for position in drawn:
+        index = pool.index(position)
+        pool.pop(index)
+        weights.pop(index)
+
+
+def _partition_checkpoint_binding_digest(
+    seed_tagged, position, n, group_count, items_digest, weights_digest,
+    groups_digest, drawn, exact, rng_payload,
+):
+    """把分组断点各字段绑定为一个防篡改摘要。
+
+    与 _checkpoint_binding_digest 同一构造(serialize_metrics 规范化后
+    sha256), 绑定标签 kind、position、n、组数、items/weights/group_sizes
+    指纹、已抽组位置(按抽取先后排列的零基原始位置)、标签化 seed、抽样
+    计划与 RNG 快照: 任一字段被改动而不重算摘要时, 恢复都会在产出任何组
+    之前发现, 分段消费无需从头重放随机流。
+    """
+    return _hash_text(serialize_metrics({
+        "kind": _PARTITION_CHECKPOINT_KIND,
+        "seed": seed_tagged,
+        "position": position,
+        "n": n,
+        "group_count": group_count,
+        "items_digest": items_digest,
+        "weights_digest": weights_digest,
+        "groups_digest": groups_digest,
+        "drawn": drawn,
+        "exact": exact,
+        "rng": rng_payload,
+    }))
+
+
+def weighted_sample_partition_checkpoint(
+    items, weights, group_sizes, seed=0, start=0
+):
+    """创建分组采样会话的断点(只含 JSON 原生值的状态映射)。
+
+    先按 weighted_sample_partition_indices 的全部规则与固定校验顺序完成
+    items、weights、group_sizes、seed 的校验(有限非文本序列、等长关系、
+    非布尔非负整数组大小、sum(group_sizes) 不超过正权重位置数、权重接受
+    非布尔 int/有限非负 float/Fraction/Decimal 并拒绝负数、NaN、无穷与
+    错误结构); start 必须是非布尔非负整数(TypeError / ValueError)且
+    start <= len(group_sizes)(越过计划末尾以 ValueError 拒绝; start 等于
+    组数表示全部组已消费完)。本入口不产出组, 但仍完成全部校验 —— 空计划
+    只接受 start=0。
+
+    校验通过后, 沿同一条无放回加权序列先消费 start 个完整组(第 j 组大小
+    为 group_sizes[j], 前一组抽走的位置在后一组保持缺席, 各组连续消耗
+    同一条由 seed 初始化的随机流, 零大小组不消耗随机流), 再返回只含
+    JSON 原生值的状态: 绑定版本、标签 kind、position(已完成组数)、n、
+    组数、items/weights/group_sizes 指纹、已抽组位置(按抽取先后排列的
+    零基原始位置)、标签化 seed、抽样计划(exact)、RNG 快照与完整性摘要。
+    可直接交给 serialize_metrics 落盘, 也可经 deserialize_metrics 还原
+    (甚至跨进程)后交给 weighted_sample_partition_resume_indices 恢复。
+    不修改入参。
+    """
+    n, sizes = _validate_partition_inputs(items, weights, group_sizes, seed)
+    _validate_start(start)
+    group_count = len(sizes)
+    if start > group_count:
+        raise ValueError("partition window out of range")
+
+    # 复制到本地, 绝不修改入参; 抽样计划按整条分组序列的总抽取数选择,
+    # 与 weighted_sample_indices(items, weights, total, seed) 一致。
+    total = sum(sizes)
+    pool_weights = list(weights)
+    rng = random.Random(seed)
+    planned_weights, use_exact = _select_sampling_plan(pool_weights, total)
+
+    # 所有组是同一条无放回序列的连续切片: 用一个贯穿全程的位置池一次抽完
+    # 前 start 组应消耗的 sum(sizes[:start]) 个位置, 抽走的位置持续缺席 —
+    # 零大小组贡献零个位置、不消耗随机流; drawn 按抽取先后记录原始位置。
+    prefix_total = sum(sizes[:start])
+    pool = list(range(n))
+    active_weights = list(planned_weights)
+    drawn = _partition_pull(
+        pool, active_weights, prefix_total, rng, use_exact
+    )
+
+    seed_tagged = _seed_to_tagged_value(seed)
+    rng_payload = _rng_state_to_jsonable(rng.getstate())
+    items_digest = _items_fingerprint(items)
+    weights_digest = _weights_fingerprint(weights)
+    groups_digest = _group_sizes_fingerprint(sizes)
+    state = {
+        "version": _CHECKPOINT_VERSION,
+        "kind": _PARTITION_CHECKPOINT_KIND,
+        "position": start,
+        "n": n,
+        "group_count": group_count,
+        "items_digest": items_digest,
+        "weights_digest": weights_digest,
+        "groups_digest": groups_digest,
+        "drawn": drawn,
+        "seed": seed_tagged,
+        "exact": bool(use_exact),
+        "rng": rng_payload,
+    }
+    state["digest"] = _partition_checkpoint_binding_digest(
+        seed_tagged, start, n, group_count, items_digest, weights_digest,
+        groups_digest, drawn, bool(use_exact), rng_payload,
+    )
+    return state
+
+
+def _validate_partition_checkpoint_state(state):
+    """校验分组断点状态本身的结构与版本, 返回规范化字段。
+
+    调用前须已确认 state 是映射(否则 TypeError 在外层抛出)。字段缺失、
+    未知(多余)字段、类型错误、非法取值、版本不支持、kind 不符等一切
+    结构问题统一抛 ValueError。
+    """
+    required = ("version", "kind", "position", "n", "group_count",
+                "items_digest", "weights_digest", "groups_digest", "drawn",
+                "seed", "exact", "rng", "digest")
+    if not all(key in state for key in required):
+        raise ValueError("invalid checkpoint state: missing fields")
+    if set(state) != set(required):
+        raise ValueError("invalid checkpoint state: unexpected fields")
+
+    version = state["version"]
+    if (isinstance(version, bool) or not isinstance(version, int)
+            or version != _CHECKPOINT_VERSION):
+        raise ValueError("unsupported checkpoint version: %r" % (version,))
+    if state["kind"] != _PARTITION_CHECKPOINT_KIND:
+        raise ValueError("invalid checkpoint state: unexpected kind")
+    position = state["position"]
+    n = state["n"]
+    group_count = state["group_count"]
+    for name, value in (("position", position), ("n", n),
+                        ("group_count", group_count)):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError("invalid checkpoint state: %s" % name)
+    if position > group_count:
+        raise ValueError("invalid checkpoint state: position out of range")
+    if not isinstance(state["exact"], bool):
+        raise ValueError("invalid checkpoint state: exact")
+    for name in ("items_digest", "weights_digest", "groups_digest", "digest"):
+        if not isinstance(state[name], str):
+            raise ValueError("invalid checkpoint state: %s" % name)
+
+    # drawn 只以 JSON 原生 list 出现: 成员是非布尔整数、处于零基范围
+    # [0, n) 且不重复(组间位置互不重叠)。其长度须与 position 之前各组
+    # 大小之和一致 —— 该校验需要当前 group_sizes, 由恢复核心在输入校验
+    # 后补做; 这里先校验纯结构。
+    drawn = state["drawn"]
+    if not isinstance(drawn, list):
+        raise ValueError("invalid checkpoint state: drawn")
+    seen = set()
+    for member in drawn:
+        if (isinstance(member, bool) or not isinstance(member, int)
+                or member < 0 or member >= n or member in seen):
+            raise ValueError("invalid checkpoint state: drawn")
+        seen.add(member)
+
+    # 状态可能经 serialize_metrics + deserialize_metrics 还原: 其中的
+    # Decimal 载荷先还原为创建时的等值 float, 再解码与核对摘要 —— 两条
+    # 文本路径(json / serialize_metrics)解析出的状态因此可互换恢复。
+    seed_payload = _normalize_checkpoint_numbers(state["seed"])
+    rng_payload = _normalize_checkpoint_numbers(state["rng"])
+
+    # 两个逆运算对内部结构问题统一抛 ValueError。
+    seed = _tagged_value_to_seed(seed_payload)
+    rng_state = _rng_state_from_jsonable(rng_payload)
+
+    # 绑定摘要: 任何对字段的篡改(position、kind、组数、指纹、已抽组位置、
+    # seed、RNG 快照、exact)若不附带重算的摘要, 都会在这里被发现 ——
+    # 因此恢复时不必从头重放随机流。
+    expected_digest = _partition_checkpoint_binding_digest(
+        seed_payload, position, n, group_count, state["items_digest"],
+        state["weights_digest"], state["groups_digest"], drawn,
+        state["exact"], rng_payload,
+    )
+    if not hmac.compare_digest(expected_digest, state["digest"]):
+        raise ValueError("invalid checkpoint state: digest mismatch")
+    return (position, n, group_count, drawn, state["exact"], seed, rng_state,
+            seed_payload)
+
+
+def _resume_partition_groups_indices(
+    items, weights, group_sizes, state, draws
+):
+    """两个分组恢复入口共用的已校验核心: 只产出索引组与下一状态。
+
+    调用约定与 _resume_schedule_rounds_indices 相同: 外层已确认 state 是
+    映射并校验过 draws。先用状态携带的 seed 按
+    weighted_sample_partition_indices 的固定顺序完成 items、weights、
+    group_sizes 的全部校验(组大小非负与总抽取数的正权重可行性在此确定),
+    再校验状态本身的结构/版本/摘要, 然后核对恢复窗口 [position,
+    position+draws) 不越过组计划、已抽位置数与前 position 组大小之和一致,
+    以及状态和当前输入的绑定(n、组数、items/weights/group_sizes 指纹、
+    抽样计划); 任一失败都在物化任何组之前抛出既有 TypeError /
+    ValueError, JSON / Decimal / random 层面的意外异常统一收敛为
+    ValueError。全部通过后从全新位置池移除已抽位置还原断点处的剩余池,
+    直接从 RNG 快照续接, 在同一个剩余池上连续抽取各组, 返回 (索引组
+    列表, 下一状态); 不修改入参, 也不修改传入的状态映射。
+    """
+    # 状态结构与版本先校验(ValueError), 取出的 seed 再用于分组输入校验,
+    # 保证 seed 的类型规则同样被执行。
+    (position, state_n, group_count, drawn, use_exact, seed, rng_state,
+     seed_payload) = _validate_partition_checkpoint_state(state)
+    n, sizes = _validate_partition_inputs(items, weights, group_sizes, seed)
+
+    # 状态与当前采样输入的一致性: n、组数先比, 再逐项核对三个指纹。
+    if state_n != n or group_count != len(sizes):
+        raise ValueError("checkpoint state does not match partition inputs")
+    # 已抽位置数必须恰好等于前 position 组大小之和: position 与组计划、
+    # 已抽位置三者由此绑定。恢复窗口不能越过计划范围。两项都在物化任何
+    # 组之前确定。
+    if len(drawn) != sum(sizes[:position]):
+        raise ValueError("invalid checkpoint state: drawn length mismatch")
+    if position + draws > group_count:
+        raise ValueError("partition window out of range")
+    if state["items_digest"] != _items_fingerprint(items):
+        raise ValueError("checkpoint state does not match items")
+    if state["weights_digest"] != _weights_fingerprint(weights):
+        raise ValueError("checkpoint state does not match weights")
+    if state["groups_digest"] != _group_sizes_fingerprint(sizes):
+        raise ValueError("checkpoint state does not match group_sizes")
+
+    # 抽样计划必须与创建断点时一致; 权重已逐位置指纹核对, 这里重建计划
+    # 并比对 exact 标志。RNG 快照与 (seed, position, 已抽位置) 的绑定已
+    # 由状态摘要保证未被篡改, 故恢复直接从快照继续, 无需从头重放。
+    total = sum(sizes)
+    planned_weights, planned_exact = _select_sampling_plan(list(weights), total)
+    if planned_exact != use_exact:
+        raise ValueError("invalid checkpoint state: sampling plan mismatch")
+
+    # 从全新位置池出发, 按抽取顺序移除已抽位置, 还原断点处的剩余池 —
+    # 与沿同一条序列连续抽到 position 时的池逐元素相同, 因此配合 RNG
+    # 快照即可无缝续接, 无需从头重放随机流。
+    pool = list(range(n))
+    active_weights = list(planned_weights)
+    _partition_remove_drawn(pool, active_weights, drawn)
+
+    rng = random.Random()
+    try:
+        rng.setstate(rng_state)
+    except ValueError:
+        raise
+    except Exception as exc:
+        # 结构与取值范围已在上游校验; 任何解释器层面的额外拒绝都统一成
+        # ValueError, 绝不泄漏其他异常类型, 也不会已产出部分组。
+        raise ValueError("invalid checkpoint RNG state") from exc
+
+    # 全部校验通过后才物化组: 各组在同一个剩余池上连续抽取, 第 j 组抽
+    # group_sizes[position+j] 个位置, 抽走的位置对后续组持续缺席 ——
+    # 与一次性分组结果的对应零基区间逐项一致。零大小组返回空列表且不
+    # 消耗随机流。
+    groups = []
+    next_drawn = list(drawn)
+    for j in range(position, position + draws):
+        group = _partition_pull(
+            pool, active_weights, sizes[j], rng, planned_exact
+        )
+        groups.append(group)
+        next_drawn.extend(group)
+
+    next_state = dict(state)
+    next_rng_payload = _rng_state_to_jsonable(rng.getstate())
+    next_position = position + draws
+    next_state["position"] = next_position
+    next_state["drawn"] = next_drawn
+    next_state["rng"] = next_rng_payload
+    # seed 载荷使用校验时规范化后的形式: 经 deserialize_metrics 还原的
+    # 状态其 Decimal 已回到等值 float, 下一状态因此与 JSON 原生状态链
+    # 逐字段一致, 可继续经任一文本路径序列化/解析后再恢复。
+    next_state["seed"] = seed_payload
+    # 摘要必须随 position / 已抽位置 / RNG 一并刷新, 否则链式再恢复时会
+    # 因摘要失配而失败(其余字段与原状态相同)。
+    next_state["digest"] = _partition_checkpoint_binding_digest(
+        seed_payload, next_position, n, group_count,
+        state["items_digest"], state["weights_digest"],
+        state["groups_digest"], next_drawn, planned_exact, next_rng_payload,
+    )
+    return groups, next_state
+
+
+def weighted_sample_partition_resume_indices(
+    items, weights, group_sizes, state, draws
+):
+    """从分组断点继续产出索引组, 返回 (组列表, 下一状态)。
+
+    传入与创建断点时相同的 items、weights、group_sizes 与状态; 第一组从
+    断点记录的 position 开始, 逐组等于
+    weighted_sample_partition_indices(items, weights, group_sizes, seed)
+    返回组的零基区间 [position, position+draws); 多次连续续接与一次性
+    分组结果逐项相同, 恢复时无需从头重放随机流。返回前完成与分组入口
+    一致的全部输入校验(含组大小非负与总抽取数的正权重可行性), 并核对
+    状态与 items、weights、group_sizes 及 (seed, position, RNG 快照)的
+    自洽性: 状态不是映射抛 TypeError; 字段缺失或未知、版本不支持、摘要
+    或输入不匹配统一抛 ValueError; items/weights/group_sizes/draws 的
+    错误沿用既有 TypeError / ValueError; draws=0 越过计划范围同样以
+    ValueError 拒绝。所有失败都在任何组物化之前确定, 绝不返回部分结果。
+    draws=0 且 position 在计划范围内时返回空组列表与位置、RNG 不变的
+    新状态副本; 零大小组返回空列表, 位置仍逐组加一且不消耗随机流。状态
+    可经 serialize_metrics / deserialize_metrics 往返后继续恢复。不修改
+    入参, 也不修改传入的状态映射。
+    """
+    # 状态不是映射: TypeError(文档约定的明确分类)。映射前提下的一切
+    # 结构/版本/摘要问题在 _validate_partition_checkpoint_state 中统一为
+    # ValueError。
+    if not isinstance(state, collections.abc.Mapping):
+        raise TypeError("checkpoint state must be a mapping")
+    # draws 的类型/取值规则独立于状态, 先按既有规则校验(TypeError /
+    # ValueError), 再解析状态。
+    _validate_draws(draws)
+    return _resume_partition_groups_indices(
+        items, weights, group_sizes, state, draws
+    )
+
+
+def weighted_sample_partition_resume(
+    items, weights, group_sizes, state, draws
+):
+    """按元素值从分组断点继续, 返回 (元素值组列表, 下一状态)。
+
+    校验顺序按恢复入口约定固定: 调用开始先按分组入口完成 items、weights、
+    group_sizes、seed(状态携带的种子其标签化编码随后随状态一并校验)的
+    结构、长度、组大小取值与正权重可行性校验, 再按现有恢复入口校验
+    state 的映射类型、版本、字段集合、摘要、随机数状态以及 state 与当前
+    输入的绑定(含恢复窗口范围), draws 必须是非布尔非负整数。状态不是
+    映射抛 TypeError; 非法状态、版本不支持、状态与输入不匹配、正权重不足
+    或恢复窗口超出计划范围等一律抛 ValueError; 其余输入错误沿用既有
+    TypeError / ValueError。所有失败都在产生任何组之前确定,
+    JSON / Decimal / random 的异常不会以其他类型泄漏。
+
+    每组返回元素值列表, 与 weighted_sample_partition_resume_indices
+    返回的每组原始位置逐项对应(第 j 个值恰为 items[第 j 个索引]): 相同
+    值的不同位置分别消耗, 组内与跨组都不会出现重复位置。返回的下一状态
+    与按索引入口产出的完全相同(position、RNG 快照、digest 一致), 只含
+    JSON 原生值, 可直接再次传入本入口或按索引入口, 或经
+    serialize_metrics / deserialize_metrics 往返后继续恢复。draws=0 在
+    计划范围内返回空组列表与位置、随机状态不变的状态副本; 零大小组生成
+    空列表并按组数推进 position, 不消耗随机流。不修改入参, 也不修改传入
+    的状态映射。
+    """
+    # 第一步: 先按分组入口完成 items、weights、group_sizes 的结构、长度、
+    # 组大小取值与正权重可行性校验(seed 以 0 试跑, 只校验类型相关规则;
+    # state 中 seed 的编码与具体值在下一步状态校验时核对)。因此即使
+    # state 本身已损坏, 非法 items/weights/group_sizes 仍优先以分组入口
+    # 的异常类别报告。
+    _validate_partition_inputs(items, weights, group_sizes, 0)
+
+    # 第二步: 恢复入口的映射类型检查与 draws 规则(TypeError / ValueError)。
+    if not isinstance(state, collections.abc.Mapping):
+        raise TypeError("checkpoint state must be a mapping")
+    _validate_draws(draws)
+
+    # 第三步: 状态结构/版本/字段/摘要/RNG、state 与输入绑定(含从状态
+    # 解出的 seed 再跑一次完整分组校验与窗口检查), 全部通过后从 RNG 快照
+    # 续接产出索引组。与按索引入口共用同一个已校验核心, 因此组内容、
+    # 下一状态、异常类别与其逐项一致。
+    index_groups, next_state = _resume_partition_groups_indices(
+        items, weights, group_sizes, state, draws
+    )
+    # 按每组原始位置逐项映射为元素值: 相同值的不同位置各自独立映射,
+    # 组内/跨组不重复位置这一性质随索引结果原样保留。只读取 items, 不
+    # 修改入参。
+    groups = [
+        [items[i] for i in group_indices] for group_indices in index_groups
+    ]
+    return groups, next_state
 
 
 # ---------------------------------------------------------------------------
