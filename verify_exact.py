@@ -10,7 +10,9 @@
   6. 异常仍按既有 TypeError / ValueError 分类; 入参不被修改;
   7. 小整数(累计 <= 2**53)保持基线浮点路径的固定序列;
   8. deserialize_metrics 精确还原序列化文本(任意精度 int / Decimal,
-     重复成员名与非有限值拒绝), 并可消费 checkpoint 状态文本恢复采样。
+     重复成员名与非有限值拒绝), 并可消费 checkpoint 状态文本恢复采样;
+  9. 按轮样本数计划 k_schedule: 不同规模批次、共享随机流、零样本轮不耗
+     流、counts 摊平与精确往返, 以及完整的 TypeError/ValueError 校验。
 
 用法:  python3 verify_exact.py   (全部通过时退出码为 0)
 """
@@ -843,6 +845,201 @@ app.weighted_sample_schedule_resume_indices(
         sc_items, sc_schedule, sc_k, sc_seed), 3)
 check((list(sc_items), [list(r) for r in sc_schedule]) == sc_snap,
       "schedule checkpoint/resume 不修改 items / weights_schedule")
+
+
+# ---------------------------------------------------------------------------
+# 14. 按轮样本数计划: 固定权重在确定性随机流中产生不同规模批次
+# ---------------------------------------------------------------------------
+section("按轮样本数计划 k_schedule")
+
+ks_items = list("abcdef")
+ks_weights = [HUGE, 1, HUGE * 2, 7, 0, 3]
+ks_plan = [4, 0, 2, 5, 1, 0, 3]
+
+# 14.1 结构: 每轮长度等于该轮 k_j、无重复、零权重位置不出现; values 与
+#   indices 逐轮对应; 结果确定。
+ks_rounds_ok = True
+for seed in (0, 1, 42, -7, 1.5, "s", b"s", bytearray(b"s"), True):
+    ri = app.weighted_sample_k_schedule_indices(
+        ks_items, ks_weights, ks_plan, len(ks_plan), seed)
+    rv = app.weighted_sample_k_schedule(
+        ks_items, ks_weights, ks_plan, len(ks_plan), seed)
+    if len(ri) != len(ks_plan) or rv != [
+        [ks_items[i] for i in rd] for rd in ri
+    ]:
+        ks_rounds_ok = False
+    for j, rd in enumerate(ri):
+        if len(rd) != ks_plan[j] or len(set(rd)) != len(rd):
+            ks_rounds_ok = False
+        if any(not isinstance(p, int) or p < 0 or p >= 6 for p in rd):
+            ks_rounds_ok = False
+        if 4 in rd:  # 零权重位置
+            ks_rounds_ok = False
+    if ri != app.weighted_sample_k_schedule_indices(
+            ks_items, ks_weights, ks_plan, len(ks_plan), seed):
+        ks_rounds_ok = False
+check(ks_rounds_ok,
+      "各轮长度=k_j、无重复且在范围内, 零权重不出现, values<->indices 对应")
+
+# 14.2 start=0 首轮逐项等于单轮入口。
+first_ok = app.weighted_sample_k_schedule_indices(
+    ks_items, ks_weights, [4, 0, 2], 3, 42)[0] == \
+    app.weighted_sample_indices(ks_items, ks_weights, 4, 42)
+check(first_ok, "start=0 第一轮与 weighted_sample_indices 逐项相同")
+
+# 14.3 计划每项都等于 k 时, 批量/流式/频次入口与既有固定 k 入口逐轮一致。
+uniform_ok = True
+for k in (0, 1, 3, 5):
+    for seed in (0, 7, 42):
+        for draws, start in ((7, 0), (4, 3), (0, 0)):
+            plan = [k] * (start + draws)
+            if app.weighted_sample_k_schedule_indices(
+                    ks_items, ks_weights, plan, draws, seed, start) != \
+                    app.weighted_sample_many_indices(
+                        ks_items, ks_weights, k, draws, seed, start):
+                uniform_ok = False
+            if list(app.weighted_sample_k_schedule_stream_indices(
+                    ks_items, ks_weights, plan, draws, seed, start)) != \
+                    list(app.weighted_sample_stream_indices(
+                        ks_items, ks_weights, k, draws, seed, start)):
+                uniform_ok = False
+            if app.weighted_sample_k_schedule_counts(
+                    ks_items, ks_weights, plan, draws, seed, start) != \
+                    app.weighted_sample_counts(
+                        ks_items, ks_weights, k, draws, seed, start):
+                uniform_ok = False
+check(uniform_ok, "k_schedule 全等 k 时与 many/stream/counts 逐轮逐项一致")
+
+# 14.4 共享随机流 + start 窗口: 切片一致(流式同); 样本数为零的轮次不耗流。
+ks_full = app.weighted_sample_k_schedule_indices(
+    ks_items, ks_weights, ks_plan * 3, 21, 99)
+ks_window_ok = all(
+    app.weighted_sample_k_schedule_indices(
+        ks_items, ks_weights, ks_plan * 3, 21 - s, 99, start=s)
+    == ks_full[s:]
+    and list(app.weighted_sample_k_schedule_stream_indices(
+        ks_items, ks_weights, ks_plan * 3, 21 - s, 99, start=s))
+    == ks_full[s:]
+    for s in (0, 1, 7, 20)
+)
+# 中间夹零轮: 去掉零轮后与同种子无零轮序列一致。
+gz_a = app.weighted_sample_k_schedule_indices(
+    ks_items, ks_weights, [3, 0, 2, 0, 4], 5, 8)
+gz_b = app.weighted_sample_k_schedule_indices(
+    ks_items, ks_weights, [3, 2, 4], 3, 8)
+ks_window_ok = ks_window_ok and [gz_a[0], gz_a[2], gz_a[4]] == gz_b
+# 零轮计划即使 start 抵达计划末端也合法(不触及任何轮次, 不耗流)。
+ks_window_ok = ks_window_ok and app.weighted_sample_k_schedule_indices(
+    ks_items, [0, 0, 0, 0, 0, 0], [0, 0], 0, 7, start=2) == []
+ks_window_ok = ks_window_ok and app.weighted_sample_k_schedule_indices(
+    ks_items, [0, 0, 0, 0, 0, 0], [0, 0], 2, 7) == [[], []]
+check(ks_window_ok, "start 窗口=完整切片(批量/流式), 零样本轮不消耗随机流")
+
+# 14.5 counts 等于索引轮次摊平计数(含 start 窗口), 全零权重位置恒为 0。
+ks_counts_ok = True
+for seed in (0, 42, 99):
+    rounds = app.weighted_sample_k_schedule_indices(
+        ks_items, ks_weights, ks_plan, 7, seed)
+    flat = [p for rd in rounds for p in rd]
+    counts = app.weighted_sample_k_schedule_counts(
+        ks_items, ks_weights, ks_plan, 7, seed)
+    if counts != [flat.count(i) for i in range(6)]:
+        ks_counts_ok = False
+    if sum(counts) != sum(ks_plan) or counts[4] != 0:
+        ks_counts_ok = False
+    if any(type(c) is not int for c in counts):
+        ks_counts_ok = False
+# start 窗口。
+flat_w = [p for rd in ks_full[7:17] for p in rd]
+ks_counts_ok = ks_counts_ok and app.weighted_sample_k_schedule_counts(
+    ks_items, ks_weights, ks_plan * 3, 10, 99, start=7) == \
+    [flat_w.count(i) for i in range(6)]
+# 序列化精确往返。
+ks_rt = app.deserialize_metrics(app.serialize_metrics(
+    {"counts": app.weighted_sample_k_schedule_counts(
+        list(range(3)), [1, 1, 1], [3] * 100, 100, 0)}))
+ks_counts_ok = ks_counts_ok and all(type(x) is int for x in ks_rt["counts"])
+check(ks_counts_ok, "counts=轮次摊平计数(含窗口), 任意精度整数可精确往返")
+
+# 14.6 校验与异常分类: 结构/成员类型 -> TypeError; 范围/窗口/可行性 ->
+#   ValueError; 流式创建时抛出; draws=0 完整校验; 窗口外不可行不检查。
+raises(TypeError,
+       lambda: app.weighted_sample_k_schedule_indices(
+           ks_items, ks_weights, b"01", 1, 0),
+       "k_schedule: 字节序列 -> TypeError")
+raises(TypeError,
+       lambda: app.weighted_sample_k_schedule_indices(
+           ks_items, ks_weights, [1, True], 1, 0),
+       "k_schedule: 布尔成员 -> TypeError")
+raises(TypeError,
+       lambda: app.weighted_sample_k_schedule_indices(
+           ks_items, ks_weights, [1, 1.0], 1, 0),
+       "k_schedule: 浮点成员 -> TypeError")
+raises(TypeError,
+       lambda: app.weighted_sample_k_schedule_indices(
+           ks_items, ks_weights, [1], True, 0),
+       "k_schedule: 布尔 draws -> TypeError")
+raises(TypeError,
+       lambda: app.weighted_sample_k_schedule_stream_indices(
+           ks_items, ks_weights, [1], 1, 0, start=1.0),
+       "k_schedule 流式: start 类型错误创建时 -> TypeError")
+raises(ValueError,
+       lambda: app.weighted_sample_k_schedule_indices(
+           ks_items, ks_weights, [-1], 1, 0),
+       "k_schedule: 负成员 -> ValueError")
+raises(ValueError,
+       lambda: app.weighted_sample_k_schedule_indices(
+           ks_items, ks_weights, [7], 1, 0),
+       "k_schedule: 成员超过 items 长度 -> ValueError")
+raises(ValueError,
+       lambda: app.weighted_sample_k_schedule_indices(
+           ks_items, ks_weights, [1, 1], 3, 0),
+       "k_schedule: 窗口越界 -> ValueError")
+raises(ValueError,
+       lambda: app.weighted_sample_k_schedule_indices(
+           ks_items, [1, 0, 0, 0, 0, 0], [2, 1], 1, 0, start=1),
+       "k_schedule: 被跳过轮次正权重不足 -> ValueError")
+raises(ValueError,
+       lambda: app.weighted_sample_k_schedule_stream(
+           ks_items, [1, 0, 0, 0, 0, 0], [2], 1, 0),
+       "k_schedule 流式: 正权重不足创建时 -> ValueError")
+raises(ValueError,
+       lambda: app.weighted_sample_k_schedule_indices(
+           ks_items, ks_weights, [-1], 0, 0),
+       "k_schedule: draws=0 仍校验成员范围 -> ValueError")
+raises(ValueError,
+       lambda: app.weighted_sample_k_schedule_indices(
+           ks_items, [1, float("nan"), 3, 0, 1, 1], [0], 0, 0),
+       "k_schedule: draws=0 仍校验权重 (NaN) -> ValueError")
+# 窗口之外的轮次不要求可行性; draws=0 且 start=0 不触及任何轮次。
+check(app.weighted_sample_k_schedule_indices(
+    ks_items, [1, 0, 0, 0, 0, 0], [1, 2], 1, 0) == [[0]],
+    "窗口外轮次不做可行性检查")
+check(app.weighted_sample_k_schedule_counts(
+    ks_items, ks_weights, [1, 2], 0, 0) == [0] * 6,
+    "counts: draws=0 且合法 -> 全零列表")
+
+# 14.7 精确权重路径(Fraction/Decimal/超大整数)与不修改入参。
+ks_exact = app.weighted_sample_k_schedule_indices(
+    ["H", "t", "z"],
+    [10 ** 100, Fraction(1, 10 ** 100), _Decimal("1E-100")],
+    [2, 0, 1], 3, 7)
+check(len(ks_exact[0]) == 2 and ks_exact[1] == [] and len(ks_exact[2]) == 1
+      and ks_exact == app.weighted_sample_k_schedule_indices(
+          ["H", "t", "z"],
+          [10 ** 100, Fraction(1, 10 ** 100), _Decimal("1E-100")],
+          [2, 0, 1], 3, 7),
+      "k_schedule 在 Fraction/Decimal/超大整数下走精确路径且确定")
+ks_snap = (list(ks_items), list(ks_weights), list(ks_plan))
+app.weighted_sample_k_schedule(ks_items, ks_weights, ks_plan, 7, 5)
+app.weighted_sample_k_schedule_counts(ks_items, ks_weights, ks_plan, 7, 5)
+list(app.weighted_sample_k_schedule_stream_indices(
+    ks_items, ks_weights, ks_plan, 7, 5))
+check((list(ks_items), list(ks_weights), list(ks_plan)) == ks_snap,
+      "k_schedule 入口不修改 items / weights / k_schedule")
+app.weighted_sample_k_schedule_indices(
+    ks_items, ks_weights, [1, 2], 2, None)
+print("  PASS: k_schedule 下 seed=None 可正常工作")
 
 
 # ---------------------------------------------------------------------------
