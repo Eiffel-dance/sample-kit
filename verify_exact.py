@@ -846,6 +846,194 @@ check((list(sc_items), [list(r) for r in sc_schedule]) == sc_snap,
 
 
 # ---------------------------------------------------------------------------
+# 14. 按轮样本数计划的可暂停 / 恢复会话
+# ---------------------------------------------------------------------------
+section("按轮样本数计划 checkpoint / resume")
+
+kc_items = list("abcdefg")
+kc_weights = [3, 0, 2, 5, 1, 4, 2]
+kc_plan = [2, 0, 3, 1, 2, 4, 0, 3, 1]
+kc_seed = 42
+kc_full = app.weighted_sample_k_schedule_indices(
+    kc_items, kc_weights, kc_plan, len(kc_plan), kc_seed)
+
+# 14.1 恢复窗口逐轮等于一次性批量入口的零基切片; 连续恢复与一次性一致。
+slice_ok = True
+for start in range(len(kc_plan) + 1):
+    state = app.weighted_sample_k_schedule_checkpoint(
+        kc_items, kc_weights, kc_plan, kc_seed, start=start)
+    for draws in range(0, len(kc_plan) - start + 1):
+        rounds, next_state = app.weighted_sample_k_schedule_resume_indices(
+            kc_items, kc_weights, kc_plan, state, draws)
+        if rounds != kc_full[start:start + draws]:
+            slice_ok = False
+        if next_state["position"] != start + draws:
+            slice_ok = False
+state = app.weighted_sample_k_schedule_checkpoint(
+    kc_items, kc_weights, kc_plan, kc_seed)
+chained = []
+for d in (2, 0, 1, 3, 0, 3):
+    rounds, state = app.weighted_sample_k_schedule_resume_indices(
+        kc_items, kc_weights, kc_plan, state, d)
+    chained.extend(rounds)
+if chained != kc_full:
+    slice_ok = False
+check(slice_ok, "k schedule 恢复窗口等于一次性批量入口切片, 连续恢复一致")
+
+# 14.2 计划各项相同时与固定 k 的批量 / 流式 / 计数入口逐轮一致。
+uniform_plan = [2] * 6
+uniform_full = app.weighted_sample_k_schedule_indices(
+    kc_items, kc_weights, uniform_plan, 6, kc_seed)
+uniform_ok = (
+    uniform_full == app.weighted_sample_many_indices(
+        kc_items, kc_weights, 2, 6, kc_seed)
+    and list(app.weighted_sample_k_schedule_stream_indices(
+        kc_items, kc_weights, uniform_plan, 6, kc_seed)) == uniform_full
+)
+flat = [0] * len(kc_items)
+for rd in uniform_full:
+    for pos in rd:
+        flat[pos] += 1
+uniform_ok = uniform_ok and (
+    app.weighted_sample_k_schedule_counts(
+        kc_items, kc_weights, uniform_plan, 6, kc_seed) == flat)
+uniform_state = app.weighted_sample_k_schedule_checkpoint(
+    kc_items, kc_weights, uniform_plan, kc_seed, start=2)
+uniform_rounds, _ = app.weighted_sample_k_schedule_resume_indices(
+    kc_items, kc_weights, uniform_plan, uniform_state, 4)
+uniform_ok = uniform_ok and uniform_rounds == uniform_full[2:]
+check(uniform_ok, "k schedule 全等计划与固定 k 批量/流式/计数入口一致")
+
+# 14.3 值入口按位置映射, 下一状态与索引入口逐字段一致。
+dup_items = ["x", "y", "x", "z", "y", "x", "z"]
+dup_state = app.weighted_sample_k_schedule_checkpoint(
+    dup_items, kc_weights, kc_plan, kc_seed, start=2)
+v_rounds, v_next = app.weighted_sample_k_schedule_resume(
+    dup_items, kc_weights, kc_plan, dup_state, 4)
+i_rounds, i_next = app.weighted_sample_k_schedule_resume_indices(
+    dup_items, kc_weights, kc_plan, dup_state, 4)
+values_ok = (
+    v_rounds == [[dup_items[i] for i in rd] for rd in i_rounds]
+    and v_next == i_next
+    and v_rounds == app.weighted_sample_k_schedule(
+        dup_items, kc_weights, kc_plan, len(kc_plan), kc_seed)[2:6]
+)
+check(values_ok, "k schedule 值恢复按位置映射元素, 下一状态与索引入口一致")
+
+# 14.4 draws=0 返回空轮次与不变状态副本; 零样本轮次不耗随机流。
+zero_state = app.weighted_sample_k_schedule_checkpoint(
+    kc_items, kc_weights, kc_plan, kc_seed, start=2)
+zero_rounds, zero_next = app.weighted_sample_k_schedule_resume_indices(
+    kc_items, kc_weights, kc_plan, zero_state, 0)
+z_plan = [0, 0, 2, 0, 1]
+z_state = app.weighted_sample_k_schedule_checkpoint(
+    ["a", "b", "c"], [1, 2, 3], z_plan, seed=7, start=2)
+z_fresh = app._rng_state_to_jsonable(random.Random(7).getstate())
+z_rounds, z_next = app.weighted_sample_k_schedule_resume_indices(
+    ["a", "b", "c"], [1, 2, 3], z_plan, z_state, 2)
+zero_ok = (
+    zero_rounds == [] and zero_next == zero_state
+    and zero_next is not zero_state
+    and z_state["rng"] == z_fresh
+    and z_rounds == app.weighted_sample_k_schedule_indices(
+        ["a", "b", "c"], [1, 2, 3], z_plan, 5, seed=7)[2:4]
+    and z_rounds[1] == [] and z_next["position"] == 4
+)
+check(zero_ok, "k schedule: draws=0 状态不变; 零样本轮次不耗随机流")
+
+# 14.5 状态经 serialize/deserialize 往返后仍可恢复, 超大整数精确十进制。
+rt_ok = True
+state = app.weighted_sample_k_schedule_checkpoint(
+    kc_items, kc_weights, kc_plan, kc_seed, start=3)
+rounds, next_state = app.weighted_sample_k_schedule_resume_indices(
+    kc_items, kc_weights, kc_plan, dm(sm(state)), 4)
+if rounds != kc_full[3:7]:
+    rt_ok = False
+more, _ = app.weighted_sample_k_schedule_resume_indices(
+    kc_items, kc_weights, kc_plan, dm(sm(next_state)), 2)
+if more != kc_full[7:9]:
+    rt_ok = False
+big_weights = [10 ** 5000, 1, 2]
+big_plan = [1, 2, 0, 2]
+big_state = app.weighted_sample_k_schedule_checkpoint(
+    kc_items[:3], big_weights, big_plan, seed=8, start=1)
+big_restored = dm(sm(big_state))
+if not all(isinstance(x, int) for x in big_restored["rng"]["mt"]):
+    rt_ok = False
+big_rounds, _ = app.weighted_sample_k_schedule_resume_indices(
+    kc_items[:3], big_weights, big_plan, big_restored, 3)
+if big_rounds != app.weighted_sample_k_schedule_indices(
+        kc_items[:3], big_weights, big_plan, 4, seed=8)[1:]:
+    rt_ok = False
+check(rt_ok, "k schedule 状态经 serialize/deserialize 往返后可恢复且整数精确")
+
+# 14.6 非法输入与损坏状态按既有 TypeError / ValueError 分类, 不出部分结果。
+raises(TypeError, lambda: app.weighted_sample_k_schedule_checkpoint(
+    "abcdefg", kc_weights, kc_plan, 0),
+    "k schedule checkpoint: items 为文本 -> TypeError")
+raises(TypeError, lambda: app.weighted_sample_k_schedule_checkpoint(
+    kc_items, kc_weights, iter(kc_plan), 0),
+    "k schedule checkpoint: 计划为迭代器 -> TypeError")
+raises(TypeError, lambda: app.weighted_sample_k_schedule_checkpoint(
+    kc_items, kc_weights, [1, True], 0),
+    "k schedule checkpoint: 成员为布尔 -> TypeError")
+raises(ValueError, lambda: app.weighted_sample_k_schedule_checkpoint(
+    kc_items, kc_weights, [1, -1], 0),
+    "k schedule checkpoint: 成员为负 -> ValueError")
+raises(ValueError, lambda: app.weighted_sample_k_schedule_checkpoint(
+    kc_items, kc_weights, [8], 0),
+    "k schedule checkpoint: 成员超过位置数 -> ValueError")
+raises(ValueError, lambda: app.weighted_sample_k_schedule_checkpoint(
+    kc_items, kc_weights, kc_plan, 0, len(kc_plan) + 1),
+    "k schedule checkpoint: start 越过计划长度 -> ValueError")
+raises(ValueError, lambda: app.weighted_sample_k_schedule_checkpoint(
+    kc_items, [1, 0, 0, 0, 0, 0, 0], [0, 2], 0),
+    "k schedule checkpoint: 某轮正权重不足 -> ValueError")
+end_state = app.weighted_sample_k_schedule_checkpoint(
+    kc_items, kc_weights, kc_plan, kc_seed, start=len(kc_plan))
+raises(ValueError, lambda: app.weighted_sample_k_schedule_resume_indices(
+    kc_items, kc_weights, kc_plan, end_state, 1),
+    "k schedule resume: 恢复窗口超出计划范围 -> ValueError")
+raises(TypeError, lambda: app.weighted_sample_k_schedule_resume_indices(
+    kc_items, kc_weights, kc_plan, [], 1),
+    "k schedule resume: 非映射状态 -> TypeError")
+raises(TypeError, lambda: app.weighted_sample_k_schedule_resume_indices(
+    kc_items, kc_weights, kc_plan, end_state, True),
+    "k schedule resume: draws 为布尔 -> TypeError")
+tampered = _copy.deepcopy(zero_state)
+tampered["position"] += 1
+raises(ValueError, lambda: app.weighted_sample_k_schedule_resume_indices(
+    kc_items, kc_weights, kc_plan, tampered, 1),
+    "k schedule resume: 位置篡改且摘要不符 -> ValueError")
+tampered_exact = _copy.deepcopy(zero_state)
+tampered_exact["exact"] = not tampered_exact["exact"]
+raises(ValueError, lambda: app.weighted_sample_k_schedule_resume_indices(
+    kc_items, kc_weights, kc_plan, tampered_exact, 1),
+    "k schedule resume: 路径标记篡改且摘要不符 -> ValueError")
+wrong_kind = app.weighted_sample_schedule_checkpoint(
+    kc_items, [list(kc_weights)] * len(kc_plan), 2, kc_seed, start=2)
+raises(ValueError, lambda: app.weighted_sample_k_schedule_resume_indices(
+    kc_items, kc_weights, kc_plan, wrong_kind, 1),
+    "k schedule resume: 按轮权重计划状态不能用于本恢复 -> ValueError")
+raises(ValueError, lambda: app.weighted_sample_k_schedule_resume_indices(
+    kc_items, kc_weights, [2, 0, 3, 1, 2, 4, 0, 3, 2], zero_state, 1),
+    "k schedule resume: 计划不匹配 -> ValueError")
+
+# 14.7 入参与状态不被修改。
+kc_snap = (list(kc_items), list(kc_weights), list(kc_plan))
+kc_state = app.weighted_sample_k_schedule_checkpoint(
+    kc_items, kc_weights, kc_plan, kc_seed, start=2)
+kc_state_snap = _copy.deepcopy(kc_state)
+app.weighted_sample_k_schedule_resume_indices(
+    kc_items, kc_weights, kc_plan, kc_state, 3)
+app.weighted_sample_k_schedule_resume(
+    kc_items, kc_weights, kc_plan, kc_state, 3)
+check((list(kc_items), list(kc_weights), list(kc_plan)) == kc_snap
+      and kc_state == kc_state_snap,
+      "k schedule checkpoint/resume 不修改 items / weights / 计划 / 状态")
+
+
+# ---------------------------------------------------------------------------
 print()
 if _FAILURES:
     print("结果: %d 项失败" % len(_FAILURES))
