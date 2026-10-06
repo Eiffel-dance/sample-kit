@@ -4544,6 +4544,396 @@ def weighted_sample_stratified_counts(items, weights, strata, quotas, seed=0):
 
 
 # ---------------------------------------------------------------------------
+# 可暂停 / 恢复的分层配额采样会话
+# ---------------------------------------------------------------------------
+
+_STRATIFIED_CHECKPOINT_KIND = "stratified"
+
+
+def _strata_fingerprint(strata_numbers):
+    """对完整的分层编号序列取指纹: 逐位置带下标规范化后整体 sha256。
+
+    位置的零基下标与编号值都参与指纹, 因此调换两个位置的编号、增删位置
+    或改动任一编号都会改变指纹; 成员在调用前已通过
+    _validate_stratified_inputs 校验(非布尔非负整数), 超大整数编号也按
+    精确十进制处理, 不经过浮点。
+    """
+    digest = hashlib.sha256()
+    for index, number in enumerate(strata_numbers):
+        digest.update(
+            ("%d:%s\n" % (index, _int_to_decimal_text(number))).encode(
+                "utf-8"
+            )
+        )
+    return digest.hexdigest()
+
+
+def _quotas_fingerprint(quota_values):
+    """对完整的分层配额计划取指纹: 逐层带编号规范化后整体 sha256。
+
+    分层编号(quotas 的零基下标)与配额值都参与指纹, 因此调换、增删或改动
+    任一层的配额都会改变指纹; 成员在调用前已通过
+    _validate_stratified_inputs 校验(非布尔非负整数), 超大整数配额同样
+    按精确十进制处理, 不经过浮点。
+    """
+    digest = hashlib.sha256()
+    for number, quota in enumerate(quota_values):
+        digest.update(
+            ("%d:%s\n" % (number, _int_to_decimal_text(quota))).encode(
+                "utf-8"
+            )
+        )
+    return digest.hexdigest()
+
+
+def _stratified_checkpoint_binding_digest(
+    seed_tagged, position, n, strata_count, items_digest, weights_digest,
+    strata_digest, quotas_digest, rng_payload,
+):
+    """把分层配额断点各字段绑定为一个防篡改摘要。
+
+    与其他断点同一构造(serialize_metrics 规范化后 sha256), 绑定标签
+    kind、position、n、分层数、items / weights / strata / quotas 的指纹、
+    标签化 seed 与 RNG 快照: 任一字段被改动而不重算摘要时, 恢复都会在
+    产出任何分层结果前发现, 因此长计划分段交接无需从头重放随机流。
+    """
+    return _hash_text(serialize_metrics({
+        "kind": _STRATIFIED_CHECKPOINT_KIND,
+        "seed": seed_tagged,
+        "position": position,
+        "n": n,
+        "strata_count": strata_count,
+        "items_digest": items_digest,
+        "weights_digest": weights_digest,
+        "strata_digest": strata_digest,
+        "quotas_digest": quotas_digest,
+        "rng": rng_payload,
+    }))
+
+
+def _prepare_validated_stratified_session(
+    items, weights, strata, quotas, seed, start
+):
+    """分层断点入口共用的前置准备: 与一次性分层入口一致的校验与跳层。
+
+    以 _validate_stratified_inputs 完成 items、weights、seed、strata、
+    quotas 的全部校验(结构/成员类型、长度与编号范围、权重取值、每层正
+    权重可行性), start 必须是非布尔非负整数且不超过分层数(start ==
+    分层数允许, 表示计划已全部消费)。随后把随机流推进到 "前 start 个
+    分层已消费" 的位置 —— 被跳过的层按自己的成员权重与抽样计划消耗,
+    零配额分层不消耗随机流, 与一次性入口的节奏完全一致。返回
+    (n, strata 编号副本, quotas 配额副本, rng); 权重只复制到本地,
+    绝不修改入参。
+    """
+    n, strata_numbers, quota_values = _validate_stratified_inputs(
+        items, weights, strata, quotas, seed
+    )
+    _validate_start(start)
+    if start > len(quota_values):
+        raise ValueError("stratified start out of range")
+
+    local_weights = list(weights)
+    rng = random.Random(seed)
+    for number in range(start):
+        quota = quota_values[number]
+        # 零配额分层只推进位置, 不消耗随机流 —— 与一次性入口的节奏一致。
+        if quota == 0:
+            continue
+        pool = [i for i in range(n) if strata_numbers[i] == number]
+        pool_weights = [local_weights[i] for i in pool]
+        planned_weights, use_exact = _select_sampling_plan(
+            pool_weights, quota
+        )
+        _draw_indices_once_pool(pool, planned_weights, quota, rng, use_exact)
+    return n, strata_numbers, quota_values, rng
+
+
+def weighted_sample_stratified_checkpoint(
+    items, weights, strata, quotas, seed=0, start=0
+):
+    """创建分层配额采样会话的断点(只含 JSON 原生值的状态映射)。
+
+    校验沿用 weighted_sample_stratified_indices 的全部规则与固定顺序:
+    items、weights、seed 与既有采样入口一致; strata 是与 items 等长的
+    有限非文本序列, 成员为非布尔非负整数分层编号; quotas 是有限非文本
+    序列, 下标对应分层编号, 成员为非布尔非负整数配额, 长度必须恰好等于
+    最大编号加一; 权重元素继续接受非布尔 int、有限非负 float、Fraction、
+    Decimal(可混合, 超大整数、Fraction、Decimal 不经过浮点); 负数、
+    NaN、无穷权重、错误结构或任一层配额超过该层正权重位置数一律拒绝。
+    start 必须是非布尔非负整数且不超过分层数(start == 分层数允许, 表示
+    计划已全部消费)。全部校验在返回状态前完成, 失败不返回部分结果,
+    也不修改入参。
+
+    校验通过后按编号升序处理前 start 个分层(每层在其成员位置中按权重
+    比例无放回抽取配额个位置, 零配额或无成员分层只推进位置而不消耗随机
+    流), 再返回当前位置与只含 JSON 原生值的状态; 状态绑定版本、标签
+    kind、position、n、分层数、items / weights / strata / quotas 指纹、
+    标签化 seed、随机流快照与完整性摘要, 可直接交给 serialize_metrics
+    落盘, 也可经 deserialize_metrics 还原(甚至跨进程)后交给
+    weighted_sample_stratified_resume_indices 恢复。
+    """
+    n, strata_numbers, quota_values, rng = (
+        _prepare_validated_stratified_session(
+            items, weights, strata, quotas, seed, start
+        )
+    )
+    seed_tagged = _seed_to_tagged_value(seed)
+    rng_payload = _rng_state_to_jsonable(rng.getstate())
+    items_digest = _items_fingerprint(items)
+    weights_digest = _weights_fingerprint(weights)
+    strata_digest = _strata_fingerprint(strata_numbers)
+    quotas_digest = _quotas_fingerprint(quota_values)
+    strata_count = len(quota_values)
+    state = {
+        "version": _CHECKPOINT_VERSION,
+        "kind": _STRATIFIED_CHECKPOINT_KIND,
+        "position": start,
+        "n": n,
+        "strata_count": strata_count,
+        "items_digest": items_digest,
+        "weights_digest": weights_digest,
+        "strata_digest": strata_digest,
+        "quotas_digest": quotas_digest,
+        "seed": seed_tagged,
+        "rng": rng_payload,
+    }
+    state["digest"] = _stratified_checkpoint_binding_digest(
+        seed_tagged, start, n, strata_count, items_digest, weights_digest,
+        strata_digest, quotas_digest, rng_payload,
+    )
+    return state
+
+
+def _validate_stratified_checkpoint_state(state):
+    """校验分层配额断点状态本身的结构与版本, 返回规范化字段。
+
+    调用前须已确认 state 是映射(否则 TypeError 在外层抛出)。字段缺失、
+    未知(多余)字段、类型错误、非法取值、版本不支持、kind 不符等一切
+    结构问题统一抛 ValueError。
+    """
+    required = ("version", "kind", "position", "n", "strata_count",
+                "items_digest", "weights_digest", "strata_digest",
+                "quotas_digest", "seed", "rng", "digest")
+    if not all(key in state for key in required):
+        raise ValueError("invalid checkpoint state: missing fields")
+    if set(state) != set(required):
+        raise ValueError("invalid checkpoint state: unexpected fields")
+
+    version = state["version"]
+    if (isinstance(version, bool) or not isinstance(version, int)
+            or version != _CHECKPOINT_VERSION):
+        raise ValueError("unsupported checkpoint version: %r" % (version,))
+    if state["kind"] != _STRATIFIED_CHECKPOINT_KIND:
+        raise ValueError("invalid checkpoint state: unexpected kind")
+    position = state["position"]
+    n = state["n"]
+    strata_count = state["strata_count"]
+    for name, value in (("position", position), ("n", n),
+                        ("strata_count", strata_count)):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError("invalid checkpoint state: %s" % name)
+    if position > strata_count:
+        raise ValueError("invalid checkpoint state: position exceeds strata")
+    for name in ("items_digest", "weights_digest", "strata_digest",
+                 "quotas_digest", "digest"):
+        if not isinstance(state[name], str):
+            raise ValueError("invalid checkpoint state: %s" % name)
+
+    # 状态可能经 serialize_metrics + deserialize_metrics 还原: 其中的
+    # Decimal 载荷先还原为创建时的等值 float, 再解码与核对摘要 —— 两条
+    # 文本路径(json / serialize_metrics)解析出的状态因此可互换恢复。
+    seed_payload = _normalize_checkpoint_numbers(state["seed"])
+    rng_payload = _normalize_checkpoint_numbers(state["rng"])
+
+    # 两个逆运算对内部结构问题统一抛 ValueError。
+    seed = _tagged_value_to_seed(seed_payload)
+    rng_state = _rng_state_from_jsonable(rng_payload)
+
+    # 绑定摘要: 任何对字段的篡改(position、kind、分层数、seed、RNG
+    # 快照、指纹)若不附带重算的摘要, 都会在这里被发现 —— 因此恢复时
+    # 不必从头重放随机流。
+    expected_digest = _stratified_checkpoint_binding_digest(
+        seed_payload, position, n, strata_count, state["items_digest"],
+        state["weights_digest"], state["strata_digest"],
+        state["quotas_digest"], rng_payload,
+    )
+    if not hmac.compare_digest(expected_digest, state["digest"]):
+        raise ValueError("invalid checkpoint state: digest mismatch")
+    return (position, n, strata_count, seed, rng_state, seed_payload)
+
+
+def _resume_stratified_indices(items, weights, strata, quotas, state, draws):
+    """两个分层恢复入口共用的已校验核心: 只产出索引序列与下一状态。
+
+    调用约定与其他恢复核心相同: 外层已确认 state 是映射并校验过 draws。
+    先校验状态本身的结构/版本/摘要, 再用状态携带的 seed 按
+    weighted_sample_stratified_indices 的固定顺序完成 items、weights、
+    strata、quotas 的全部校验, 恢复窗口 [position, position+draws) 越过
+    分层数时以 ValueError 拒绝; 然后核对状态与当前输入的绑定(n、分层数、
+    items / weights / strata / quotas 指纹)。任一失败都在物化任何结果
+    之前抛出既有 TypeError / ValueError, JSON / Decimal / random 层面的
+    意外异常统一收敛为 ValueError。全部通过后直接从 RNG 快照续接, 窗口
+    内每层按自己的成员权重重建确定性抽样计划后抽样(零配额分层只推进
+    位置), 各层结果按编号升序拼接, 返回 (索引列表, 下一状态); 不修改
+    入参, 也不修改传入的状态映射。
+    """
+    (position, state_n, strata_count, seed, rng_state,
+     seed_payload) = _validate_stratified_checkpoint_state(state)
+
+    # 与一次性分层入口同一套校验: 结构/成员类型、长度与编号范围、权重
+    # 取值与每层正权重可行性都在此确定。
+    n, strata_numbers, quota_values = _validate_stratified_inputs(
+        items, weights, strata, quotas, seed
+    )
+
+    # 恢复窗口不得越过计划范围; 计划末尾之后只接受空窗口(draws=0)。
+    if position + draws > len(quota_values):
+        raise ValueError("stratified resume window out of range")
+
+    # 状态与当前采样输入的一致性: n 与分层数先比, 再核对完整指纹。
+    if state_n != n:
+        raise ValueError("checkpoint state does not match items")
+    if strata_count != len(quota_values):
+        raise ValueError("checkpoint state does not match quotas")
+    if state["items_digest"] != _items_fingerprint(items):
+        raise ValueError("checkpoint state does not match items")
+    if state["weights_digest"] != _weights_fingerprint(weights):
+        raise ValueError("checkpoint state does not match weights")
+    if state["strata_digest"] != _strata_fingerprint(strata_numbers):
+        raise ValueError("checkpoint state does not match strata")
+    if state["quotas_digest"] != _quotas_fingerprint(quota_values):
+        raise ValueError("checkpoint state does not match quotas")
+
+    # 全部校验通过后才物化结果: 直接从快照状态继续。每层的抽样计划由
+    # (该层成员权重, 配额) 唯一确定, 与创建断点及一次性入口算出的计划
+    # 逐层相同, 因此恢复结果与一次性入口的相同分层区间逐项一致。
+    rng = random.Random()
+    try:
+        rng.setstate(rng_state)
+    except ValueError:
+        raise
+    except Exception as exc:
+        # 结构与取值范围已在上游校验; 任何解释器层面的额外拒绝都统一成
+        # ValueError, 绝不泄漏其他异常类型, 也不会已产出部分结果。
+        raise ValueError("invalid checkpoint RNG state") from exc
+    local_weights = list(weights)
+    indices = []
+    for number in range(position, position + draws):
+        quota = quota_values[number]
+        # 零配额分层只推进位置, 不消耗随机流。
+        if quota == 0:
+            continue
+        pool = [i for i in range(n) if strata_numbers[i] == number]
+        pool_weights = [local_weights[i] for i in pool]
+        planned_weights, use_exact = _select_sampling_plan(
+            pool_weights, quota
+        )
+        indices.extend(
+            _draw_indices_once_pool(pool, planned_weights, quota, rng,
+                                    use_exact)
+        )
+
+    next_state = dict(state)
+    next_rng_payload = _rng_state_to_jsonable(rng.getstate())
+    next_position = position + draws
+    next_state["position"] = next_position
+    next_state["rng"] = next_rng_payload
+    # seed 载荷使用校验时规范化后的形式: 经 deserialize_metrics 还原的
+    # 状态其 Decimal 已回到等值 float, 下一状态因此与 JSON 原生状态链
+    # 逐字段一致, 可继续经任一文本路径序列化/解析后再恢复。
+    next_state["seed"] = seed_payload
+    # 摘要必须随 position / RNG 一并刷新, 否则链式再恢复时会因摘要失配
+    # 而失败(其余字段与原状态相同)。
+    next_state["digest"] = _stratified_checkpoint_binding_digest(
+        seed_payload, next_position, n, strata_count,
+        state["items_digest"], state["weights_digest"],
+        state["strata_digest"], state["quotas_digest"], next_rng_payload,
+    )
+    return indices, next_state
+
+
+def weighted_sample_stratified_resume_indices(
+    items, weights, strata, quotas, state, draws
+):
+    """从分层配额断点继续产出索引序列, 返回 (索引列表, 下一状态)。
+
+    从断点记录的位置(已消费的分层编号前缀)开始消费 draws 个连续分层
+    槽位; 结果与一次性 weighted_sample_stratified_indices 在相同分层
+    区间 [position, position+draws) 的按编号拼接段逐项一致(层内保持
+    抽样先后, 重复值按位置区分, 零权重永不出现); 多次连续续接与一次性
+    生成逐项相同, 恢复时无需从头重放随机流。返回前完成与一次性分层
+    入口一致的全部输入校验(含恢复窗口不越过分层数), 并核对状态与
+    items、weights、strata、quotas 及 (seed, 位置, RNG 快照) 的自洽性:
+    状态不是映射抛 TypeError; 字段缺失或未知、版本或 kind 不支持、摘要
+    或输入不匹配统一抛 ValueError; items/weights/strata/quotas/draws
+    的错误沿用既有 TypeError / ValueError。所有失败都在任何结果物化
+    之前确定, 绝不返回部分结果。draws=0 返回空列表与位置不变的状态
+    副本; 零配额分层只推进 position 而不消耗随机流。状态可经
+    serialize_metrics / deserialize_metrics 往返后继续恢复。不修改
+    入参, 也不修改传入的状态映射。
+    """
+    # 状态不是映射: TypeError(文档约定的明确分类)。映射前提下的一切
+    # 结构/版本/摘要问题统一为 ValueError。
+    if not isinstance(state, collections.abc.Mapping):
+        raise TypeError("checkpoint state must be a mapping")
+    # draws 的类型/取值规则独立于状态, 先按既有规则校验(TypeError /
+    # ValueError), 再解析状态。
+    _validate_draws(draws)
+    return _resume_stratified_indices(
+        items, weights, strata, quotas, state, draws
+    )
+
+
+def weighted_sample_stratified_resume(
+    items, weights, strata, quotas, state, draws
+):
+    """按元素值从分层配额断点继续, 返回 (元素值列表, 下一状态)。
+
+    校验顺序按恢复入口约定固定: 调用开始先按现有一次性分层入口完成
+    items、weights、strata、quotas 的结构、成员类型、长度与编号范围、
+    权重取值与每层正权重可行性校验(这部分与 seed 无关, 以合法种子 0
+    试跑; state 携带的 seed 其标签化编码随后随 state 一并校验), 再按
+    现有恢复入口校验 state 的映射类型、版本、字段集合、摘要、随机数
+    状态以及 state 与当前输入的绑定(含恢复窗口范围), draws 必须是非
+    布尔非负整数。状态不是映射抛 TypeError; 非法状态、版本或 kind 不
+    支持、状态与输入不匹配、正权重不足或恢复窗口越出分层范围等一律抛
+    ValueError; 其余输入错误沿用既有 TypeError / ValueError。所有失败
+    都在产生任何结果之前确定, JSON / Decimal / random 的异常不会以
+    其他类型泄漏。
+
+    返回的元素值列表与 weighted_sample_stratified_resume_indices 返回
+    的原始位置逐项对应(第 j 个值恰为 items[第 j 个索引]): 相同值的
+    不同位置分别消耗。返回的下一状态与按索引入口产出的完全相同
+    (position、RNG 快照、digest 一致), 只含 JSON 原生值, 可直接再次
+    传入本入口或按索引入口, 或经 serialize_metrics / deserialize_metrics
+    往返后继续恢复。draws=0 返回空列表与位置、随机状态不变的状态副本;
+    零配额分层只推进 position 而不消耗随机流。不修改入参, 也不修改
+    传入的状态映射。
+    """
+    # 第一步: 先按现有一次性分层入口完成 items、weights、strata、quotas
+    # 的全部校验(以合法种子 0 试跑; state 携带的 seed 其编码与类型在第
+    # 三步随状态一并校验)。因此即使 state 本身已损坏, 非法输入仍优先以
+    # 分层入口的异常类别报告。
+    _validate_stratified_inputs(items, weights, strata, quotas, 0)
+
+    # 第二步: 恢复入口的映射类型检查与 draws 规则(TypeError / ValueError)。
+    if not isinstance(state, collections.abc.Mapping):
+        raise TypeError("checkpoint state must be a mapping")
+    _validate_draws(draws)
+
+    # 第三步: 状态结构/版本/字段/摘要/RNG、state 与输入绑定(含从状态
+    # 解出的 seed 再跑一次完整分层校验与窗口检查), 全部通过后从 RNG
+    # 快照续接产出索引序列。与按索引入口共用同一个已校验核心, 因此
+    # 结果内容、下一状态、异常类别与其逐项一致。
+    indices, next_state = _resume_stratified_indices(
+        items, weights, strata, quotas, state, draws
+    )
+    # 按原始位置逐项映射为元素值: 相同值的不同位置各自独立映射。只读取
+    # items, 不修改入参。
+    return [items[i] for i in indices], next_state
+
+
+# ---------------------------------------------------------------------------
 # 指标序列化
 # ---------------------------------------------------------------------------
 

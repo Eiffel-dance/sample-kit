@@ -41,6 +41,9 @@ from app import (
     weighted_sample_stratified_indices,
     weighted_sample_stratified,
     weighted_sample_stratified_counts,
+    weighted_sample_stratified_checkpoint,
+    weighted_sample_stratified_resume_indices,
+    weighted_sample_stratified_resume,
     weighted_sample_stream,
     weighted_sample_stream_indices,
     weighted_sample_many_excluding,
@@ -8762,6 +8765,499 @@ class WeightedSampleStratifiedTest(unittest.TestCase):
         self.assertEqual(
             weighted_sample(self.ITEMS, self.WEIGHTS, 3, self.SEED),
             weighted_sample(self.ITEMS, self.WEIGHTS, 3, self.SEED))
+
+
+class WeightedSampleStratifiedCheckpointTest(unittest.TestCase):
+    """分层配额采样的可暂停 / 恢复会话:
+    weighted_sample_stratified_checkpoint /
+    weighted_sample_stratified_resume_indices /
+    weighted_sample_stratified_resume。"""
+
+    ITEMS = ["a", "b", "c", "d", "e", "f", "g", "h"]
+    WEIGHTS = [5, 1, 3, 2, 4, 1, 2, 6]
+    STRATA = [0, 0, 1, 1, 2, 2, 2, 2]
+    QUOTAS = [1, 1, 2]
+    SEED = 20240521
+
+    def _full(self):
+        return weighted_sample_stratified_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS, self.SEED)
+
+    def _segment(self, start, draws):
+        # 一次性结果按配额累计边界切出的分层区间 [start, start+draws)。
+        begin = sum(self.QUOTAS[:start])
+        end = sum(self.QUOTAS[:start + draws])
+        return self._full()[begin:end]
+
+    def test_checkpoint_state_is_json_native(self):
+        state = weighted_sample_stratified_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+            self.SEED, start=2)
+        # 版本 / kind / 位置 / 分层数 / 指纹 / seed / RNG / 摘要齐备。
+        self.assertEqual(state["version"], 1)
+        self.assertEqual(state["kind"], "stratified")
+        self.assertEqual(state["position"], 2)
+        self.assertEqual(state["n"], len(self.ITEMS))
+        self.assertEqual(state["strata_count"], len(self.QUOTAS))
+        self.assertTrue(json.loads(json.dumps(state)) == state)
+
+    def test_resume_window_equals_one_shot_segment(self):
+        for start in range(len(self.QUOTAS) + 1):
+            state = weighted_sample_stratified_checkpoint(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+                self.SEED, start=start)
+            for draws in range(0, len(self.QUOTAS) - start + 1):
+                with self.subTest(start=start, draws=draws):
+                    indices, next_state = (
+                        weighted_sample_stratified_resume_indices(
+                            self.ITEMS, self.WEIGHTS, self.STRATA,
+                            self.QUOTAS, state, draws)
+                    )
+                    self.assertEqual(indices, self._segment(start, draws))
+                    self.assertEqual(next_state["position"], start + draws)
+
+    def test_chained_resumes_equal_one_shot_run(self):
+        state = weighted_sample_stratified_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS, self.SEED)
+        chunks = []
+        for draws in (1, 0, 2, 0):
+            indices, state = weighted_sample_stratified_resume_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+                state, draws)
+            chunks.extend(indices)
+        self.assertEqual(chunks, self._full())
+        # 链式结束时位置恰为计划末尾。
+        self.assertEqual(state["position"], len(self.QUOTAS))
+
+    def test_draws_zero_returns_empty_and_unchanged_state_copy(self):
+        state = weighted_sample_stratified_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+            self.SEED, start=1)
+        indices, next_state = weighted_sample_stratified_resume_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS, state, 0)
+        self.assertEqual(indices, [])
+        self.assertEqual(next_state, state)
+        self.assertIsNot(next_state, state)
+
+    def test_zero_quota_stratum_only_advances_position_without_rng(self):
+        items = ["a", "b", "c", "d", "e", "f"]
+        weights = [3, 1, 2, 2, 4, 1]
+        strata = [0, 0, 1, 1, 2, 2]
+        quotas = [1, 0, 1]
+        import random as _random
+        # 越过零配额的第 1 层不消耗随机流: start=2 的快照与只消费第 0 层
+        # 的快照一致。
+        head = _random.Random(self.SEED)
+        pool = [0, 1]
+        planned, use_exact = app._select_sampling_plan([3, 1], 1)
+        app._draw_indices_once_pool(pool, planned, 1, head, use_exact)
+        state = weighted_sample_stratified_checkpoint(
+            items, weights, strata, quotas, self.SEED, start=2)
+        self.assertEqual(
+            state["rng"], app._rng_state_to_jsonable(head.getstate()))
+        # 恢复窗口只覆盖零配额层: 空结果, 只推进位置, 随机流不变。
+        indices, next_state = weighted_sample_stratified_resume_indices(
+            items, weights, strata, quotas, state, 0)
+        self.assertEqual(indices, [])
+        self.assertEqual(next_state["rng"], state["rng"])
+        # 从 start=1 恢复零配额层再恢复第 2 层, 与一次性结果逐项一致。
+        mid = weighted_sample_stratified_checkpoint(
+            items, weights, strata, quotas, self.SEED, start=1)
+        self.assertEqual(mid["rng"], state["rng"])
+        indices, _ = weighted_sample_stratified_resume_indices(
+            items, weights, strata, quotas, mid, 2)
+        full = weighted_sample_stratified_indices(
+            items, weights, strata, quotas, self.SEED)
+        self.assertEqual(indices, full[1:])
+
+    def test_checkpoint_at_end_of_plan(self):
+        # start == 分层数允许, 表示计划已全部消费; 只能再以 draws=0 恢复。
+        end = weighted_sample_stratified_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+            self.SEED, start=len(self.QUOTAS))
+        self.assertEqual(end["position"], len(self.QUOTAS))
+        indices, same = weighted_sample_stratified_resume_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS, end, 0)
+        self.assertEqual(indices, [])
+        self.assertEqual(same, end)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_resume_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS, end, 1)
+
+    def test_value_resume_maps_positions_and_shares_next_state(self):
+        items = ["x", "y", "x", "z", "y", "x", "z", "y"]
+        state = weighted_sample_stratified_checkpoint(
+            items, self.WEIGHTS, self.STRATA, self.QUOTAS,
+            self.SEED, start=1)
+        values, value_next = weighted_sample_stratified_resume(
+            items, self.WEIGHTS, self.STRATA, self.QUOTAS, state, 2)
+        indices, index_next = weighted_sample_stratified_resume_indices(
+            items, self.WEIGHTS, self.STRATA, self.QUOTAS, state, 2)
+        self.assertEqual(values, [items[i] for i in indices])
+        # 下一状态逐字段一致, 可互换续接。
+        self.assertEqual(value_next, index_next)
+        full = weighted_sample_stratified(
+            items, self.WEIGHTS, self.STRATA, self.QUOTAS, self.SEED)
+        self.assertEqual(values, full[self.QUOTAS[0]:])
+
+    def test_state_roundtrips_serialize_metrics(self):
+        state = weighted_sample_stratified_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+            self.SEED, start=1)
+        restored = deserialize_metrics(serialize_metrics(state))
+        indices, next_state = weighted_sample_stratified_resume_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+            restored, 1)
+        self.assertEqual(indices, self._segment(1, 1))
+        # 下一状态再做一次文本往返后仍可续接。
+        again, _ = weighted_sample_stratified_resume_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+            deserialize_metrics(serialize_metrics(next_state)), 1)
+        self.assertEqual(again, self._segment(2, 1))
+
+    def test_rng_words_keep_exact_decimal_integers(self):
+        items = ["a", "b", "c"]
+        weights = [10 ** 5000, 1, 2]
+        strata = [0, 0, 1]
+        quotas = [1, 1]
+        state = weighted_sample_stratified_checkpoint(
+            items, weights, strata, quotas, seed=8, start=1)
+        restored = deserialize_metrics(serialize_metrics(state))
+        self.assertTrue(all(isinstance(x, int) for x in restored["rng"]["mt"]))
+        indices, _ = weighted_sample_stratified_resume_indices(
+            items, weights, strata, quotas, restored, 1)
+        self.assertEqual(
+            indices,
+            weighted_sample_stratified_indices(
+                items, weights, strata, quotas, seed=8)[1:],
+        )
+
+    def test_fraction_decimal_and_huge_integer_weights_resume(self):
+        items = ["a", "b", "c", "d"]
+        weights = [Fraction(1, 10 ** 30), Decimal("1E-25"), 10 ** 80, 2]
+        strata = [0, 0, 1, 1]
+        quotas = [1, 1]
+        full = weighted_sample_stratified_indices(
+            items, weights, strata, quotas, 17)
+        state = weighted_sample_stratified_checkpoint(
+            items, weights, strata, quotas, 17, start=1)
+        indices, _ = weighted_sample_stratified_resume_indices(
+            items, weights, strata, quotas, state, 1)
+        self.assertEqual(indices, full[1:])
+        values, _ = weighted_sample_stratified_resume(
+            items, weights, strata, quotas, state, 1)
+        self.assertEqual(values, [items[i] for i in indices])
+
+    def test_empty_items_checkpoint_and_resume(self):
+        state = weighted_sample_stratified_checkpoint([], [], [], [])
+        self.assertEqual(state["position"], 0)
+        self.assertEqual(state["strata_count"], 0)
+        indices, next_state = weighted_sample_stratified_resume_indices(
+            [], [], [], [], state, 0)
+        self.assertEqual(indices, [])
+        self.assertEqual(next_state, state)
+        values, _ = weighted_sample_stratified_resume(
+            [], [], [], [], state, 0)
+        self.assertEqual(values, [])
+
+    def test_all_zero_quotas_session(self):
+        quotas = [0, 0, 0]
+        state = weighted_sample_stratified_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.STRATA, quotas, self.SEED)
+        indices, state = weighted_sample_stratified_resume_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA, quotas, state, 3)
+        self.assertEqual(indices, [])
+        self.assertEqual(state["position"], 3)
+
+    # ------------------------------------------------------------------
+    # 创建入口: 沿用分层配额入口的全部校验
+    # ------------------------------------------------------------------
+    def test_checkpoint_validation_matches_stratified_entry(self):
+        te = lambda fn: self.assertRaises(TypeError, fn)
+        ve = lambda fn: self.assertRaises(ValueError, fn)
+        items, weights = self.ITEMS, self.WEIGHTS
+        strata, quotas, seed = self.STRATA, self.QUOTAS, self.SEED
+        cp = weighted_sample_stratified_checkpoint
+        te(lambda: cp("abcdefgh", weights, strata, quotas, seed))
+        te(lambda: cp(items, "12345678", strata, quotas, seed))
+        te(lambda: cp(items, weights, "00012222", quotas, seed))
+        te(lambda: cp(items, weights, strata, "112", seed))
+        te(lambda: cp(items, weights, strata, quotas, object()))
+        te(lambda: cp(items, weights, [True] + strata[1:], quotas, seed))
+        te(lambda: cp(items, weights, strata, [1, False, 2], seed))
+        te(lambda: cp(items, [True] + weights[1:], strata, quotas, seed))
+        te(lambda: cp(items, weights, strata, quotas, seed, True))
+        te(lambda: cp(items, weights, strata, quotas, seed, 1.0))
+        ve(lambda: cp(items, weights[:-1], strata, quotas, seed))
+        ve(lambda: cp(items, weights, strata[:-1], quotas, seed))
+        ve(lambda: cp(items, weights, [-1] + strata[1:], quotas, seed))
+        ve(lambda: cp(items, weights, strata, quotas[:-1], seed))
+        ve(lambda: cp(items, weights, strata, quotas + [0], seed))
+        ve(lambda: cp(items, weights, strata, [1, -1, 2], seed))
+        ve(lambda: cp(items, weights, strata, [3, 1, 2], seed))
+        ve(lambda: cp(items, [-1] + weights[1:], strata, quotas, seed))
+        ve(lambda: cp(items, [float("nan")] + weights[1:], strata, quotas,
+                      seed))
+        ve(lambda: cp(items, [float("inf")] + weights[1:], strata, quotas,
+                      seed))
+        ve(lambda: cp(items, weights, strata, quotas, seed, -1))
+        ve(lambda: cp(items, weights, strata, quotas, seed, len(quotas) + 1))
+        # 空 items 只接受空 strata / quotas 与 start=0。
+        ve(lambda: cp([], [], [], [0]))
+        ve(lambda: cp([], [], [], [], 0, 1))
+        empty = cp([], [], [], [])
+        self.assertEqual(empty["position"], 0)
+
+    def test_checkpoint_does_not_mutate_inputs(self):
+        items = list(self.ITEMS)
+        weights = list(self.WEIGHTS)
+        strata = list(self.STRATA)
+        quotas = list(self.QUOTAS)
+        weighted_sample_stratified_checkpoint(
+            items, weights, strata, quotas, self.SEED, start=2)
+        self.assertEqual(items, self.ITEMS)
+        self.assertEqual(weights, self.WEIGHTS)
+        self.assertEqual(strata, self.STRATA)
+        self.assertEqual(quotas, self.QUOTAS)
+
+    # ------------------------------------------------------------------
+    # 恢复: 状态类型 / 结构 / 摘要 / 输入绑定
+    # ------------------------------------------------------------------
+    def test_non_mapping_state_raises_type_error(self):
+        for bad in (None, [], "{}", 1, True, (), {1, 2}):
+            with self.subTest(bad=bad):
+                with self.assertRaises(TypeError):
+                    weighted_sample_stratified_resume_indices(
+                        self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+                        bad, 1)
+
+    def test_draws_type_and_value_rules(self):
+        state = weighted_sample_stratified_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS, self.SEED)
+        for bad in (True, False, 1.0, "1", None, [1], 1 + 0j):
+            with self.subTest(bad=bad):
+                with self.assertRaises(TypeError):
+                    weighted_sample_stratified_resume_indices(
+                        self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+                        state, bad)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_resume_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS, state, -1)
+
+    def test_resume_window_out_of_range_raises_value_error(self):
+        state = weighted_sample_stratified_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+            self.SEED, start=2)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_resume_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS, state, 2)
+
+    def test_invalid_state_structure_raises_value_error(self):
+        import copy as _copy
+        state = weighted_sample_stratified_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+            self.SEED, start=1)
+
+        def ve(mutator):
+            bad = _copy.deepcopy(state)
+            mutator(bad)
+            with self.assertRaises(ValueError):
+                weighted_sample_stratified_resume_indices(
+                    self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+                    bad, 1)
+
+        ve(lambda s: s.pop("version"))
+        ve(lambda s: s.pop("kind"))
+        ve(lambda s: s.pop("rng"))
+        ve(lambda s: s.pop("strata_digest"))
+        ve(lambda s: s.update(extra=1))
+        ve(lambda s: s.update(position=-1))
+        ve(lambda s: s.update(position=True))
+        ve(lambda s: s.update(n=-1))
+        ve(lambda s: s.update(strata_count=-1))
+        ve(lambda s: s.update(kind="schedule"))
+        ve(lambda s: s.update(items_digest=1))
+        ve(lambda s: s.update(quotas_digest=None))
+        ve(lambda s: s.update(seed=["z", 1]))
+        ve(lambda s: s.update(rng={"v": 3}))
+        ve(lambda s: s.update(digest=1))
+
+    def test_unsupported_version_raises_value_error(self):
+        state = weighted_sample_stratified_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS, self.SEED)
+        for bad_version in (0, 2, 99, True, "1", 1.0):
+            bad = dict(state)
+            bad["version"] = bad_version
+            with self.subTest(bad_version=bad_version):
+                with self.assertRaises(ValueError):
+                    weighted_sample_stratified_resume_indices(
+                        self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+                        bad, 1)
+
+    def test_state_mismatch_with_inputs_raises_value_error(self):
+        state = weighted_sample_stratified_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+            self.SEED, start=1)
+
+        def ve(label, i2, w2, s2, q2):
+            with self.subTest(label=label):
+                with self.assertRaises(ValueError):
+                    weighted_sample_stratified_resume_indices(
+                        i2, w2, s2, q2, state, 1)
+
+        ve("items differ", list("abcdefgx"), self.WEIGHTS, self.STRATA,
+           self.QUOTAS)
+        ve("weights differ", self.ITEMS, [9] + self.WEIGHTS[1:],
+           self.STRATA, self.QUOTAS)
+        # 同值不同类型(5 -> 5.0)可能改变抽样计划, 必须视为不匹配。
+        ve("weight type swap", self.ITEMS, [5.0] + self.WEIGHTS[1:],
+           self.STRATA, self.QUOTAS)
+        ve("strata differ", self.ITEMS, self.WEIGHTS,
+           [1] + self.STRATA[1:], self.QUOTAS)
+        ve("quotas differ", self.ITEMS, self.WEIGHTS, self.STRATA, [1, 1, 1])
+        ve("quotas reordered", self.ITEMS, self.WEIGHTS, self.STRATA,
+           [1, 2, 1])
+
+    def test_tampered_fields_without_valid_digest_raise_value_error(self):
+        import copy as _copy
+        state = weighted_sample_stratified_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+            self.SEED, start=1)
+
+        def ve(mutator):
+            bad = _copy.deepcopy(state)
+            mutator(bad)
+            with self.assertRaises(ValueError):
+                weighted_sample_stratified_resume_indices(
+                    self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+                    bad, 1)
+
+        ve(lambda s: s.update(position=s["position"] + 1))
+        ve(lambda s: s.update(strata_count=s["strata_count"] + 1))
+        ve(lambda s: s["rng"]["mt"].__setitem__(0, s["rng"]["mt"][0] ^ 1))
+        ve(lambda s: s.update(digest="0" * 64))
+        ve(lambda s: s.update(seed=["i", 123]))
+
+    def test_out_of_range_rng_state_raises_value_error_even_with_digest(self):
+        # 即使重算了绑定摘要, 越界 MT 状态字/索引也必须统一抛 ValueError。
+        import copy as _copy
+        from app import _stratified_checkpoint_binding_digest
+        state = weighted_sample_stratified_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS, self.SEED)
+        for pos, value in (
+            (0, 10 ** 40), (1, -5), (623, 1 << 32), (624, 625), (624, -1),
+        ):
+            bad = _copy.deepcopy(state)
+            bad["rng"]["mt"][pos] = value
+            bad["digest"] = _stratified_checkpoint_binding_digest(
+                bad["seed"], bad["position"], bad["n"],
+                bad["strata_count"], bad["items_digest"],
+                bad["weights_digest"], bad["strata_digest"],
+                bad["quotas_digest"], bad["rng"],
+            )
+            with self.subTest(pos=pos, value=value):
+                with self.assertRaises(ValueError):
+                    weighted_sample_stratified_resume_indices(
+                        self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+                        bad, 1)
+
+    def test_other_kinds_of_checkpoint_state_rejected(self):
+        # 固定权重 / 按轮计划会话的状态不能用于分层恢复, 反之亦然。
+        stratified_state = weighted_sample_stratified_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+            self.SEED, start=1)
+        fixed_state = weighted_sample_checkpoint(
+            self.ITEMS, self.WEIGHTS, 2, self.SEED, start=1)
+        schedule_state = weighted_sample_schedule_checkpoint(
+            self.ITEMS, [list(self.WEIGHTS), list(self.WEIGHTS)], 2,
+            self.SEED, start=1)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_resume_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+                fixed_state, 1)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_resume_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+                schedule_state, 1)
+        with self.assertRaises(ValueError):
+            weighted_sample_resume_indices(
+                self.ITEMS, self.WEIGHTS, 2, stratified_state, 1)
+
+    def test_value_entry_validates_inputs_before_mapping(self):
+        # 值入口先按分层入口校验 items/weights/strata/quotas, 再要求 state
+        # 是映射并校验 draws —— 损坏的状态不能掩盖非法输入。
+        with self.assertRaises(TypeError):
+            weighted_sample_stratified_resume(
+                "abcdefgh", self.WEIGHTS, self.STRATA, self.QUOTAS,
+                "not-a-mapping", 1)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_resume(
+                self.ITEMS, self.WEIGHTS, self.STRATA, [3, 1, 2],
+                "not-a-mapping", 1)
+        state = weighted_sample_stratified_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS, self.SEED)
+        with self.assertRaises(TypeError):
+            weighted_sample_stratified_resume(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS, [], 1)
+        with self.assertRaises(TypeError):
+            weighted_sample_stratified_resume(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+                state, True)
+
+    def test_no_partial_output_on_failure(self):
+        # 恢复窗口越界时即使能抽出前面的分层, 也不返回部分结果。
+        state = weighted_sample_stratified_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+            self.SEED, start=1)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_resume_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS, state, 5)
+
+    def test_resume_does_not_mutate_inputs_or_state(self):
+        import copy as _copy
+        items = list(self.ITEMS)
+        weights = list(self.WEIGHTS)
+        strata = list(self.STRATA)
+        quotas = list(self.QUOTAS)
+        state = weighted_sample_stratified_checkpoint(
+            items, weights, strata, quotas, self.SEED, start=1)
+        state_snapshot = _copy.deepcopy(state)
+        weighted_sample_stratified_resume_indices(
+            items, weights, strata, quotas, state, 2)
+        weighted_sample_stratified_resume(
+            items, weights, strata, quotas, state, 2)
+        self.assertEqual(items, self.ITEMS)
+        self.assertEqual(weights, self.WEIGHTS)
+        self.assertEqual(strata, self.STRATA)
+        self.assertEqual(quotas, self.QUOTAS)
+        self.assertEqual(state, state_snapshot)
+
+    def test_seed_types_resume_consistently(self):
+        for seed in (1.5, "hello", -0.0, float("nan")):
+            state = weighted_sample_stratified_checkpoint(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+                seed, start=1)
+            indices, _ = weighted_sample_stratified_resume_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+                state, 2)
+            self.assertEqual(
+                indices,
+                weighted_sample_stratified_indices(
+                    self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+                    seed)[self.QUOTAS[0]:],
+            )
+        # None 种子来自系统熵: 同一份快照无论恢复多少次都给出同一序列。
+        none_state = weighted_sample_stratified_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+            None, start=1)
+        payload = json.loads(json.dumps(none_state))
+        a, _ = weighted_sample_stratified_resume_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS, payload, 2)
+        b, _ = weighted_sample_stratified_resume_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+            json.loads(json.dumps(none_state)), 2)
+        self.assertEqual(a, b)
+        self.assertEqual(len(a), sum(self.QUOTAS[1:]))
 
 
 if __name__ == "__main__":
