@@ -44,6 +44,14 @@ from app import (
     weighted_sample_stratified_checkpoint,
     weighted_sample_stratified_resume_indices,
     weighted_sample_stratified_resume,
+    weighted_sample_stratified_schedule_indices,
+    weighted_sample_stratified_schedule,
+    weighted_sample_stratified_schedule_counts,
+    weighted_sample_stratified_schedule_stream_indices,
+    weighted_sample_stratified_schedule_stream,
+    weighted_sample_stratified_schedule_checkpoint,
+    weighted_sample_stratified_schedule_resume_indices,
+    weighted_sample_stratified_schedule_resume,
     weighted_sample_stream,
     weighted_sample_stream_indices,
     weighted_sample_many_excluding,
@@ -9127,6 +9135,790 @@ class WeightedSampleStratifiedCheckpointTest(unittest.TestCase):
         self.assertEqual(weights, self.WEIGHTS)
         self.assertEqual(strata, self.STRATA)
         self.assertEqual(quotas, self.QUOTAS)
+
+
+class WeightedSampleStratifiedScheduleTest(unittest.TestCase):
+    ITEMS = ["a", "b", "c", "d", "e", "f", "g", "h"]
+    WEIGHTS = [5, 1, 3, 2, 4, 1, 2, 6]
+    STRATA = [0, 0, 1, 1, 2, 2, 2, 2]
+    QUOTAS_SCHEDULE = [[1, 1, 2], [0, 2, 1], [2, 0, 1], [0, 0, 0], [1, 1, 1]]
+    SEED = 20240613
+
+    def test_deterministic_same_seed(self):
+        first = weighted_sample_stratified_schedule_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS_SCHEDULE,
+            5, self.SEED)
+        second = weighted_sample_stratified_schedule_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS_SCHEDULE,
+            5, self.SEED)
+        self.assertEqual(first, second)
+        self.assertEqual(len(first), 5)
+
+    def test_round_shape_and_layer_concatenation(self):
+        rounds = weighted_sample_stratified_schedule_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS_SCHEDULE,
+            5, self.SEED)
+        for row, round_indices in zip(self.QUOTAS_SCHEDULE, rounds):
+            # 每轮长度等于该行配额总和, 各层按编号升序拼接。
+            self.assertEqual(len(round_indices), sum(row))
+            cursor = 0
+            for number, quota in enumerate(row):
+                segment = round_indices[cursor:cursor + quota]
+                cursor += quota
+                for position in segment:
+                    self.assertEqual(self.STRATA[position], number)
+            # 轮内位置互不重复(每个位置只属于一个分层, 层内无放回)。
+            self.assertEqual(len(set(round_indices)), len(round_indices))
+
+    def test_single_row_matches_fixed_stratified_entry(self):
+        quotas = [1, 1, 2]
+        for seed in (0, 1, 7, 99):
+            scheduled = weighted_sample_stratified_schedule_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, [quotas], 1, seed)
+            self.assertEqual(
+                scheduled,
+                [weighted_sample_stratified_indices(
+                    self.ITEMS, self.WEIGHTS, self.STRATA, quotas, seed)])
+            self.assertEqual(
+                weighted_sample_stratified_schedule(
+                    self.ITEMS, self.WEIGHTS, self.STRATA, [quotas], 1, seed),
+                [weighted_sample_stratified(
+                    self.ITEMS, self.WEIGHTS, self.STRATA, quotas, seed)])
+
+    def test_single_stratum_matches_many_entry(self):
+        # 全部位置同属编号零的单层且每行配额相同: 与 weighted_sample_many
+        # 同参调用逐轮逐项一致。
+        strata = [0] * len(self.ITEMS)
+        schedule = [[2]] * 4
+        self.assertEqual(
+            weighted_sample_stratified_schedule_indices(
+                self.ITEMS, self.WEIGHTS, strata, schedule, 4, self.SEED),
+            weighted_sample_many_indices(
+                self.ITEMS, self.WEIGHTS, 2, 4, self.SEED))
+
+    def test_start_window_matches_full_run_slice(self):
+        full = weighted_sample_stratified_schedule_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS_SCHEDULE,
+            5, self.SEED)
+        for start in range(6):
+            window = weighted_sample_stratified_schedule_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS_SCHEDULE,
+                5 - start, self.SEED, start)
+            self.assertEqual(window, full[start:])
+
+    def test_skipped_rounds_consume_stream_by_their_row(self):
+        # 被跳过的轮次按各自配额行消耗随机流: 改变被跳过行的配额会改变
+        # 后续轮次, 但窗口切片语义保持不变(与完整调用对齐)。
+        full = weighted_sample_stratified_schedule_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS_SCHEDULE,
+            5, self.SEED)
+        tail = weighted_sample_stratified_schedule_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS_SCHEDULE,
+            2, self.SEED, 3)
+        self.assertEqual(tail, full[3:])
+
+    def test_zero_quota_layers_do_not_consume_stream(self):
+        # 行内零配额分层不消耗随机流: 把中间层配额从零改为零不影响结果;
+        # 与把该层从计划中移除(编号前移)的紧凑计划逐项一致。
+        items = ["a", "b", "c", "d", "e", "f"]
+        weights = [3, 1, 2, 2, 4, 1]
+        strata = [0, 0, 1, 1, 2, 2]
+        with_gap = weighted_sample_stratified_schedule_indices(
+            items, weights, strata, [[1, 0, 1], [1, 0, 1]], 2, self.SEED)
+        compact_items = [items[0], items[1], items[4], items[5]]
+        compact_weights = [weights[0], weights[1], weights[4], weights[5]]
+        compact_strata = [0, 0, 1, 1]
+        compact = weighted_sample_stratified_schedule_indices(
+            compact_items, compact_weights, compact_strata,
+            [[1, 1], [1, 1]], 2, self.SEED)
+        remap = [0, 1, 4, 5]
+        self.assertEqual(
+            with_gap, [[remap[i] for i in round_] for round_ in compact])
+
+    def test_all_zero_quota_round_returns_empty_and_consumes_nothing(self):
+        # 全零配额的轮次返回空列表且不消耗随机流: 移除该行后相邻轮次不变。
+        schedule = self.QUOTAS_SCHEDULE
+        full = weighted_sample_stratified_schedule_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA, schedule, 5, self.SEED)
+        self.assertEqual(full[3], [])
+        trimmed = [row for j, row in enumerate(schedule) if j != 3]
+        expected = weighted_sample_stratified_schedule_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA, trimmed, 4, self.SEED)
+        self.assertEqual(full[:3] + full[4:], expected)
+
+    def test_values_entry_corresponds_to_indices_entry(self):
+        rounds = weighted_sample_stratified_schedule_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS_SCHEDULE,
+            5, self.SEED)
+        values = weighted_sample_stratified_schedule(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS_SCHEDULE,
+            5, self.SEED)
+        self.assertEqual(
+            values, [[self.ITEMS[i] for i in r] for r in rounds])
+
+    def test_duplicate_values_distinct_positions(self):
+        items = ["x", "x", "x", "x"]
+        weights = [1, 1, 1, 1]
+        strata = [0, 0, 1, 1]
+        rounds = weighted_sample_stratified_schedule_indices(
+            items, weights, strata, [[1, 1], [2, 2]], 2, 5)
+        self.assertEqual(len(set(rounds[0])), 2)
+        self.assertEqual(len(set(rounds[1])), 4)
+        values = weighted_sample_stratified_schedule(
+            items, weights, strata, [[1, 1], [2, 2]], 2, 5)
+        self.assertEqual(
+            values, [[items[i] for i in r] for r in rounds])
+
+    def test_zero_weight_never_chosen(self):
+        items = ["a", "b", "c", "d"]
+        weights = [0, 3, 0, 2]
+        strata = [0, 0, 1, 1]
+        for seed in range(20):
+            rounds = weighted_sample_stratified_schedule_indices(
+                items, weights, strata, [[1, 1]] * 3, 3, seed)
+            self.assertEqual(rounds, [[1, 3]] * 3)
+
+    def test_counts_match_flattened_index_rounds(self):
+        rounds = weighted_sample_stratified_schedule_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS_SCHEDULE,
+            5, self.SEED)
+        counts = weighted_sample_stratified_schedule_counts(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS_SCHEDULE,
+            5, self.SEED)
+        expected = [0] * len(self.ITEMS)
+        for round_indices in rounds:
+            for position in round_indices:
+                expected[position] += 1
+        self.assertEqual(counts, expected)
+        self.assertEqual(len(counts), len(self.ITEMS))
+
+    def test_counts_window_matches_index_window(self):
+        counts = weighted_sample_stratified_schedule_counts(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS_SCHEDULE,
+            2, self.SEED, 2)
+        rounds = weighted_sample_stratified_schedule_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS_SCHEDULE,
+            2, self.SEED, 2)
+        expected = [0] * len(self.ITEMS)
+        for round_indices in rounds:
+            for position in round_indices:
+                expected[position] += 1
+        self.assertEqual(counts, expected)
+
+    def test_counts_are_exact_integers_and_serialize_roundtrip(self):
+        counts = weighted_sample_stratified_schedule_counts(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS_SCHEDULE,
+            5, self.SEED)
+        self.assertTrue(all(isinstance(c, int) for c in counts))
+        self.assertEqual(
+            deserialize_metrics(serialize_metrics(counts)), counts)
+
+    def test_stream_matches_batch_round_by_round(self):
+        batch = weighted_sample_stratified_schedule_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS_SCHEDULE,
+            5, self.SEED)
+        streamed = list(weighted_sample_stratified_schedule_stream_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS_SCHEDULE,
+            5, self.SEED))
+        self.assertEqual(streamed, batch)
+        for start in range(6):
+            draws = 5 - start
+            streamed_window = list(
+                weighted_sample_stratified_schedule_stream_indices(
+                    self.ITEMS, self.WEIGHTS, self.STRATA,
+                    self.QUOTAS_SCHEDULE, draws, self.SEED, start))
+            self.assertEqual(streamed_window, batch[start:])
+
+    def test_stream_values_match_batch_values(self):
+        values = weighted_sample_stratified_schedule(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS_SCHEDULE,
+            5, self.SEED)
+        streamed = list(weighted_sample_stratified_schedule_stream(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS_SCHEDULE,
+            5, self.SEED))
+        self.assertEqual(streamed, values)
+
+    def test_draws_zero_returns_empty_after_full_validation(self):
+        self.assertEqual(
+            weighted_sample_stratified_schedule_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                self.QUOTAS_SCHEDULE, 0, self.SEED), [])
+        self.assertEqual(
+            weighted_sample_stratified_schedule(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                self.QUOTAS_SCHEDULE, 0, self.SEED), [])
+        self.assertEqual(
+            weighted_sample_stratified_schedule_counts(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                self.QUOTAS_SCHEDULE, 0, self.SEED),
+            [0] * len(self.ITEMS))
+        self.assertEqual(
+            list(weighted_sample_stratified_schedule_stream_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                self.QUOTAS_SCHEDULE, 0, self.SEED)), [])
+        # draws=0 仍校验完整计划、每行可行性与窗口。
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_schedule_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                [[1, 1, 9]], 0, self.SEED)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_schedule_counts(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                self.QUOTAS_SCHEDULE, 0, self.SEED, 6)
+        with self.assertRaises(TypeError):
+            weighted_sample_stratified_schedule_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                [[1, 1, True]], 0, self.SEED)
+
+    def test_empty_items_requires_empty_strata_and_rows(self):
+        self.assertEqual(
+            weighted_sample_stratified_schedule_indices(
+                [], [], [], [[], []], 2, self.SEED), [[], []])
+        self.assertEqual(
+            weighted_sample_stratified_schedule_counts(
+                [], [], [], [[]], 1, self.SEED), [])
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_schedule_indices(
+                [], [], [0], [[]], 1, self.SEED)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_schedule_indices(
+                [], [], [], [[1]], 1, self.SEED)
+
+    def test_structure_errors_raise_type_error(self):
+        args = (self.ITEMS, self.WEIGHTS, self.STRATA)
+        entries = (
+            weighted_sample_stratified_schedule_indices,
+            weighted_sample_stratified_schedule_counts,
+        )
+        for entry in entries:
+            with self.assertRaises(TypeError):
+                entry(*args, "not-a-sequence", 1, self.SEED)
+            with self.assertRaises(TypeError):
+                entry(*args, [[1, 1], 3], 1, self.SEED)
+            with self.assertRaises(TypeError):
+                entry(*args, [[1, 1, True]], 1, self.SEED)
+            with self.assertRaises(TypeError):
+                entry(*args, [[1, 1, 1.0]], 1, self.SEED)
+            with self.assertRaises(TypeError):
+                entry(*args, [[1, 1, "1"]], 1, self.SEED)
+            with self.assertRaises(TypeError):
+                entry(self.ITEMS, self.WEIGHTS, [0, 0, 1, 1, 2, 2, 2, "x"],
+                      [[1, 1, 1]], 1, self.SEED)
+            with self.assertRaises(TypeError):
+                entry(self.ITEMS, self.WEIGHTS, [0, 0, 1, 1, 2, 2, 2, True],
+                      [[1, 1, 1]], 1, self.SEED)
+            with self.assertRaises(TypeError):
+                entry(*args, self.QUOTAS_SCHEDULE, True, self.SEED)
+            with self.assertRaises(TypeError):
+                entry(*args, self.QUOTAS_SCHEDULE, 1.5, self.SEED)
+            with self.assertRaises(TypeError):
+                entry(*args, self.QUOTAS_SCHEDULE, 1, self.SEED, True)
+        with self.assertRaises(TypeError):
+            weighted_sample_stratified_schedule_stream_indices(
+                *args, self.QUOTAS_SCHEDULE, "x", self.SEED)
+
+    def test_value_errors(self):
+        args = (self.ITEMS, self.WEIGHTS, self.STRATA)
+        # 行长度不等于最大编号加一。
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_schedule_indices(
+                *args, [[1, 1]], 1, self.SEED)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_schedule_indices(
+                *args, [[1, 1, 1, 0]], 1, self.SEED)
+        # 负配额。
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_schedule_indices(
+                *args, [[1, -1, 1]], 1, self.SEED)
+        # strata 长度与编号范围。
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_schedule_indices(
+                self.ITEMS, self.WEIGHTS, [0, 0, 1], [[1]], 1, self.SEED)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_schedule_indices(
+                self.ITEMS, self.WEIGHTS, [0, 0, 1, 1, 2, 2, 2, -1],
+                [[1, 1, 1]], 1, self.SEED)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_schedule_indices(
+                self.ITEMS, self.WEIGHTS, [0, 0, 1, 1, 2, 2, 2, 5],
+                [[1, 1, 1]], 1, self.SEED)
+        # 窗口越界。
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_schedule_indices(
+                *args, self.QUOTAS_SCHEDULE, 6, self.SEED)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_schedule_indices(
+                *args, self.QUOTAS_SCHEDULE, 2, self.SEED, 4)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_schedule_indices(
+                *args, self.QUOTAS_SCHEDULE, -1, self.SEED)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_schedule_indices(
+                *args, self.QUOTAS_SCHEDULE, 1, self.SEED, -1)
+        # 权重取值。
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_schedule_indices(
+                self.ITEMS, [-1] + self.WEIGHTS[1:], self.STRATA,
+                self.QUOTAS_SCHEDULE, 1, self.SEED)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_schedule_indices(
+                self.ITEMS, [float("nan")] * 8, self.STRATA,
+                self.QUOTAS_SCHEDULE, 1, self.SEED)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_schedule_indices(
+                self.ITEMS, [float("inf")] * 8, self.STRATA,
+                self.QUOTAS_SCHEDULE, 1, self.SEED)
+        # 某一行某层正权重不足配额(编号 2 的层只有 4 个正权重位置)。
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_schedule_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                [[1, 1, 5]], 1, self.SEED)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_schedule_indices(
+                self.ITEMS, [0, 0, 3, 2, 4, 1, 2, 6], self.STRATA,
+                [[1, 0, 0]], 1, self.SEED)
+        # 错误同样出现在计数与流式入口(创建时)。
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_schedule_counts(
+                *args, [[1, 1, 9]], 1, self.SEED)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_schedule_stream_indices(
+                *args, [[1, 1, 9]], 1, self.SEED)
+
+    def test_fraction_decimal_and_huge_integer_weights(self):
+        weights = [Fraction(1, 3), Decimal("0.5"), 10 ** 60, 2,
+                   Fraction(2, 5), Decimal("1.25"), 1, 10 ** 40 + 7]
+        first = weighted_sample_stratified_schedule_indices(
+            self.ITEMS, weights, self.STRATA, self.QUOTAS_SCHEDULE,
+            5, self.SEED)
+        second = weighted_sample_stratified_schedule_indices(
+            self.ITEMS, weights, self.STRATA, self.QUOTAS_SCHEDULE,
+            5, self.SEED)
+        self.assertEqual(first, second)
+        for row, round_indices in zip(self.QUOTAS_SCHEDULE, first):
+            self.assertEqual(len(round_indices), sum(row))
+        # 单行单层等价于对应精确权重入口。
+        self.assertEqual(
+            weighted_sample_stratified_schedule_indices(
+                self.ITEMS, weights, [0] * 8, [[3]], 1, self.SEED),
+            [weighted_sample_indices(self.ITEMS, weights, 3, self.SEED)])
+        # 超大整数权重(10**60 等)走纯整数精确路径, 不被浮点吞掉: 与把
+        # 同一权重写成 Fraction 的等价调用逐项一致。
+        as_fractions = [Fraction(w) for w in weights]
+        self.assertEqual(
+            first,
+            weighted_sample_stratified_schedule_indices(
+                self.ITEMS, as_fractions, self.STRATA,
+                self.QUOTAS_SCHEDULE, 5, self.SEED))
+
+    def test_inputs_not_mutated(self):
+        items = list(self.ITEMS)
+        weights = list(self.WEIGHTS)
+        strata = list(self.STRATA)
+        schedule = [list(row) for row in self.QUOTAS_SCHEDULE]
+        weighted_sample_stratified_schedule_indices(
+            items, weights, strata, schedule, 5, self.SEED)
+        weighted_sample_stratified_schedule(
+            items, weights, strata, schedule, 5, self.SEED)
+        weighted_sample_stratified_schedule_counts(
+            items, weights, strata, schedule, 5, self.SEED)
+        list(weighted_sample_stratified_schedule_stream_indices(
+            items, weights, strata, schedule, 5, self.SEED))
+        self.assertEqual(items, self.ITEMS)
+        self.assertEqual(weights, self.WEIGHTS)
+        self.assertEqual(strata, self.STRATA)
+        self.assertEqual(
+            schedule, [list(row) for row in self.QUOTAS_SCHEDULE])
+
+    def test_fixed_quota_entries_unchanged(self):
+        # 固定配额入口行为不受新增入口影响。
+        indices = weighted_sample_stratified_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA, [1, 1, 2], self.SEED)
+        self.assertEqual(
+            indices,
+            weighted_sample_stratified_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, [1, 1, 2], self.SEED))
+        counts = weighted_sample_stratified_counts(
+            self.ITEMS, self.WEIGHTS, self.STRATA, [1, 1, 2], self.SEED)
+        expected = [0] * len(self.ITEMS)
+        for position in indices:
+            expected[position] += 1
+        self.assertEqual(counts, expected)
+
+
+class WeightedSampleStratifiedScheduleCheckpointTest(unittest.TestCase):
+    ITEMS = ["a", "b", "c", "d", "e", "f", "g", "h"]
+    WEIGHTS = [5, 1, 3, 2, 4, 1, 2, 6]
+    STRATA = [0, 0, 1, 1, 2, 2, 2, 2]
+    QUOTAS_SCHEDULE = [[1, 1, 2], [0, 2, 1], [2, 0, 1], [0, 0, 0], [1, 1, 1]]
+    SEED = 731
+
+    def _one_shot(self):
+        return weighted_sample_stratified_schedule_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS_SCHEDULE,
+            len(self.QUOTAS_SCHEDULE), self.SEED)
+
+    def test_checkpoint_state_is_json_native(self):
+        state = weighted_sample_stratified_schedule_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS_SCHEDULE,
+            self.SEED, start=2)
+        # json 默认序列化/还原往返不报错且内容不变(只含 JSON 原生值)。
+        self.assertEqual(json.loads(json.dumps(state)), state)
+        self.assertEqual(state["kind"], "stratified_schedule")
+        self.assertEqual(state["position"], 2)
+        self.assertEqual(state["n"], len(self.ITEMS))
+        self.assertEqual(state["strata_count"], 3)
+        self.assertEqual(
+            state["schedule_length"], len(self.QUOTAS_SCHEDULE))
+
+    def test_resume_window_equals_one_shot_slice(self):
+        full = self._one_shot()
+        for start in range(len(self.QUOTAS_SCHEDULE) + 1):
+            state = weighted_sample_stratified_schedule_checkpoint(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                self.QUOTAS_SCHEDULE, self.SEED, start=start)
+            draws = len(self.QUOTAS_SCHEDULE) - start
+            rounds, _ = weighted_sample_stratified_schedule_resume_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                self.QUOTAS_SCHEDULE, state, draws)
+            self.assertEqual(rounds, full[start:])
+
+    def test_chained_resumes_equal_one_shot_run(self):
+        full = self._one_shot()
+        state = weighted_sample_stratified_schedule_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS_SCHEDULE,
+            self.SEED)
+        chained = []
+        for draws in (1, 2, 0, 2):
+            rounds, state = \
+                weighted_sample_stratified_schedule_resume_indices(
+                    self.ITEMS, self.WEIGHTS, self.STRATA,
+                    self.QUOTAS_SCHEDULE, state, draws)
+            chained.extend(rounds)
+        self.assertEqual(chained, full)
+        self.assertEqual(
+            state["position"], len(self.QUOTAS_SCHEDULE))
+
+    def test_value_resume_matches_index_resume(self):
+        state = weighted_sample_stratified_schedule_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS_SCHEDULE,
+            self.SEED, start=1)
+        index_rounds, index_state = \
+            weighted_sample_stratified_schedule_resume_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                self.QUOTAS_SCHEDULE, state, 3)
+        value_rounds, value_state = \
+            weighted_sample_stratified_schedule_resume(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                self.QUOTAS_SCHEDULE, state, 3)
+        self.assertEqual(
+            value_rounds,
+            [[self.ITEMS[i] for i in r] for r in index_rounds])
+        # 两个入口的下一状态逐字段一致, 可互换续接。
+        self.assertEqual(index_state, value_state)
+        tail_i, _ = weighted_sample_stratified_schedule_resume_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA,
+            self.QUOTAS_SCHEDULE, value_state, 1)
+        tail_v, _ = weighted_sample_stratified_schedule_resume(
+            self.ITEMS, self.WEIGHTS, self.STRATA,
+            self.QUOTAS_SCHEDULE, index_state, 1)
+        self.assertEqual(
+            tail_v, [[self.ITEMS[i] for i in r] for r in tail_i])
+
+    def test_resume_values_handle_duplicate_items_by_position(self):
+        items = ["x", "x", "x", "x"]
+        weights = [1, 1, 1, 1]
+        strata = [0, 0, 1, 1]
+        schedule = [[1, 1], [2, 2]]
+        state = weighted_sample_stratified_schedule_checkpoint(
+            items, weights, strata, schedule, 5)
+        index_rounds, _ = \
+            weighted_sample_stratified_schedule_resume_indices(
+                items, weights, strata, schedule, state, 2)
+        value_rounds, _ = weighted_sample_stratified_schedule_resume(
+            items, weights, strata, schedule, state, 2)
+        self.assertEqual(
+            value_rounds,
+            [[items[i] for i in r] for r in index_rounds])
+
+    def test_draws_zero_returns_empty_and_state_copy(self):
+        state = weighted_sample_stratified_schedule_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS_SCHEDULE,
+            self.SEED, start=2)
+        rounds, next_state = \
+            weighted_sample_stratified_schedule_resume_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                self.QUOTAS_SCHEDULE, state, 0)
+        self.assertEqual(rounds, [])
+        self.assertEqual(next_state, state)
+        self.assertIsNot(next_state, state)
+
+    def test_zero_quota_rounds_advance_position_without_rng(self):
+        # 全零配额的轮次只推进 position, 不消耗随机流: 跨过该行的恢复与
+        # 一次性调用逐项一致。
+        schedule = [[1, 0, 1], [0, 0, 0], [1, 1, 0]]
+        state = weighted_sample_stratified_schedule_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.STRATA, schedule,
+            self.SEED, start=1)
+        rounds, state = weighted_sample_stratified_schedule_resume_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA, schedule, state, 2)
+        full = weighted_sample_stratified_schedule_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA, schedule, 3, self.SEED)
+        self.assertEqual(rounds, full[1:])
+        self.assertEqual(rounds[0], [])
+        self.assertEqual(state["position"], 3)
+
+    def test_end_of_plan_accepts_only_empty_window(self):
+        state = weighted_sample_stratified_schedule_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS_SCHEDULE,
+            self.SEED, start=len(self.QUOTAS_SCHEDULE))
+        rounds, next_state = \
+            weighted_sample_stratified_schedule_resume_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                self.QUOTAS_SCHEDULE, state, 0)
+        self.assertEqual(rounds, [])
+        self.assertEqual(
+            next_state["position"], len(self.QUOTAS_SCHEDULE))
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_schedule_resume_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                self.QUOTAS_SCHEDULE, state, 1)
+
+    def test_resume_window_out_of_range(self):
+        state = weighted_sample_stratified_schedule_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS_SCHEDULE,
+            self.SEED, start=3)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_schedule_resume_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                self.QUOTAS_SCHEDULE, state, 3)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_schedule_resume(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                self.QUOTAS_SCHEDULE, state, 3)
+
+    def test_state_survives_serialize_metrics_round_trip(self):
+        state = weighted_sample_stratified_schedule_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS_SCHEDULE,
+            self.SEED, start=2)
+        restored = deserialize_metrics(serialize_metrics(state))
+        expected, _ = weighted_sample_stratified_schedule_resume_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA,
+            self.QUOTAS_SCHEDULE, state, 2)
+        actual, next_state = \
+            weighted_sample_stratified_schedule_resume_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                self.QUOTAS_SCHEDULE, restored, 2)
+        self.assertEqual(actual, expected)
+        # 下一状态同样可序列化往返并继续恢复。
+        full = self._one_shot()
+        restored_next = deserialize_metrics(serialize_metrics(next_state))
+        tail, _ = weighted_sample_stratified_schedule_resume_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA,
+            self.QUOTAS_SCHEDULE, restored_next, 1)
+        self.assertEqual(tail, full[4:])
+
+    def test_state_survives_json_round_trip(self):
+        state = weighted_sample_stratified_schedule_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS_SCHEDULE,
+            self.SEED, start=1)
+        restored = json.loads(json.dumps(state))
+        rounds, _ = weighted_sample_stratified_schedule_resume_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA,
+            self.QUOTAS_SCHEDULE, restored, 2)
+        self.assertEqual(rounds, self._one_shot()[1:3])
+
+    def test_exact_weight_types_supported(self):
+        weights = [Fraction(1, 3), Decimal("0.5"), 10 ** 60, 2,
+                   Fraction(2, 5), Decimal("1.25"), 1, 10 ** 40 + 7]
+        state = weighted_sample_stratified_schedule_checkpoint(
+            self.ITEMS, weights, self.STRATA, self.QUOTAS_SCHEDULE,
+            self.SEED, start=1)
+        rounds, _ = weighted_sample_stratified_schedule_resume_indices(
+            self.ITEMS, weights, self.STRATA, self.QUOTAS_SCHEDULE,
+            state, 4)
+        full = weighted_sample_stratified_schedule_indices(
+            self.ITEMS, weights, self.STRATA, self.QUOTAS_SCHEDULE,
+            5, self.SEED)
+        self.assertEqual(rounds, full[1:])
+        # 状态可经 serialize_metrics 往返(超大整数保持精确十进制)。
+        restored = deserialize_metrics(serialize_metrics(state))
+        again, _ = weighted_sample_stratified_schedule_resume_indices(
+            self.ITEMS, weights, self.STRATA, self.QUOTAS_SCHEDULE,
+            restored, 4)
+        self.assertEqual(again, rounds)
+
+    def test_checkpoint_validates_like_batch_entry(self):
+        with self.assertRaises(TypeError):
+            weighted_sample_stratified_schedule_checkpoint(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                [[1, 1, True]], self.SEED)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_schedule_checkpoint(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                [[1, 1, 9]], self.SEED)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_schedule_checkpoint(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                self.QUOTAS_SCHEDULE, self.SEED, start=6)
+        with self.assertRaises(TypeError):
+            weighted_sample_stratified_schedule_checkpoint(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                self.QUOTAS_SCHEDULE, self.SEED, start=1.5)
+        # start == 计划长度合法。
+        state = weighted_sample_stratified_schedule_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS_SCHEDULE,
+            self.SEED, start=len(self.QUOTAS_SCHEDULE))
+        self.assertEqual(
+            state["position"], len(self.QUOTAS_SCHEDULE))
+
+    def test_resume_rejects_non_mapping_state(self):
+        for bad in (None, 42, "state", [("position", 0)]):
+            with self.assertRaises(TypeError):
+                weighted_sample_stratified_schedule_resume_indices(
+                    self.ITEMS, self.WEIGHTS, self.STRATA,
+                    self.QUOTAS_SCHEDULE, bad, 1)
+            with self.assertRaises(TypeError):
+                weighted_sample_stratified_schedule_resume(
+                    self.ITEMS, self.WEIGHTS, self.STRATA,
+                    self.QUOTAS_SCHEDULE, bad, 1)
+
+    def test_resume_rejects_bad_draws(self):
+        state = weighted_sample_stratified_schedule_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS_SCHEDULE,
+            self.SEED)
+        for bad in (True, 1.5, "1", None):
+            with self.assertRaises(TypeError):
+                weighted_sample_stratified_schedule_resume_indices(
+                    self.ITEMS, self.WEIGHTS, self.STRATA,
+                    self.QUOTAS_SCHEDULE, state, bad)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_schedule_resume_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                self.QUOTAS_SCHEDULE, state, -1)
+
+    def test_resume_rejects_structurally_invalid_state(self):
+        state = weighted_sample_stratified_schedule_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS_SCHEDULE,
+            self.SEED, start=1)
+        import copy as _copy
+        # 缺失字段。
+        for key in state:
+            bad = dict(state)
+            del bad[key]
+            with self.assertRaises(ValueError):
+                weighted_sample_stratified_schedule_resume_indices(
+                    self.ITEMS, self.WEIGHTS, self.STRATA,
+                    self.QUOTAS_SCHEDULE, bad, 1)
+        # 多余字段。
+        bad = dict(state)
+        bad["extra"] = 1
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_schedule_resume_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                self.QUOTAS_SCHEDULE, bad, 1)
+        # 版本 / kind 不支持。
+        for key, value in (("version", 2), ("version", "1"),
+                           ("kind", "stratified"), ("kind", "schedule")):
+            bad = dict(state)
+            bad[key] = value
+            with self.assertRaises(ValueError):
+                weighted_sample_stratified_schedule_resume_indices(
+                    self.ITEMS, self.WEIGHTS, self.STRATA,
+                    self.QUOTAS_SCHEDULE, bad, 1)
+        # 篡改字段(摘要失配)。
+        for key, value in (("position", 0), ("n", 7), ("strata_count", 2),
+                           ("schedule_length", 4)):
+            bad = _copy.deepcopy(state)
+            bad[key] = value
+            with self.assertRaises(ValueError):
+                weighted_sample_stratified_schedule_resume_indices(
+                    self.ITEMS, self.WEIGHTS, self.STRATA,
+                    self.QUOTAS_SCHEDULE, bad, 1)
+        # 篡改抽样路径标记与 RNG 快照。
+        bad = _copy.deepcopy(state)
+        bad["exact"][0][0] = not bad["exact"][0][0]
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_schedule_resume_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                self.QUOTAS_SCHEDULE, bad, 1)
+        bad = _copy.deepcopy(state)
+        bad["rng"]["mt"][0] += 1
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_schedule_resume_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                self.QUOTAS_SCHEDULE, bad, 1)
+
+    def test_resume_rejects_mismatched_inputs(self):
+        state = weighted_sample_stratified_schedule_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS_SCHEDULE,
+            self.SEED, start=1)
+        # items / weights / strata / quotas_schedule 任一不匹配都拒绝。
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_schedule_resume_indices(
+                ["a", "b", "c", "d", "e", "f", "g", "z"],
+                self.WEIGHTS, self.STRATA, self.QUOTAS_SCHEDULE, state, 1)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_schedule_resume_indices(
+                self.ITEMS, [5, 1, 3, 2, 4, 1, 2, 7],
+                self.STRATA, self.QUOTAS_SCHEDULE, state, 1)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_schedule_resume_indices(
+                self.ITEMS, self.WEIGHTS, [0, 0, 1, 1, 2, 2, 2, 1],
+                self.QUOTAS_SCHEDULE, state, 1)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_schedule_resume_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                [[0, 1, 2]] + self.QUOTAS_SCHEDULE[1:], state, 1)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_schedule_resume_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                self.QUOTAS_SCHEDULE + [[0, 0, 0]], state, 1)
+        # 权重类型变化(同值不同类型)同样改变抽样路径, 必须拒绝。
+        weights = list(self.WEIGHTS)
+        weights[0] = 5.0
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_schedule_resume_indices(
+                self.ITEMS, weights, self.STRATA,
+                self.QUOTAS_SCHEDULE, state, 1)
+
+    def test_resume_does_not_mutate_inputs_or_state(self):
+        items = list(self.ITEMS)
+        weights = list(self.WEIGHTS)
+        strata = list(self.STRATA)
+        schedule = [list(row) for row in self.QUOTAS_SCHEDULE]
+        state = weighted_sample_stratified_schedule_checkpoint(
+            items, weights, strata, schedule, self.SEED, start=1)
+        import copy as _copy
+        snapshot = _copy.deepcopy(state)
+        weighted_sample_stratified_schedule_resume_indices(
+            items, weights, strata, schedule, state, 2)
+        weighted_sample_stratified_schedule_resume(
+            items, weights, strata, schedule, state, 2)
+        self.assertEqual(state, snapshot)
+        self.assertEqual(items, self.ITEMS)
+        self.assertEqual(weights, self.WEIGHTS)
+        self.assertEqual(strata, self.STRATA)
+        self.assertEqual(
+            schedule, [list(row) for row in self.QUOTAS_SCHEDULE])
+
+    def test_empty_plan_session(self):
+        state = weighted_sample_stratified_schedule_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.STRATA, [], self.SEED)
+        self.assertEqual(state["position"], 0)
+        self.assertEqual(state["schedule_length"], 0)
+        rounds, state = weighted_sample_stratified_schedule_resume_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA, [], state, 0)
+        self.assertEqual(rounds, [])
+        self.assertEqual(state["position"], 0)
+
+    def test_empty_items_session(self):
+        state = weighted_sample_stratified_schedule_checkpoint(
+            [], [], [], [[], []], self.SEED)
+        rounds, state = weighted_sample_stratified_schedule_resume_indices(
+            [], [], [], [[], []], state, 2)
+        self.assertEqual(rounds, [[], []])
+        self.assertEqual(state["position"], 2)
 
 
 if __name__ == "__main__":

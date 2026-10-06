@@ -5078,6 +5078,717 @@ def weighted_sample_stratified_resume(items, weights, strata, quotas, state,
 
 
 # ---------------------------------------------------------------------------
+# 按轮变化的分层配额计划采样
+# ---------------------------------------------------------------------------
+
+def _validate_stratified_schedule_inputs(items, weights, strata,
+                                         quotas_schedule, draws, seed, start):
+    """按轮分层配额计划各入口共用的全部前置校验。
+
+    校验顺序固定: 先 items、weights、seed 的结构/类型(与既有采样入口同一
+    套规则, TypeError), 再 strata 的结构与成员类型(非布尔整数, TypeError),
+    然后 quotas_schedule 及其每一行的结构(非文本且长度可确定的序列)与每个
+    成员的类型(非布尔整数, TypeError), 再 draws、start(非布尔非负整数);
+    随后 weights / strata 长度与 items 一致、strata 编号非负、每一行长度
+    等于最大编号加一、配额非负、窗口 [start, start+draws) 不越过计划范围
+    (ValueError); 接着权重元素类型(TypeError)与取值(ValueError)校验; 最后
+    对完整计划的每一行按编号升序逐层校验配额不超过该层正权重位置数
+    (ValueError)。空 items 只接受空 strata 且每行配额也为空; draws=0 同样
+    完成完整计划、每行可行性与窗口的全部校验。全部校验在产生任何结果前
+    完成, 不修改入参。通过后返回 (n, strata 编号副本, 逐行配额副本)。
+    """
+    # ---- 1. 结构与参数类型 (TypeError) ----
+    if not _is_length_determinable_sequence(items):
+        raise TypeError("items must be a length-determinable sequence")
+    if not _is_length_determinable_sequence(weights):
+        raise TypeError("weights must be a length-determinable sequence")
+    if not isinstance(seed, _SEED_TYPES):
+        raise TypeError("unsupported seed type: %s" % type(seed).__name__)
+    if not _is_length_determinable_sequence(strata):
+        raise TypeError("strata must be a length-determinable sequence")
+    strata_numbers = []
+    for member in strata:
+        if isinstance(member, bool) or not isinstance(member, int):
+            raise TypeError("strata members must be non-boolean integers")
+        strata_numbers.append(member)
+    if not _is_length_determinable_sequence(quotas_schedule):
+        raise TypeError(
+            "quotas_schedule must be a length-determinable sequence"
+        )
+    quota_rows = []
+    for row in quotas_schedule:
+        if not _is_length_determinable_sequence(row):
+            raise TypeError(
+                "quotas_schedule rows must be length-determinable sequences"
+            )
+        quota_row = []
+        for member in row:
+            if isinstance(member, bool) or not isinstance(member, int):
+                raise TypeError(
+                    "quotas_schedule members must be non-boolean integers"
+                )
+            quota_row.append(member)
+        quota_rows.append(quota_row)
+    _validate_draws(draws)
+    _validate_start(start)
+
+    # ---- 2. 长度、编号范围与窗口 (ValueError) ----
+    n = len(items)
+    if len(weights) != n:
+        raise ValueError("invalid sample size")
+    if len(strata_numbers) != n:
+        raise ValueError("strata length must equal items length")
+    for number in strata_numbers:
+        if number < 0:
+            raise ValueError("stratum number out of range")
+    # 每行配额的下标对应分层编号, 行长必须恰好是最大编号加一 —— 空 items
+    # 没有最大编号, 每行都必须是空序列。
+    top = max(strata_numbers) if strata_numbers else -1
+    for row in quota_rows:
+        if len(row) != top + 1:
+            raise ValueError(
+                "quotas row length must equal max stratum number plus one"
+            )
+        for quota in row:
+            if quota < 0:
+                raise ValueError("quotas must be non-negative")
+    if start + draws > len(quota_rows):
+        raise ValueError("quotas schedule window out of range")
+
+    # ---- 3. 权重元素类型与取值 (TypeError / ValueError) ----
+    _validate_weight_elements(weights)
+
+    # ---- 4. 完整计划每一行、每一层配额的正权重可行性 (ValueError) ----
+    # 与分层入口同一规则: 配额超过该层正权重位置数(含该层没有成员或成员
+    # 权重全为零的情形)时确定抛 ValueError; 零配额分层恒可行。draws=0 也
+    # 不省略 —— 完整计划的每一行都在产生任何结果前校验。
+    for row in quota_rows:
+        for number, quota in enumerate(row):
+            if quota > 0:
+                layer_weights = [
+                    weights[i] for i in range(n) if strata_numbers[i] == number
+                ]
+                if quota > _count_positive_weights(layer_weights):
+                    raise ValueError("no positive weight")
+    return n, strata_numbers, quota_rows
+
+
+def _stratified_round_plan(local_weights, strata_numbers, quota_row, n):
+    """一轮分层配额的确定性抽样计划: 逐层 (pool, planned_weights, quota,
+    use_exact) 或 None(零配额层)。
+
+    与分层入口为每层选择的计划一致: 层内位置池按原始零基索引升序保留,
+    每层以自己的成员权重与配额经 _select_sampling_plan 选定抽样路径
+    (Fraction / Decimal / 超大整数走纯整数精确路径, 不被浮点吞掉);
+    零配额分层不构造计划、不消耗随机流。只读取权重, 不修改入参。
+    """
+    plans = []
+    for number, quota in enumerate(quota_row):
+        if quota == 0:
+            plans.append(None)
+            continue
+        pool = [i for i in range(n) if strata_numbers[i] == number]
+        pool_weights = [local_weights[i] for i in pool]
+        planned_weights, use_exact = _select_sampling_plan(pool_weights, quota)
+        plans.append((pool, planned_weights, quota, use_exact))
+    return plans
+
+
+def _draw_stratified_round(round_plans, rng):
+    """按编号升序逐层消耗共享随机流, 返回按层拼接的零基原始索引。
+
+    零配额分层(计划为 None)不消耗随机流; 各层结果按编号升序依次拼接,
+    层内按抽样先后排列。rng 由调用方共享, 一轮内的各层与相邻轮次连续
+    消耗同一条随机流。
+    """
+    indices = []
+    for plan in round_plans:
+        if plan is None:
+            continue
+        pool, planned_weights, quota, use_exact = plan
+        indices.extend(
+            _draw_indices_once_pool(pool, planned_weights, quota, rng, use_exact)
+        )
+    return indices
+
+
+def weighted_sample_stratified_schedule_indices(items, weights, strata,
+                                                quotas_schedule, draws,
+                                                seed=0, start=0):
+    """按轮变化的分层配额计划批量入口: 一次调用生成 draws 轮分层样本。
+
+    items、weights、strata、seed 沿用 weighted_sample_stratified_indices
+    的全部规则; quotas_schedule 是有限非文本序列, 每个成员都是长度等于
+    最大分层编号加一的配额行(非文本且长度可确定的序列, 成员为非布尔非负
+    整数)。第 start+j 轮(零基)使用 quotas_schedule[start+j]: 在该行配额下
+    按编号升序逐层做加权无放回抽样, 各层结果按编号升序拼接作为该轮的
+    零基原始索引列表; 返回长度等于 draws 的外层 list。每轮都从全部原始
+    位置重新开始(轮内每个位置至多出现一次, 轮次之间允许再次选中同一
+    位置, 重复值按位置区分); 所有轮次与轮内各层共享同一个由 seed 初始化
+    的随机流, 零配额分层不消耗该流。start 只跳过前面的完整轮次 —— 被跳过
+    的第 j 轮同样按 quotas_schedule[j] 的各行配额消耗同一条随机流 ——
+    结果与 start=0 的完整调用按零基区间 [start, start+draws) 切片逐项
+    一致。quotas_schedule 只有一行 [quotas] 时, start=0 的首轮与
+    weighted_sample_stratified_indices(items, weights, strata, quotas,
+    seed) 逐项相同。
+
+    全部校验在返回任何轮次前完成(draws=0 也校验完整计划、每行可行性与
+    窗口): 结构或成员类型错误抛 TypeError; 长度不一致、编号越界、行长
+    不等于最大编号加一、负配额、窗口越界、负权重、NaN、无穷权重或任一行
+    某层正权重不足配额抛 ValueError。权重元素继续接受非布尔 int、有限非负
+    float、Fraction、Decimal(可混合; 超大整数、Fraction、Decimal 全程不
+    经过浮点)。draws=0 返回空 list; 全部配额为零的轮次返回空列表且不消耗
+    随机流。不修改入参与 quotas_schedule。
+    """
+    n, strata_numbers, quota_rows = _validate_stratified_schedule_inputs(
+        items, weights, strata, quotas_schedule, draws, seed, start
+    )
+
+    # draws=0: 全部校验已在上面完成, 直接返回空结果, 不消耗随机流。
+    if draws == 0:
+        return []
+
+    # 复制到本地, 绝不修改入参; 窗口 [0, start+draws) 内每一轮(含被跳过
+    # 的轮次)都按自己那一行的配额选定逐层抽样计划, 被跳过的轮次同样消耗
+    # 同一条由 seed 初始化的随机流, 因此跳过 start 个完整轮次与从 0 生成
+    # 时消耗的随机流完全相同。
+    local_weights = list(weights)
+    rng = random.Random(seed)
+    plans = [
+        _stratified_round_plan(local_weights, strata_numbers, quota_rows[j], n)
+        for j in range(start + draws)
+    ]
+    for j in range(start):
+        _draw_stratified_round(plans[j], rng)
+    return [
+        _draw_stratified_round(plans[j], rng)
+        for j in range(start, start + draws)
+    ]
+
+
+def weighted_sample_stratified_schedule(items, weights, strata,
+                                        quotas_schedule, draws,
+                                        seed=0, start=0):
+    """weighted_sample_stratified_schedule_indices 的元素值入口: 规则、
+    校验顺序与异常类别完全一致, 区别仅在于每轮按相同索引返回元素值列表;
+    两个入口逐轮逐项对应(相同值的不同位置仍按位置独立处理)。
+    """
+    rounds = weighted_sample_stratified_schedule_indices(
+        items, weights, strata, quotas_schedule, draws, seed, start
+    )
+    return [[items[i] for i in round_indices] for round_indices in rounds]
+
+
+def weighted_sample_stratified_schedule_counts(items, weights, strata,
+                                               quotas_schedule, draws,
+                                               seed=0, start=0):
+    """weighted_sample_stratified_schedule_indices 的批量频次入口。
+
+    接受与该入口完全相同的参数语义、固定校验顺序与异常类别, 按同一条由
+    seed 初始化的随机流先生成(并跳过)start 个完整轮次, 再生成 draws 轮;
+    返回长度等于 items 的整数 list counts, counts[i] 即零基区间
+    [start, start+draws) 内位置 i 被选中的总次数(每轮各层无放回, 同一
+    位置每轮至多计一次, 轮间恢复全部位置; 相等的元素值仍按不同位置分别
+    累计)。结果等于把 weighted_sample_stratified_schedule_indices 对应
+    窗口的全部轮次按位置摊平计数, 随机流消耗逐项对齐。draws=0 或窗口内
+    配额全为零时返回全零列表, 但仍完成完整计划、每行可行性与窗口的全部
+    校验; 任何失败都不给出部分计数。计数为任意精度整数, 可直接交给
+    serialize_metrics 并经 deserialize_metrics 精确往返。不修改入参与
+    quotas_schedule。
+    """
+    n, strata_numbers, quota_rows = _validate_stratified_schedule_inputs(
+        items, weights, strata, quotas_schedule, draws, seed, start
+    )
+
+    counts = [0] * n
+    # draws=0: 全部校验已在上面完成, 直接返回全零列表, 不消耗随机流。
+    if draws == 0:
+        return counts
+
+    # 与索引入口完全相同的计划选择、跳过与生成节奏, 随机流消耗逐项对齐。
+    local_weights = list(weights)
+    rng = random.Random(seed)
+    plans = [
+        _stratified_round_plan(local_weights, strata_numbers, quota_rows[j], n)
+        for j in range(start + draws)
+    ]
+    for j in range(start):
+        _draw_stratified_round(plans[j], rng)
+    for j in range(start, start + draws):
+        for position in _draw_stratified_round(plans[j], rng):
+            counts[position] += 1
+    return counts
+
+
+def weighted_sample_stratified_schedule_stream_indices(items, weights, strata,
+                                                       quotas_schedule, draws,
+                                                       seed=0, start=0):
+    """weighted_sample_stratified_schedule_indices 的按需逐轮入口。
+
+    返回一个可迭代对象, 每次迭代产出一轮按层拼接的零基原始索引列表, 共
+    draws 轮; 对相同输入和种子, 转成列表后与
+    weighted_sample_stratified_schedule_indices(...) 的全部轮次完全一致
+    (第 start+j 轮使用 quotas_schedule[start+j] 的配额行)。每轮都从全部
+    原始位置重新开始, 轮内各层无放回, 轮次之间允许再次选中同一位置。
+
+    可选的 start(默认 0)与批量入口语义相同: 迭代时先从该 seed 对应的
+    轮次流按需跳过 start 个完整轮次(被跳过的第 j 轮同样按
+    quotas_schedule[j] 的各行配额消耗同一条确定性随机流, 零配额分层不
+    消耗), 再逐轮产出 draws 轮; start 不改变后续随机序列。
+
+    与批量入口不同, 轮次在调用方消费时才逐轮生成; 但全部校验(items /
+    weights / seed / strata / quotas_schedule 及每一行的结构与成员类型、
+    长度、编号与配额取值、draws / start、窗口范围、权重取值、完整计划
+    每一行每一层的正权重可行性)都在创建时完成 —— 非法输入在调用当场
+    抛出稳定的 TypeError / ValueError, 绝不会延迟到已经产出部分轮次
+    之后; draws=0 也不省略任何校验, 返回不产出元素的迭代对象。不修改
+    入参与 quotas_schedule。连续消费同一迭代器只推进当前随机流, 不重新
+    播种。
+    """
+    n, strata_numbers, quota_rows = _validate_stratified_schedule_inputs(
+        items, weights, strata, quotas_schedule, draws, seed, start
+    )
+
+    # 与批量入口完全相同的计划选择: 窗口 [0, start+draws) 内每一轮(含被
+    # 跳过的轮次)都在创建时按自己那一行的配额选定逐层抽样计划 —— 全部
+    # 确定性工作在迭代前完成, 迭代期间不会再抛出任何异常。
+    local_weights = list(weights)
+    rng = random.Random(seed)
+    plans = [
+        _stratified_round_plan(local_weights, strata_numbers, quota_rows[j], n)
+        for j in range(start + draws)
+    ]
+
+    def _rounds():
+        # 按需跳过 start 个完整轮次: 与完整序列消耗同一条确定性随机流。
+        # draws=0 时跳过与否都不影响空结果, 无需空转 —— 与既有流式入口
+        # 同一节奏。
+        if draws > 0:
+            for j in range(start):
+                _draw_stratified_round(plans[j], rng)
+        for j in range(start, start + draws):
+            yield _draw_stratified_round(plans[j], rng)
+
+    return _rounds()
+
+
+def weighted_sample_stratified_schedule_stream(items, weights, strata,
+                                               quotas_schedule, draws,
+                                               seed=0, start=0):
+    """weighted_sample_stratified_schedule 的按需逐轮入口, 规则与
+    weighted_sample_stratified_schedule_stream_indices 完全一致(同一套
+    创建时校验与 start 窗口语义), 区别仅在于每轮按相同索引产出元素值
+    列表; 与 weighted_sample_stratified_schedule 的逐轮结果完全一致。
+    """
+    index_stream = weighted_sample_stratified_schedule_stream_indices(
+        items, weights, strata, quotas_schedule, draws, seed, start
+    )
+    return ([items[i] for i in round_indices] for round_indices in index_stream)
+
+
+# ---------------------------------------------------------------------------
+# 可暂停 / 恢复的按轮分层配额计划采样会话
+# ---------------------------------------------------------------------------
+
+_STRATIFIED_SCHEDULE_CHECKPOINT_KIND = "stratified_schedule"
+
+
+def _quotas_schedule_fingerprint(quota_rows):
+    """对完整的按轮配额计划取指纹: 逐行逐层带编号规范化后整体 sha256。
+
+    行号、分层编号(即行内下标)与精确十进制配额都参与指纹, 因此调换两行、
+    增删行或改动任一配额都会改变指纹; 成员在调用前已通过校验(非布尔非负
+    整数), 超大配额也按精确十进制处理, 不经过浮点。
+    """
+    digest = hashlib.sha256()
+    for row_index, row in enumerate(quota_rows):
+        for number, quota in enumerate(row):
+            digest.update(
+                ("%d:%d:%s\n" % (row_index, number,
+                                 _int_to_decimal_text(quota))).encode("utf-8")
+            )
+    return digest.hexdigest()
+
+
+def _stratified_schedule_exact_flags(weights, strata_numbers, quota_rows, n):
+    """逐轮逐层抽样路径标记(完整计划的一部分), 返回与计划同形的 bool 列表。
+
+    每一行是一个长度等于分层数的 bool 列表: 正配额分层以其成员权重与
+    配额经 _select_sampling_plan 求得 exact 标记(与批量入口为该轮该层
+    选择的抽样路径一致); 零配额分层不消耗随机流、不构造抽样计划, 标记
+    恒为 False。只读取权重, 不修改入参。
+    """
+    flags = []
+    for row in quota_rows:
+        row_flags = []
+        for number, quota in enumerate(row):
+            if quota == 0:
+                row_flags.append(False)
+                continue
+            pool_weights = [
+                weights[i] for i in range(n) if strata_numbers[i] == number
+            ]
+            _, use_exact = _select_sampling_plan(pool_weights, quota)
+            row_flags.append(bool(use_exact))
+        flags.append(row_flags)
+    return flags
+
+
+def _stratified_schedule_checkpoint_binding_digest(
+    seed_tagged, position, n, strata_count, schedule_length,
+    items_digest, weights_digest, strata_digest, schedule_digest,
+    exact, rng_payload,
+):
+    """把按轮分层计划断点各字段绑定为一个防篡改摘要。
+
+    与其他断点同一构造(serialize_metrics 规范化后 sha256), 绑定标签
+    kind、position、n、分层数、计划长度、items / weights / strata /
+    完整 quotas_schedule 的指纹、逐轮逐层抽样路径标记、标签化 seed 与
+    RNG 快照: 任一字段被改动而不重算摘要时, 恢复都会在产出任何轮次前
+    发现, 因此长计划分段交接无需从头重放随机流。
+    """
+    return _hash_text(serialize_metrics({
+        "kind": _STRATIFIED_SCHEDULE_CHECKPOINT_KIND,
+        "seed": seed_tagged,
+        "position": position,
+        "n": n,
+        "strata_count": strata_count,
+        "schedule_length": schedule_length,
+        "items_digest": items_digest,
+        "weights_digest": weights_digest,
+        "strata_digest": strata_digest,
+        "schedule_digest": schedule_digest,
+        "exact": exact,
+        "rng": rng_payload,
+    }))
+
+
+def weighted_sample_stratified_schedule_checkpoint(items, weights, strata,
+                                                   quotas_schedule,
+                                                   seed=0, start=0):
+    """创建按轮分层配额计划采样会话的断点(只含 JSON 原生值的状态映射)。
+
+    校验沿用 weighted_sample_stratified_schedule_indices 的全部规则与
+    固定顺序(items、weights、seed、strata、quotas_schedule 及每一行的
+    结构与成员类型; 长度一致、编号范围、每行长度等于最大编号加一、配额
+    非负、权重有限非负; 完整计划每一行每一层配额不超过该层正权重位置
+    数), draws 恒按 0 处理(本入口不产出轮次), start 必须是非布尔非负
+    整数且不超过计划长度(start == 计划长度允许, 表示计划已全部消费)。
+    全部校验在返回状态前完成, 失败不返回部分结果, 也不修改入参。
+
+    校验通过后按行序完成前 start 个完整轮次(第 j 轮按
+    quotas_schedule[j] 的各行配额、逐层抽样计划消耗同一条由 seed 初始化
+    的随机流; 零配额分层不消耗随机流), 再返回当前位置与只含 JSON 原生值
+    的状态; 状态绑定版本、标签 kind、position、n、分层数、计划长度、
+    items / weights / strata / 完整 quotas_schedule 指纹、标签化 seed、
+    逐轮逐层抽样路径标记、随机流快照与完整性摘要, 可直接交给
+    serialize_metrics 落盘, 也可经 deserialize_metrics 还原(甚至跨进程)
+    后交给 weighted_sample_stratified_schedule_resume_indices 恢复,
+    恢复时从随机流快照续接, 无需从头重放。
+    """
+    n, strata_numbers, quota_rows = _validate_stratified_schedule_inputs(
+        items, weights, strata, quotas_schedule, 0, seed, start
+    )
+
+    # 复制到本地, 绝不修改入参; 按行序推进前 start 个完整轮次, 与批量
+    # 入口的随机流消耗逐项对齐(零配额分层不消耗随机流)。
+    local_weights = list(weights)
+    rng = random.Random(seed)
+    for j in range(start):
+        _draw_stratified_round(
+            _stratified_round_plan(
+                local_weights, strata_numbers, quota_rows[j], n
+            ),
+            rng,
+        )
+
+    seed_tagged = _seed_to_tagged_value(seed)
+    rng_payload = _rng_state_to_jsonable(rng.getstate())
+    items_digest = _items_fingerprint(items)
+    weights_digest = _weights_fingerprint(weights)
+    strata_digest = _strata_fingerprint(strata_numbers)
+    schedule_digest = _quotas_schedule_fingerprint(quota_rows)
+    exact = _stratified_schedule_exact_flags(
+        local_weights, strata_numbers, quota_rows, n
+    )
+    strata_count = max(strata_numbers) + 1 if strata_numbers else 0
+    schedule_length = len(quota_rows)
+    state = {
+        "version": _CHECKPOINT_VERSION,
+        "kind": _STRATIFIED_SCHEDULE_CHECKPOINT_KIND,
+        "position": start,
+        "n": n,
+        "strata_count": strata_count,
+        "schedule_length": schedule_length,
+        "items_digest": items_digest,
+        "weights_digest": weights_digest,
+        "strata_digest": strata_digest,
+        "schedule_digest": schedule_digest,
+        "seed": seed_tagged,
+        "exact": exact,
+        "rng": rng_payload,
+    }
+    state["digest"] = _stratified_schedule_checkpoint_binding_digest(
+        seed_tagged, start, n, strata_count, schedule_length,
+        items_digest, weights_digest, strata_digest, schedule_digest,
+        exact, rng_payload,
+    )
+    return state
+
+
+def _validate_stratified_schedule_checkpoint_state(state):
+    """校验按轮分层计划断点状态本身的结构与版本, 返回规范化字段。
+
+    调用前须已确认 state 是映射(否则 TypeError 在外层抛出)。字段缺失、
+    未知(多余)字段、类型错误、非法取值、版本不支持、kind 不符等一切
+    结构问题统一抛 ValueError。
+    """
+    required = ("version", "kind", "position", "n", "strata_count",
+                "schedule_length", "items_digest", "weights_digest",
+                "strata_digest", "schedule_digest", "seed", "exact",
+                "rng", "digest")
+    if not all(key in state for key in required):
+        raise ValueError("invalid checkpoint state: missing fields")
+    if set(state) != set(required):
+        raise ValueError("invalid checkpoint state: unexpected fields")
+
+    version = state["version"]
+    if (isinstance(version, bool) or not isinstance(version, int)
+            or version != _CHECKPOINT_VERSION):
+        raise ValueError("unsupported checkpoint version: %r" % (version,))
+    if state["kind"] != _STRATIFIED_SCHEDULE_CHECKPOINT_KIND:
+        raise ValueError("invalid checkpoint state: unexpected kind")
+    position = state["position"]
+    n = state["n"]
+    strata_count = state["strata_count"]
+    schedule_length = state["schedule_length"]
+    for name, value in (("position", position), ("n", n),
+                        ("strata_count", strata_count),
+                        ("schedule_length", schedule_length)):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError("invalid checkpoint state: %s" % name)
+    if position > schedule_length:
+        raise ValueError("invalid checkpoint state: position exceeds schedule")
+    # 逐轮逐层抽样路径标记必须与计划同形: 长度等于计划长度的列表, 每个
+    # 成员是长度等于分层数的 bool 列表。
+    exact = state["exact"]
+    if not isinstance(exact, list) or len(exact) != schedule_length:
+        raise ValueError("invalid checkpoint state: exact")
+    for row_flags in exact:
+        if not isinstance(row_flags, list) or len(row_flags) != strata_count \
+                or any(not isinstance(flag, bool) for flag in row_flags):
+            raise ValueError("invalid checkpoint state: exact")
+    for name in ("items_digest", "weights_digest", "strata_digest",
+                 "schedule_digest", "digest"):
+        if not isinstance(state[name], str):
+            raise ValueError("invalid checkpoint state: %s" % name)
+
+    # 状态可能经 serialize_metrics + deserialize_metrics 还原: 其中的
+    # Decimal 载荷(只可能出现在标签化 seed 或 RNG 高斯缓存中)先还原为
+    # 等值 float, 再解码与核对摘要 —— 两条文本路径解析出的状态因此可
+    # 互换恢复。
+    seed_payload = _normalize_checkpoint_numbers(state["seed"])
+    rng_payload = _normalize_checkpoint_numbers(state["rng"])
+
+    # 两个逆运算对内部结构问题统一抛 ValueError。
+    seed = _tagged_value_to_seed(seed_payload)
+    rng_state = _rng_state_from_jsonable(rng_payload)
+
+    # 绑定摘要: 任何对字段的篡改(position、kind、分层数、计划长度、抽样
+    # 路径标记、seed、RNG 快照、指纹)若不附带重算的摘要, 都会在这里被
+    # 发现 —— 因此恢复时不必从头重放随机流。
+    expected_digest = _stratified_schedule_checkpoint_binding_digest(
+        seed_payload, position, n, strata_count, schedule_length,
+        state["items_digest"], state["weights_digest"],
+        state["strata_digest"], state["schedule_digest"], exact, rng_payload,
+    )
+    if not hmac.compare_digest(expected_digest, state["digest"]):
+        raise ValueError("invalid checkpoint state: digest mismatch")
+    return (position, n, strata_count, schedule_length, exact, seed,
+            rng_state, seed_payload)
+
+
+def _resume_stratified_schedule_rounds_indices(items, weights, strata,
+                                               quotas_schedule, state, draws):
+    """两个按轮分层计划恢复入口共用的已校验核心: 只产出索引轮次与下一状态。
+
+    调用约定: 外层已确认 state 是映射并校验过 draws。先校验状态本身的
+    结构/版本/摘要, 再以状态携带的 seed 完成 items、weights、strata、
+    quotas_schedule 的按轮分层计划校验(含恢复窗口 [position,
+    position+draws) 不越过计划范围); 然后核对状态与当前输入的绑定(n、
+    分层数、计划长度、strata / quotas_schedule / items / weights 指纹)
+    以及逐轮逐层抽样路径标记。任一失败都在物化任何轮次之前抛出既有
+    TypeError / ValueError。全部通过后直接从 RNG 快照续接, 窗口内零配额
+    分层不消耗随机流, 正配额分层按成员权重重建确定性抽样计划后抽样,
+    返回 (索引轮次列表, 下一状态); 不修改入参, 也不修改传入的状态映射。
+    """
+    (position, state_n, strata_count, schedule_length, exact, seed,
+     rng_state, seed_payload) = \
+        _validate_stratified_schedule_checkpoint_state(state)
+
+    # 与一次性批量入口同一套校验与窗口语义: 完整计划每一行的结构、长度、
+    # 配额取值与可行性都在此确定; start=position、draws=draws 时窗口越界
+    # 以 "quotas schedule window out of range" 拒绝。
+    n, strata_numbers, quota_rows = _validate_stratified_schedule_inputs(
+        items, weights, strata, quotas_schedule, draws, seed, position
+    )
+
+    # 状态与当前采样输入的一致性: 位置数、分层数与计划长度先比, 再逐项
+    # 核对指纹。
+    expected_strata_count = max(strata_numbers) + 1 if strata_numbers else 0
+    if state_n != n or strata_count != expected_strata_count \
+            or schedule_length != len(quota_rows):
+        raise ValueError(
+            "checkpoint state does not match items/weights/strata/quotas_schedule"
+        )
+    if state["strata_digest"] != _strata_fingerprint(strata_numbers):
+        raise ValueError("checkpoint state does not match strata")
+    if state["schedule_digest"] != _quotas_schedule_fingerprint(quota_rows):
+        raise ValueError("checkpoint state does not match quotas schedule")
+    if state["items_digest"] != _items_fingerprint(items):
+        raise ValueError("checkpoint state does not match items")
+    if state["weights_digest"] != _weights_fingerprint(weights):
+        raise ValueError("checkpoint state does not match weights")
+
+    # 逐轮逐层抽样路径标记必须与创建断点时一致; 权重、strata、
+    # quotas_schedule 已逐项指纹核对, 这里重建完整计划并比对 exact 标记。
+    # RNG 快照与 (seed, position) 的绑定已由状态摘要保证未被篡改, 故恢复
+    # 直接从快照继续, 无需从头重放。
+    planned_exact = _stratified_schedule_exact_flags(
+        list(weights), strata_numbers, quota_rows, n
+    )
+    if planned_exact != exact:
+        raise ValueError("invalid checkpoint state: sampling plan mismatch")
+
+    # 全部校验通过后才物化轮次: 直接从快照状态继续, 与一次性批量入口在
+    # 相同轮次区间的结果逐轮一致。
+    rng = random.Random()
+    try:
+        rng.setstate(rng_state)
+    except ValueError:
+        raise
+    except Exception as exc:
+        # 结构与取值范围已在上游校验; 任何解释器层面的额外拒绝都统一成
+        # ValueError, 绝不泄漏其他异常类型, 也不会已产出部分轮次。
+        raise ValueError("invalid checkpoint RNG state") from exc
+    local_weights = list(weights)
+    rounds = []
+    for j in range(position, position + draws):
+        rounds.append(
+            _draw_stratified_round(
+                _stratified_round_plan(
+                    local_weights, strata_numbers, quota_rows[j], n
+                ),
+                rng,
+            )
+        )
+
+    next_state = dict(state)
+    next_rng_payload = _rng_state_to_jsonable(rng.getstate())
+    next_position = position + draws
+    next_state["position"] = next_position
+    next_state["rng"] = next_rng_payload
+    # seed 载荷使用校验时规范化后的形式: 经 deserialize_metrics 还原的
+    # 状态其 Decimal 已回到等值 float, 下一状态因此与 JSON 原生状态链
+    # 逐字段一致, 可继续经任一文本路径序列化/解析后再恢复。
+    next_state["seed"] = seed_payload
+    # 摘要必须随 position / RNG 一并刷新, 否则链式再恢复时会因摘要失配
+    # 而失败(其余字段与原状态相同)。
+    next_state["digest"] = _stratified_schedule_checkpoint_binding_digest(
+        seed_payload, next_position, n, strata_count, schedule_length,
+        state["items_digest"], state["weights_digest"],
+        state["strata_digest"], state["schedule_digest"], exact,
+        next_rng_payload,
+    )
+    return rounds, next_state
+
+
+def weighted_sample_stratified_schedule_resume_indices(items, weights, strata,
+                                                       quotas_schedule, state,
+                                                       draws):
+    """从按轮分层计划断点继续产出索引轮次, 返回 (轮次列表, 下一状态)。
+
+    第一轮从断点记录的 position(已消费的轮次前缀)开始; 逐轮结果与一次性
+    weighted_sample_stratified_schedule_indices(items, weights, strata,
+    quotas_schedule, draws, seed, start=position) 完全一致, 即等于一次性
+    批量序列的零基区间 [position, position+draws); 多次连续续接与一次性
+    生成逐项相同, 恢复时无需从头重放随机流。返回前完成与批量入口一致的
+    全部输入校验(含恢复窗口不越过计划范围), 并核对状态与 items、weights、
+    strata、完整 quotas_schedule 及 (seed, 位置, RNG 快照) 的自洽性:
+    状态不是映射抛 TypeError; 字段缺失或未知、版本或 kind 不支持、摘要或
+    输入不匹配、抽样路径标记不一致、随机流数据越界统一抛 ValueError;
+    items/weights/strata/quotas_schedule/draws 的错误沿用既有
+    TypeError / ValueError。所有失败都在任何轮次物化之前确定, 绝不返回
+    部分轮次。draws=0 返回空轮次与位置不变的状态副本; 零配额分层只推进
+    位置且不消耗随机流; 计划末尾之后只接受空窗口。状态可经
+    serialize_metrics / deserialize_metrics 往返后继续恢复。不修改入参,
+    也不修改传入的状态映射。
+    """
+    # 状态不是映射: TypeError(文档约定的明确分类)。映射前提下的一切
+    # 结构/版本/摘要问题在 _validate_stratified_schedule_checkpoint_state
+    # 中统一为 ValueError。
+    if not isinstance(state, collections.abc.Mapping):
+        raise TypeError("checkpoint state must be a mapping")
+    # draws 的类型/取值规则独立于状态, 先按既有规则校验(TypeError /
+    # ValueError), 再解析状态。
+    _validate_draws(draws)
+    return _resume_stratified_schedule_rounds_indices(
+        items, weights, strata, quotas_schedule, state, draws
+    )
+
+
+def weighted_sample_stratified_schedule_resume(items, weights, strata,
+                                               quotas_schedule, state, draws):
+    """按元素值从按轮分层计划断点继续, 返回 (元素值轮次列表, 下一状态)。
+
+    校验顺序按恢复入口约定固定: 调用开始先按批量入口完成 items、weights、
+    strata、quotas_schedule 的结构、长度、成员类型、编号与配额取值、权重
+    取值与完整计划每一行可行性校验(这部分与 seed 无关, 以合法种子 0 试跑;
+    state 携带的 seed 其标签化编码随后随 state 一并校验), 再按恢复入口
+    校验 state 的映射类型、版本、kind、字段集合、摘要、随机数状态以及
+    state 与当前输入的绑定(含恢复窗口范围与逐轮逐层抽样路径标记), draws
+    必须是非布尔非负整数。状态不是映射抛 TypeError; 非法状态、版本或
+    kind 不支持、状态与输入不匹配或恢复窗口超出计划范围等一律抛
+    ValueError; 其余输入错误沿用既有 TypeError / ValueError。所有失败都
+    在产生任何轮次之前确定。
+
+    每轮返回元素值列表, 与
+    weighted_sample_stratified_schedule_resume_indices 返回的每轮原始
+    位置逐项对应(第 j 个值恰为 items[第 j 个索引]): 相同值的不同位置
+    分别消耗。返回的下一状态与按索引入口产出的完全相同(position、RNG
+    快照、digest 一致), 只含 JSON 原生值, 可直接再次传入本入口或按索引
+    入口, 或经 serialize_metrics / deserialize_metrics 往返后继续恢复。
+    draws=0 返回空轮次与位置、随机状态不变的状态副本; 零配额分层只推进
+    位置, 不消耗随机流。不修改入参, 也不修改传入的状态映射。
+    """
+    # 第一步: 先按批量入口完成 items、weights、strata、quotas_schedule 的
+    # 结构、长度、成员类型、取值与可行性校验(draws/start 以 0 试跑, 窗口
+    # 必然合法; state 携带的 seed 其编码与类型在第三步随状态一并校验)。
+    # 因此即使 state 本身已损坏, 非法 items/weights/strata/quotas_schedule
+    # 仍优先以批量入口的异常类别报告。
+    _validate_stratified_schedule_inputs(
+        items, weights, strata, quotas_schedule, 0, 0, 0
+    )
+
+    # 第二步: 恢复入口的映射类型检查与 draws 规则(TypeError / ValueError)。
+    if not isinstance(state, collections.abc.Mapping):
+        raise TypeError("checkpoint state must be a mapping")
+    _validate_draws(draws)
+
+    # 第三步: 状态结构/版本/kind/字段/摘要/RNG、state 与输入绑定(含从
+    # 状态解出的 seed 再跑一次完整校验与窗口检查)、抽样路径标记核对,
+    # 全部通过后从 RNG 快照续接产出索引轮次。与按索引入口共用同一个已
+    # 校验核心, 因此轮次内容、下一状态、异常类别与其逐项一致。
+    index_rounds, next_state = _resume_stratified_schedule_rounds_indices(
+        items, weights, strata, quotas_schedule, state, draws
+    )
+    # 按每轮原始位置逐项映射为元素值: 相同值的不同位置各自独立映射。
+    # 只读取 items, 不修改入参。
+    rounds = [[items[i] for i in round_indices] for round_indices in index_rounds]
+    return rounds, next_state
+
+
+# ---------------------------------------------------------------------------
 # 指标序列化
 # ---------------------------------------------------------------------------
 
