@@ -67,6 +67,22 @@
         任何失败都不给出部分计数。计数为任意精度整数, 可直接交给
         serialize_metrics 并经 deserialize_metrics 精确往返。不修改入参
         与 weights_schedule。
+    weighted_sample_schedule_stream_indices(items, weights_schedule, k, draws,
+        seed=0, start=0)
+        weighted_sample_schedule_indices 的按需逐轮入口: 返回一个可迭代
+        对象, 调用方逐轮取得与批量入口完全一致的轮次(每轮一份按抽样先后
+        排列的零基原始索引列表), 不必一次物化全部 draws 轮。全部参数与
+        可行性校验都在创建时完成并当场抛出(结构、行长、窗口范围、权重
+        类型与取值、每轮正权重可行性, draws=0 或 k=0 也不省略), 不会
+        延迟到已经产出部分轮次之后; start 在迭代时按需跳过完整轮次,
+        被跳过的第 j 轮同样按 weights_schedule[j] 的权重与抽样计划消耗
+        同一条随机流。k=0 时每轮产出空列表且不消耗随机流, draws=0 返回
+        不产出元素的可迭代对象。不修改入参与 weights_schedule。
+    weighted_sample_schedule_stream(items, weights_schedule, k, draws,
+        seed=0, start=0)
+        与 weighted_sample_schedule_stream_indices 同规则(同一套创建时
+        校验与 start 窗口语义), 但每轮按相同索引产出元素值列表, 与
+        weighted_sample_schedule 逐轮对应。
     weighted_sample_k_schedule_indices(items, weights, k_schedule, draws,
         seed=0, start=0)
         按轮样本数计划的批量入口: k_schedule 是有限非文本序列, 成员均为
@@ -1187,6 +1203,77 @@ def weighted_sample_schedule_counts(
         ):
             counts[position] += 1
     return counts
+
+
+def weighted_sample_schedule_stream_indices(
+    items, weights_schedule, k, draws, seed=0, start=0
+):
+    """weighted_sample_schedule_indices 的按需逐轮入口。
+
+    返回一个可迭代对象, 每次迭代产出一轮按抽样先后排列的零基原始索引
+    列表, 共 draws 轮; 对相同输入和种子, 转成列表后与
+    weighted_sample_schedule_indices(...) 的全部轮次完全一致(第 start+j
+    轮使用 weights_schedule[start+j] 的权重行, 第一轮同样与
+    weighted_sample_indices 对应行逐项相同)。每轮都从全部原始位置重新
+    开始, 轮内不放回, 重复值按位置区分, 轮次之间允许再次选中同一位置。
+
+    可选的 start(默认 0)与批量入口语义相同: 迭代时先从该 seed 对应的
+    轮次流按需跳过 start 个完整轮次(被跳过的第 j 轮同样按
+    weights_schedule[j] 的权重与抽样计划消耗同一条确定性随机流), 再逐轮
+    产出 draws 轮; 转成列表后与 start=0 的完整结果按零基区间
+    [start, start+draws) 切片逐项一致, start 不改变后续随机序列。
+
+    与批量入口不同, 轮次在调用方消费时才逐轮生成, 长批次不必一次物化;
+    但全部校验(items / weights_schedule / 每一行的结构与类型、行长、
+    draws / start 类型与取值、窗口范围、权重 NaN / 无穷 / 负数、每一轮的
+    正权重可行性)都在创建时完成 —— 非法输入在调用当场抛出稳定的
+    TypeError / ValueError, 绝不会延迟到已经产出部分轮次之后; draws=0
+    或 k=0 也不省略任何校验。draws=0 时返回不产出元素的迭代对象; k=0
+    时每轮产出空列表且不消耗随机流。不修改入参与 weights_schedule。
+    """
+    n = _validate_schedule_inputs(
+        items, weights_schedule, k, draws, seed, start
+    )
+
+    rng = random.Random(seed)
+    # 与批量入口完全相同的计划选择: 窗口 [0, start+draws) 内每一轮(含被
+    # 跳过的轮次)都按自己那一行的权重选择抽样计划, 每轮复制一份权重,
+    # 绝不修改 schedule。draws=0 时 plans 覆盖 [0, start), 仅用于跳过,
+    # 迭代器本身不产出任何元素。
+    plans = [
+        _select_sampling_plan(list(weights_schedule[j]), k)
+        for j in range(start + draws)
+    ]
+
+    def _rounds():
+        # 按需跳过 start 个完整轮次: 与完整序列消耗同一条确定性随机流。
+        # k=0 的轮次不消耗随机流, draws=0 时跳过与否不影响空结果, 两种
+        # 情形都无需空转 —— 与既有流式入口同一节奏。
+        if k > 0 and draws > 0:
+            for j in range(start):
+                planned_weights, use_exact = plans[j]
+                _draw_indices_once(n, planned_weights, k, rng, use_exact)
+        for j in range(start, start + draws):
+            planned_weights, use_exact = plans[j]
+            yield _draw_indices_once(
+                n, planned_weights, k, rng, use_exact
+            )
+
+    return _rounds()
+
+
+def weighted_sample_schedule_stream(
+    items, weights_schedule, k, draws, seed=0, start=0
+):
+    """weighted_sample_schedule 的按需逐轮入口, 规则与
+    weighted_sample_schedule_stream_indices 完全一致(同一套创建时校验与
+    start 窗口语义), 区别仅在于每轮按相同索引产出元素值列表; 与
+    weighted_sample_schedule 的逐轮结果完全一致。
+    """
+    index_stream = weighted_sample_schedule_stream_indices(
+        items, weights_schedule, k, draws, seed, start
+    )
+    return ([items[i] for i in round_indices] for round_indices in index_stream)
 
 
 # ---------------------------------------------------------------------------
