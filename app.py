@@ -4575,6 +4575,100 @@ def weighted_sample_stratified_counts(items, weights, strata, quotas, seed=0):
     return counts
 
 
+def weighted_sample_stratified_stream_indices(items, weights, strata, quotas,
+                                              draws, seed=0, start=0):
+    """weighted_sample_stratified_indices 的按需逐层入口。
+
+    返回一个可迭代对象, 每次迭代产出一个分层的零基原始索引列表(层内按
+    抽样先后排列, 相同值的不同位置仍按位置独立处理), 共 draws 个; 外层
+    第 j 个列表即分层编号 start+j 的抽样结果。对相同输入和种子, 把
+    start=0 且 draws 等于 quotas 长度的全部产出依次拼接, 与
+    weighted_sample_stratified_indices(items, weights, strata, quotas,
+    seed) 逐项一致; 一般地, 转成列表后与完整计划在分层边界上的窗口
+    [start, start+draws) 逐层一致。
+
+    可选的 start(默认 0)从完整计划的第 start 个分层槽位开始: 迭代时先
+    按编号升序跳过前 start 个分层(正配额分层同样消耗同一条由 seed 初始
+    化的确定性随机流, 零配额分层不消耗), 再逐层产出 draws 个列表; start
+    不改变后续随机序列。零配额或无成员分层在窗口内产出空列表且不消耗
+    随机流; 零权重位置永不入选。
+
+    与一次性入口不同, 各层结果在调用方消费时才逐层生成; 但全部校验都在
+    创建时完成, 绝不把错误拖到迭代期间: 先按分层入口完成 items、weights、
+    seed、strata、quotas 的结构、成员类型、长度、编号、配额与权重取值、
+    各层正权重可行性校验, 再要求 draws、start 为非布尔非负整数且窗口
+    [start, start+draws) 不越过 quotas(计划末尾只接受空窗口)。结构或
+    成员类型错误抛 TypeError; 长度、编号或配额越界、负数、负权重、NaN、
+    无穷权重、某层正权重不足配额以及窗口越界抛 ValueError。draws=0 仍
+    完成全部校验并返回不产出元素的迭代对象。任何失败都不产生部分结果,
+    也不修改入参。连续消费同一迭代器只推进当前随机流, 不重新播种。
+    """
+    n, strata_numbers, quota_values = _validate_stratified_inputs(
+        items, weights, strata, quotas, seed
+    )
+    _validate_draws(draws)
+    _validate_start(start)
+    if start + draws > len(quota_values):
+        raise ValueError("stratified stream window out of range")
+
+    # 复制到本地, 绝不修改入参; 各层按编号升序共享同一条随机流。窗口
+    # [0, start+draws) 内每个正配额分层(含被跳过的分层)都在创建时按自己
+    # 的成员权重选定抽样计划 —— 与一次性入口为该层选择的计划一致, 且
+    # 全部确定性工作在迭代前完成, 迭代期间不会再抛出任何异常。
+    local_weights = list(weights)
+    rng = random.Random(seed)
+    plans = []
+    for number in range(start + draws):
+        quota = quota_values[number]
+        if quota == 0:
+            plans.append(None)
+            continue
+        pool = [i for i in range(n) if strata_numbers[i] == number]
+        pool_weights = [local_weights[i] for i in pool]
+        planned_weights, use_exact = _select_sampling_plan(pool_weights, quota)
+        plans.append((pool, planned_weights, quota, use_exact))
+
+    def _slots():
+        # 按需跳过前 start 个分层: 正配额分层消耗同一条确定性随机流, 零
+        # 配额分层不消耗 —— 与一次性入口和断点入口的推进节奏逐项一致。
+        # draws=0 时跳过与否都不影响空结果, 无需空转。
+        if draws > 0:
+            for number in range(start):
+                plan = plans[number]
+                if plan is None:
+                    continue
+                pool, planned_weights, quota, use_exact = plan
+                _draw_indices_once_pool(
+                    pool, planned_weights, quota, rng, use_exact
+                )
+        for number in range(start, start + draws):
+            plan = plans[number]
+            # 零配额(含无成员)分层产出空列表, 不消耗随机流。
+            if plan is None:
+                yield []
+                continue
+            pool, planned_weights, quota, use_exact = plan
+            yield _draw_indices_once_pool(
+                pool, planned_weights, quota, rng, use_exact
+            )
+
+    return _slots()
+
+
+def weighted_sample_stratified_stream(items, weights, strata, quotas, draws,
+                                      seed=0, start=0):
+    """weighted_sample_stratified 的按需逐层入口, 规则与
+    weighted_sample_stratified_stream_indices 完全一致(同一套创建时
+    校验与 start 窗口语义), 区别仅在于每层按相同索引产出元素值列表;
+    与 weighted_sample_stratified 在相同分层窗口的结果逐层一致(相同值
+    的不同位置仍按位置独立处理)。
+    """
+    index_stream = weighted_sample_stratified_stream_indices(
+        items, weights, strata, quotas, draws, seed, start
+    )
+    return ([items[i] for i in slot_indices] for slot_indices in index_stream)
+
+
 # ---------------------------------------------------------------------------
 # 可暂停 / 恢复的分层配额采样会话
 # ---------------------------------------------------------------------------
