@@ -469,6 +469,23 @@
         同参数的结果按位置摊平计数。计数为任意精度整数, 可直接交给
         serialize_metrics 并经 deserialize_metrics 精确往返。不修改
         入参。
+    weighted_sample_stratified_stream_indices(items, weights, strata,
+        quotas, draws, seed=0, start=0)
+        分层配额采样的按需逐层入口: 返回可迭代对象, 依次产出 draws 个
+        分层的索引列表, 第 j 个列表是编号 start + j 的分层按抽样先后
+        排列的原始零基索引。分层按编号升序共享同一条由 seed 初始化的
+        随机流, 零配额或无成员分层产出空列表且不消耗随机流, 被 start
+        跳过的分层仍推进随机状态; start=0 且 draws 等于 quotas 长度时
+        依次拼接全部产出与 weighted_sample_stratified_indices 逐项一致,
+        一般情形等于完整计划按分层边界截取的窗口 [start, start+draws)。
+        全部校验在创建时完成(分层入口规则之后要求 draws、start 为非布尔
+        非负整数且窗口不越过 quotas), 错误不拖到迭代期间; draws=0 仍
+        完成校验并返回空迭代器, 计划末尾只接受空窗口。不修改入参。
+    weighted_sample_stratified_stream(items, weights, strata, quotas,
+        draws, seed=0, start=0)
+        与 weighted_sample_stratified_stream_indices 同规则(同一套
+        创建时校验与窗口语义), 每个分层按相同索引产出元素值列表, 重复值
+        仍按位置区分。
     weighted_sample_stratified_checkpoint(items, weights, strata, quotas,
         seed=0, start=0)
         分层配额采样会话的断点创建入口: 创建时完成
@@ -4573,6 +4590,95 @@ def weighted_sample_stratified_counts(items, weights, strata, quotas, seed=0):
     for position in indices:
         counts[position] += 1
     return counts
+
+
+def weighted_sample_stratified_stream_indices(items, weights, strata, quotas,
+                                              draws, seed=0, start=0):
+    """weighted_sample_stratified_indices 的按需逐层入口。
+
+    返回一个可迭代对象, 每次迭代产出一个分层的索引列表, 共 draws 个:
+    第 j 个列表是编号为 start + j 的分层在其成员位置中按权重比例无放回
+    抽取 quotas[start + j] 个不同位置后、按抽样先后排列的原始零基索引,
+    相同值的不同位置仍按位置独立处理, 零权重位置永不出现。分层按编号
+    升序共享同一条由 seed 初始化的随机流; 零配额或无成员分层产出空列表
+    且不消耗随机流, 被 start 跳过的分层仍按一次性入口的节奏推进随机
+    状态。start=0 且 draws 等于 quotas 长度时, 依次拼接全部产出与
+    weighted_sample_stratified_indices(items, weights, strata, quotas,
+    seed) 逐项一致; 一般情形下转成列表后与完整计划按分层边界截取的
+    窗口 [start, start+draws) 逐层一致。
+
+    全部校验在创建迭代对象时完成, 不把错误拖到迭代期间: 先沿用分层入口
+    对 items、weights、seed、strata、quotas 的结构、成员类型、长度、
+    编号、配额与权重的全部规则(同一固定顺序与异常类别), 再要求 draws、
+    start 为非布尔非负整数(其他类型抛 TypeError, 负数抛 ValueError),
+    且窗口不越过 quotas(start + draws 超过分层数抛 ValueError; 计划
+    末尾只接受空窗口)。draws=0 仍完成全部校验并返回不产出元素的迭代
+    对象。任何失败都不产生部分结果, 也不修改入参。超大整数、Fraction、
+    Decimal 权重保持既有精确抽样路径。连续消费同一迭代器只推进当前
+    随机流, 不重新播种, 也不重复产出。每个索引列表都可直接交给
+    serialize_metrics。
+    """
+    n, strata_numbers, quota_values = _validate_stratified_inputs(
+        items, weights, strata, quotas, seed
+    )
+    _validate_draws(draws)
+    _validate_start(start)
+    # 窗口不得越过计划范围; start == 分层数时只接受空窗口。
+    if start + draws > len(quota_values):
+        raise ValueError("stratified stream window out of range")
+
+    # 复制到本地, 绝不修改入参; 各层按编号升序共享同一条随机流。
+    local_weights = list(weights)
+    rng = random.Random(seed)
+
+    def _slots():
+        # 按需跳过前 start 个分层槽位: 与完整计划消耗同一条确定性随机流。
+        # 零配额分层不消耗随机流, draws=0 时跳过与否不影响空结果, 两种
+        # 情形都无需空转。
+        if draws > 0:
+            for number in range(start):
+                quota = quota_values[number]
+                if quota == 0:
+                    continue
+                pool = [i for i in range(n) if strata_numbers[i] == number]
+                pool_weights = [local_weights[i] for i in pool]
+                planned_weights, use_exact = _select_sampling_plan(
+                    pool_weights, quota
+                )
+                _draw_indices_once_pool(
+                    pool, planned_weights, quota, rng, use_exact
+                )
+        for number in range(start, start + draws):
+            quota = quota_values[number]
+            # 零配额(含无成员)分层产出空列表, 不消耗随机流 —— 与一次性
+            # 入口的跳过节奏一致。
+            if quota == 0:
+                yield []
+                continue
+            pool = [i for i in range(n) if strata_numbers[i] == number]
+            pool_weights = [local_weights[i] for i in pool]
+            planned_weights, use_exact = _select_sampling_plan(
+                pool_weights, quota
+            )
+            yield _draw_indices_once_pool(
+                pool, planned_weights, quota, rng, use_exact
+            )
+
+    return _slots()
+
+
+def weighted_sample_stratified_stream(items, weights, strata, quotas, draws,
+                                      seed=0, start=0):
+    """weighted_sample_stratified 的按需逐层入口, 规则与
+    weighted_sample_stratified_stream_indices 完全一致(同一套创建时
+    校验、窗口语义与随机流节奏), 区别仅在于每个分层按相同索引产出
+    元素值列表; 相同值的不同位置仍按位置独立映射。每个值列表都可直接
+    交给 serialize_metrics。
+    """
+    index_stream = weighted_sample_stratified_stream_indices(
+        items, weights, strata, quotas, draws, seed, start
+    )
+    return ([items[i] for i in slot_indices] for slot_indices in index_stream)
 
 
 # ---------------------------------------------------------------------------
