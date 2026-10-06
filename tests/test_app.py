@@ -15,6 +15,8 @@ from app import (
     weighted_sample_schedule,
     weighted_sample_schedule_indices,
     weighted_sample_schedule_counts,
+    weighted_sample_schedule_stream,
+    weighted_sample_schedule_stream_indices,
     weighted_sample_schedule_checkpoint,
     weighted_sample_schedule_resume_indices,
     weighted_sample_schedule_resume,
@@ -5755,6 +5757,219 @@ class WeightedSampleScheduleTest(unittest.TestCase):
         self.assertEqual(
             serialize_metrics({"n": 10 ** 100}),
             '{"n":1' + "0" * 100 + "}",
+        )
+
+
+class WeightedSampleScheduleStreamTest(unittest.TestCase):
+    """按轮次变化权重的按需逐轮入口
+    weighted_sample_schedule_stream / weighted_sample_schedule_stream_indices。"""
+
+    ITEMS = list("abcd")
+    SCHEDULE = [
+        [1, 2, 3, 4],
+        [4, 3, 2, 1],
+        [0, 1, 3, 5],
+        [10 ** 100, 1, 1, 1],
+        [Fraction(1, 3), 2, 0, 1],
+        [Decimal("1E-50"), 1, 1, 1],
+    ]
+
+    def test_stream_matches_batch_round_by_round(self):
+        # 相同输入与种子下, 流式输出与批量入口逐轮完全一致。
+        for k in (0, 1, 2, 3):
+            for seed in (0, 7, 42, -3, "s"):
+                for draws, start in ((6, 0), (3, 2), (1, 5), (0, 0), (0, 6)):
+                    with self.subTest(k=k, seed=seed, draws=draws, start=start):
+                        self.assertEqual(
+                            list(weighted_sample_schedule_stream_indices(
+                                self.ITEMS, self.SCHEDULE, k, draws, seed,
+                                start)),
+                            weighted_sample_schedule_indices(
+                                self.ITEMS, self.SCHEDULE, k, draws, seed,
+                                start),
+                        )
+                        self.assertEqual(
+                            list(weighted_sample_schedule_stream(
+                                self.ITEMS, self.SCHEDULE, k, draws, seed,
+                                start)),
+                            weighted_sample_schedule(
+                                self.ITEMS, self.SCHEDULE, k, draws, seed,
+                                start),
+                        )
+
+    def test_start_only_skips_rounds_without_changing_stream(self):
+        # start 只跳过前面的轮次: 流式结果与 start=0 完整序列按
+        # [start, start+draws) 切片逐项一致。
+        full = list(weighted_sample_schedule_stream_indices(
+            self.ITEMS, self.SCHEDULE, 2, 6, 99))
+        for start in range(6):
+            for draws in range(0, 6 - start + 1):
+                with self.subTest(start=start, draws=draws):
+                    self.assertEqual(
+                        list(weighted_sample_schedule_stream_indices(
+                            self.ITEMS, self.SCHEDULE, 2, draws, 99, start)),
+                        full[start:start + draws],
+                    )
+
+    def test_lazy_round_by_round_consumption(self):
+        # 迭代器逐轮产出: 每取一轮才推进一轮, 不必一次物化整个序列。
+        stream = weighted_sample_schedule_stream_indices(
+            self.ITEMS, self.SCHEDULE, 2, 6, 7)
+        batch = weighted_sample_schedule_indices(
+            self.ITEMS, self.SCHEDULE, 2, 6, 7)
+        for expected in batch:
+            self.assertEqual(next(stream), expected)
+        with self.assertRaises(StopIteration):
+            next(stream)
+
+    def test_value_stream_maps_positions_of_index_stream(self):
+        items = ["x", "y", "x", "z"]
+        schedule = [[1, 2, 3, 4], [4, 3, 2, 1], [1, 1, 1, 1]]
+        idx = list(weighted_sample_schedule_stream_indices(
+            items, schedule, 3, 3, 11))
+        vals = list(weighted_sample_schedule_stream(
+            items, schedule, 3, 3, 11))
+        self.assertEqual(vals, [[items[i] for i in rd] for rd in idx])
+
+    def test_each_round_restarts_and_zero_weights_never_chosen(self):
+        schedule = [[0, 5, 0], [1, 0, 0], [0, 0, 7]]
+        for seed in range(50):
+            rounds = list(weighted_sample_schedule_stream_indices(
+                list("abc"), schedule, 1, 3, seed))
+            self.assertEqual(rounds, [[1], [0], [2]])
+        # 轮内位置不重复, 轮间允许再次选中同一位置。
+        for seed in range(50):
+            rounds = list(weighted_sample_schedule_stream_indices(
+                list(range(6)),
+                [[10 ** 100, 1, 10 ** 99, 3, 0, 5],
+                 [1, 1, 1, 1, 1, 1],
+                 [5, 0, 3, 1, 10 ** 99, 1]],
+                5, 3, seed))
+            for rd in rounds:
+                self.assertEqual(len(rd), 5)
+                self.assertEqual(len(set(rd)), 5)
+                self.assertTrue(all(0 <= i < 6 for i in rd))
+
+    def test_k_zero_yields_empty_lists(self):
+        schedule = [[0, 0], [1, 2], [0, 0]]
+        self.assertEqual(
+            list(weighted_sample_schedule_stream_indices(
+                ["a", "b"], schedule, 0, 3, 5)),
+            [[], [], []],
+        )
+        self.assertEqual(
+            list(weighted_sample_schedule_stream(
+                ["a", "b"], schedule, 0, 2, 5, start=1)),
+            [[], []],
+        )
+
+    def test_draws_zero_returns_empty_iterable_after_full_validation(self):
+        self.assertEqual(
+            list(weighted_sample_schedule_stream_indices(
+                ["a", "b"], [[1, 2], [3, 4]], 2, 0, 0)), [])
+        self.assertEqual(
+            list(weighted_sample_schedule_stream(
+                ["a", "b"], [[1, 2]], 2, 0, 0)), [])
+        # draws=0 仍完成全部结构、权重与可行性校验。
+        with self.assertRaises(TypeError):
+            weighted_sample_schedule_stream_indices("ab", [[1, 2]], 1, 0, 0)
+        with self.assertRaises(TypeError):
+            weighted_sample_schedule_stream_indices(["a", "b"], "xx", 1, 0, 0)
+        with self.assertRaises(TypeError):
+            weighted_sample_schedule_stream_indices(
+                ["a", "b"], [[1, "x"]], 1, 0, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_schedule_stream_indices(["a", "b"], [[1]], 0, 0, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_schedule_stream_indices(
+                ["a"], [[float("nan")]], 0, 0, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_schedule_stream_indices(
+                ["a", "b"], [[1, 0]], 2, 0, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_schedule_stream(
+                ["a", "b"], [[1, 2]], 1, 0, 0, start=2)
+
+    def test_errors_raise_at_call_time_before_any_round(self):
+        # 全部错误在迭代器返回前确定: 调用当场抛出, 而不是延迟到迭代中。
+        schedule = [[1, 2], [2, 1]]
+        for bad in (True, False, 1.0, "2", None, [2], 1 + 0j):
+            with self.subTest(bad=bad):
+                with self.assertRaises(TypeError):
+                    weighted_sample_schedule_stream_indices(
+                        ["a", "b"], schedule, 1, bad, 0)
+                with self.assertRaises(TypeError):
+                    weighted_sample_schedule_stream(
+                        ["a", "b"], schedule, 1, 1, 0, start=bad)
+        with self.assertRaises(ValueError):
+            weighted_sample_schedule_stream_indices(
+                ["a", "b"], schedule, 1, -1, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_schedule_stream(
+                ["a", "b"], schedule, 1, 1, 0, start=-1)
+        with self.assertRaises(ValueError):
+            weighted_sample_schedule_stream_indices(
+                ["a", "b"], schedule, 1, 3, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_schedule_stream_indices(
+                ["a", "b"], [[1, 0], [1, 1]], 2, 1, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_schedule_stream(
+                ["a", "b"], [[1, 1], [0, 0]], 1, 1, 0)
+        with self.assertRaises(TypeError):
+            weighted_sample_schedule_stream_indices(
+                ["a", "b"], schedule, 1, 1, object())
+        with self.assertRaises(TypeError):
+            weighted_sample_schedule_stream_indices(
+                ["a", "b"], schedule, True, 1, 0)
+
+    def test_inputs_and_schedule_not_mutated(self):
+        items = list("abc")
+        schedule = [[10 ** 100, 2, 3], [Fraction(1, 2), 0, 1],
+                    [Decimal("0.5"), 1, 1]]
+        items_snap = list(items)
+        schedule_snap = [list(row) for row in schedule]
+        list(weighted_sample_schedule_stream(items, schedule, 2, 3, 99))
+        list(weighted_sample_schedule_stream_indices(
+            items, schedule, 2, 2, -3, start=1))
+        self.assertEqual(items, items_snap)
+        self.assertEqual(schedule, schedule_snap)
+
+    def test_exact_type_rows_match_batch_reproducibly(self):
+        # Decimal / Fraction / 超大整数权重行的流式结果与批量入口一致且可复现。
+        items = list("abcd")
+        schedule = [
+            [1, 0.5, 2, 1],
+            [Fraction(1, 3), 2, 0, 1],
+            [Decimal("1E-50"), 1, 1, 1],
+            [10 ** 400, 1, 1, 1],
+            [Decimal("1E1000"), 1, 0, 2],
+        ]
+        first = list(weighted_sample_schedule_stream_indices(
+            items, schedule, 2, 5, 5))
+        self.assertEqual(
+            first,
+            weighted_sample_schedule_indices(items, schedule, 2, 5, 5))
+        for _ in range(4):
+            self.assertEqual(
+                list(weighted_sample_schedule_stream_indices(
+                    items, schedule, 2, 5, 5)),
+                first)
+        self.assertEqual(
+            list(weighted_sample_schedule_stream_indices(
+                items, schedule, 2, 3, 5, start=2)),
+            first[2:],
+        )
+
+    def test_results_serialize_exactly(self):
+        idx = list(weighted_sample_schedule_stream_indices(
+            self.ITEMS, self.SCHEDULE, 2, 6, 42))
+        self.assertEqual(deserialize_metrics(serialize_metrics(idx)), idx)
+        vals = list(weighted_sample_schedule_stream(
+            self.ITEMS, self.SCHEDULE, 2, 6, 42))
+        self.assertEqual(
+            deserialize_metrics(serialize_metrics({"rounds": vals})),
+            {"rounds": vals},
         )
 
 
