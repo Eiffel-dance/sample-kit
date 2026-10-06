@@ -38,6 +38,9 @@ from app import (
     weighted_sample_partition_checkpoint,
     weighted_sample_partition_resume_indices,
     weighted_sample_partition_resume,
+    weighted_sample_stratified_indices,
+    weighted_sample_stratified,
+    weighted_sample_stratified_counts,
     weighted_sample_stream,
     weighted_sample_stream_indices,
     weighted_sample_many_excluding,
@@ -8441,6 +8444,325 @@ class WeightedSamplePlanCheckpointTest(unittest.TestCase):
         self.assertEqual(ws, [list(row) for row in self.WEIGHTS_SCHEDULE])
         self.assertEqual(ks, self.K_SCHEDULE)
         self.assertEqual(state, state_snapshot)
+
+
+class WeightedSampleStratifiedTest(unittest.TestCase):
+    """分层配额采样: weighted_sample_stratified_indices /
+    weighted_sample_stratified / weighted_sample_stratified_counts。"""
+
+    ITEMS = list("abcdef")
+    WEIGHTS = [1, 3, 0, 2, 5, 0]
+    STRATA = [0, 1, 0, 1, 0, 1]
+    QUOTAS = [2, 1]
+    SEED = 42
+
+    def _full(self):
+        return weighted_sample_stratified_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS, self.SEED)
+
+    # ------------------------------------------------------------------
+    # 结构与确定性
+    # ------------------------------------------------------------------
+    def test_shape_membership_and_no_replacement(self):
+        groups = self._full()
+        self.assertEqual(len(groups), len(self.QUOTAS))
+        for number, group in enumerate(groups):
+            self.assertEqual(len(group), self.QUOTAS[number])
+            # 层内无重复, 每个位置都属于编号对应的层。
+            self.assertEqual(len(group), len(set(group)))
+            for position in group:
+                self.assertEqual(self.STRATA[position], number)
+        # 零权重位置(2、5)永不出现。
+        flattened = [p for group in groups for p in group]
+        self.assertNotIn(2, flattened)
+        self.assertNotIn(5, flattened)
+
+    def test_same_seed_same_result(self):
+        first = self._full()
+        for _ in range(5):
+            self.assertEqual(self._full(), first)
+            self.assertEqual(
+                weighted_sample_stratified(
+                    self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+                    self.SEED),
+                [[self.ITEMS[i] for i in group] for group in first],
+            )
+
+    def test_single_zero_stratum_matches_baseline(self):
+        k = 3
+        strata = [0] * len(self.ITEMS)
+        index_groups = weighted_sample_stratified_indices(
+            self.ITEMS, self.WEIGHTS, strata, [k], self.SEED)
+        value_groups = weighted_sample_stratified(
+            self.ITEMS, self.WEIGHTS, strata, [k], self.SEED)
+        self.assertEqual(
+            index_groups,
+            [weighted_sample_indices(self.ITEMS, self.WEIGHTS, k, self.SEED)],
+        )
+        self.assertEqual(
+            value_groups,
+            [weighted_sample(self.ITEMS, self.WEIGHTS, k, self.SEED)],
+        )
+
+    def test_values_entry_maps_positions(self):
+        items = ["x", "y", "x", "z", "y", "q"]
+        index_groups = weighted_sample_stratified_indices(
+            items, self.WEIGHTS, self.STRATA, self.QUOTAS, seed=5)
+        value_groups = weighted_sample_stratified(
+            items, self.WEIGHTS, self.STRATA, self.QUOTAS, seed=5)
+        self.assertEqual(
+            value_groups,
+            [[items[i] for i in group] for group in index_groups],
+        )
+
+    def test_zero_quota_stratum_does_not_consume_stream(self):
+        # 中间的零配额层不消耗随机流: 去掉该层及其唯一位置后, 其余各层
+        # 的抽样结果逐项对应(位置随 items 收缩而平移)。
+        items = list("abcde")
+        weights = [1, 2, 3, 4, 5]
+        groups = weighted_sample_stratified_indices(
+            items, weights, [0, 0, 1, 2, 2], [1, 0, 1], self.SEED)
+        shrunk = weighted_sample_stratified_indices(
+            list("abde"), [1, 2, 4, 5], [0, 0, 1, 1], [1, 1], self.SEED)
+        self.assertEqual(groups[1], [])
+        self.assertEqual(groups[0], shrunk[0])
+        self.assertEqual(groups[2], [i + 1 for i in shrunk[1]])
+
+    def test_all_zero_quotas_return_empty_groups(self):
+        self.assertEqual(
+            weighted_sample_stratified_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, [0, 0], self.SEED),
+            [[], []],
+        )
+        # 权重总量为零且全部配额为零同样合法。
+        self.assertEqual(
+            weighted_sample_stratified_indices(
+                self.ITEMS, [0] * len(self.ITEMS), self.STRATA, [0, 0],
+                self.SEED),
+            [[], []],
+        )
+        self.assertEqual(
+            weighted_sample_stratified(
+                self.ITEMS, [0] * len(self.ITEMS), self.STRATA, [0, 0],
+                self.SEED),
+            [[], []],
+        )
+
+    def test_empty_items_requires_empty_strata_and_quotas(self):
+        self.assertEqual(
+            weighted_sample_stratified_indices([], [], [], [], self.SEED), [])
+        self.assertEqual(
+            weighted_sample_stratified([], [], [], [], self.SEED), [])
+        self.assertEqual(
+            weighted_sample_stratified_counts([], [], [], [], self.SEED), [])
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_indices([], [], [], [0], self.SEED)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_indices([], [], [], [1], self.SEED)
+
+    def test_tuple_inputs_accepted(self):
+        self.assertEqual(
+            weighted_sample_stratified_indices(
+                tuple(self.ITEMS), tuple(self.WEIGHTS),
+                tuple(self.STRATA), tuple(self.QUOTAS), self.SEED),
+            self._full(),
+        )
+
+    def test_fraction_decimal_exact_path(self):
+        weights = [Fraction(1, 7), Decimal("0.2"), 0, 1, 10 ** 80, 0]
+        groups = weighted_sample_stratified_indices(
+            self.ITEMS, weights, self.STRATA, [1, 1], seed=7)
+        self.assertEqual(len(groups), 2)
+        self.assertEqual([len(g) for g in groups], [1, 1])
+        flattened = [p for g in groups for p in g]
+        self.assertNotIn(2, flattened)
+        self.assertNotIn(5, flattened)
+        self.assertEqual(
+            groups,
+            weighted_sample_stratified_indices(
+                self.ITEMS, weights, self.STRATA, [1, 1], 7),
+        )
+
+    def test_inputs_not_mutated(self):
+        items = list(self.ITEMS)
+        weights = list(self.WEIGHTS)
+        strata = list(self.STRATA)
+        quotas = list(self.QUOTAS)
+        weighted_sample_stratified_indices(
+            items, weights, strata, quotas, self.SEED)
+        weighted_sample_stratified(items, weights, strata, quotas, self.SEED)
+        weighted_sample_stratified_counts(
+            items, weights, strata, quotas, self.SEED)
+        self.assertEqual(items, self.ITEMS)
+        self.assertEqual(weights, self.WEIGHTS)
+        self.assertEqual(strata, self.STRATA)
+        self.assertEqual(quotas, self.QUOTAS)
+
+    # ------------------------------------------------------------------
+    # 频次入口
+    # ------------------------------------------------------------------
+    def test_counts_match_indices_entry(self):
+        groups = self._full()
+        counts = weighted_sample_stratified_counts(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS, self.SEED)
+        self.assertEqual(len(counts), len(self.ITEMS))
+        expected = [0] * len(self.ITEMS)
+        for group in groups:
+            for position in group:
+                expected[position] += 1
+        self.assertEqual(counts, expected)
+        self.assertTrue(all(isinstance(c, int) for c in counts))
+        self.assertEqual(sum(counts), sum(self.QUOTAS))
+
+    def test_counts_all_zero_quotas(self):
+        self.assertEqual(
+            weighted_sample_stratified_counts(
+                self.ITEMS, self.WEIGHTS, self.STRATA, [0, 0], self.SEED),
+            [0] * len(self.ITEMS),
+        )
+
+    def test_counts_serialize_roundtrip_exact(self):
+        counts = weighted_sample_stratified_counts(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS, self.SEED)
+        restored = deserialize_metrics(serialize_metrics(counts))
+        self.assertEqual(restored, counts)
+        self.assertTrue(all(type(c) is int for c in restored))
+        # 嵌进指标树同样精确往返。
+        tree = {"stratified": counts}
+        self.assertEqual(
+            deserialize_metrics(serialize_metrics(tree)), tree)
+
+    # ------------------------------------------------------------------
+    # 校验: 类型错误
+    # ------------------------------------------------------------------
+    def test_validation_type_errors(self):
+        te = lambda fn: self.assertRaises(TypeError, fn)
+        items, weights = self.ITEMS, self.WEIGHTS
+        strata, quotas = self.STRATA, self.QUOTAS
+        te(lambda: weighted_sample_stratified_indices(
+            "abcdef", weights, strata, quotas, 0))
+        te(lambda: weighted_sample_stratified_indices(
+            items, iter(weights), strata, quotas, 0))
+        te(lambda: weighted_sample_stratified_indices(
+            items, weights, "abcdef", quotas, 0))
+        te(lambda: weighted_sample_stratified_indices(
+            items, weights, iter(strata), quotas, 0))
+        te(lambda: weighted_sample_stratified_indices(
+            items, weights, strata, "ab", 0))
+        te(lambda: weighted_sample_stratified_indices(
+            items, weights, strata, iter(quotas), 0))
+        te(lambda: weighted_sample_stratified_indices(
+            items, weights, [0, True, 0, 1, 0, 1], quotas, 0))
+        te(lambda: weighted_sample_stratified_indices(
+            items, weights, [0, 1.0, 0, 1, 0, 1], quotas, 0))
+        te(lambda: weighted_sample_stratified_indices(
+            items, weights, strata, [1, True], 0))
+        te(lambda: weighted_sample_stratified_indices(
+            items, weights, strata, [1, 1.0], 0))
+        te(lambda: weighted_sample_stratified_indices(
+            items, [1, True, 0, 2, 5, 0], strata, quotas, 0))
+        te(lambda: weighted_sample_stratified_indices(
+            items, [1, "x", 0, 2, 5, 0], strata, quotas, 0))
+        te(lambda: weighted_sample_stratified_indices(
+            items, weights, strata, quotas, object()))
+
+    # ------------------------------------------------------------------
+    # 校验: 取值错误
+    # ------------------------------------------------------------------
+    def test_validation_value_errors(self):
+        ve = lambda fn: self.assertRaises(ValueError, fn)
+        items, weights = self.ITEMS, self.WEIGHTS
+        strata, quotas = self.STRATA, self.QUOTAS
+        # weights / strata 长度不等于 items。
+        ve(lambda: weighted_sample_stratified_indices(
+            items, (1, 2), strata, quotas, 0))
+        ve(lambda: weighted_sample_stratified_indices(
+            items, weights, [0, 1], quotas, 0))
+        # 编号越界(负编号)。
+        ve(lambda: weighted_sample_stratified_indices(
+            items, weights, [0, -1, 0, 1, 0, 1], quotas, 0))
+        # quotas 长度不是最大编号加一(过长或过短)。
+        ve(lambda: weighted_sample_stratified_indices(
+            items, weights, strata, [2, 1, 0], 0))
+        ve(lambda: weighted_sample_stratified_indices(
+            items, weights, strata, [2], 0))
+        ve(lambda: weighted_sample_stratified_indices(
+            items, weights, strata, [], 0))
+        # 负配额。
+        ve(lambda: weighted_sample_stratified_indices(
+            items, weights, strata, [-1, 1], 0))
+        ve(lambda: weighted_sample_stratified_indices(
+            items, weights, strata, [2, -1], 0))
+        # 配额超过该层正权重位置数(每层正权重位置只有 2 个)。
+        ve(lambda: weighted_sample_stratified_indices(
+            items, weights, strata, [3, 1], 0))
+        ve(lambda: weighted_sample_stratified_indices(
+            items, weights, strata, [2, 3], 0))
+        # 空层(编号存在但没有位置)的正配额不可行。
+        ve(lambda: weighted_sample_stratified_indices(
+            items, weights, [0, 0, 0, 0, 0, 2], [0, 1, 0], 0))
+        # 负权重、NaN、无穷。
+        ve(lambda: weighted_sample_stratified_indices(
+            items, [1, -3, 0, 2, 5, 0], strata, quotas, 0))
+        ve(lambda: weighted_sample_stratified_indices(
+            items, [1, float("nan"), 0, 2, 5, 0], strata, quotas, 0))
+        ve(lambda: weighted_sample_stratified_indices(
+            items, [1, float("inf"), 0, 2, 5, 0], strata, quotas, 0))
+        ve(lambda: weighted_sample_stratified_indices(
+            items, [Decimal("NaN"), 3, 0, 2, 5, 0], strata, quotas, 0))
+
+    def test_validation_order_is_fixed(self):
+        # items/weights/seed -> strata -> quotas -> 长度/编号 -> 权重取值
+        # -> 每层可行性: 靠前步骤的错误类别优先报告。
+        # quotas 成员类型错误(TypeError)先于长度/编号检查(ValueError)。
+        with self.assertRaises(TypeError):
+            weighted_sample_stratified_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, [2, 1, "x"], 0)
+        # 负配额(ValueError, 长度/编号步骤)先于权重元素类型(TypeError)。
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_indices(
+                self.ITEMS, [1, True, 0, 2, 5, 0], self.STRATA, [-1, 1], 0)
+        # 权重元素类型(TypeError)先于每层可行性(ValueError)。
+        with self.assertRaises(TypeError):
+            weighted_sample_stratified_indices(
+                self.ITEMS, [1, True, 0, 2, 5, 0], self.STRATA, [9, 9], 0)
+        # 权重取值(ValueError)先于每层可行性。
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_indices(
+                self.ITEMS, [1, -3, 0, 2, 5, 0], self.STRATA, [9, 9], 0)
+
+    def test_infeasible_later_stratum_fails_before_any_output(self):
+        # 第一层可行、第二层配额超过该层正权重位置数: 在产生任何分层
+        # 结果前抛 ValueError。
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, [1, 5], self.SEED)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified(
+                self.ITEMS, self.WEIGHTS, self.STRATA, [1, 5], self.SEED)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_counts(
+                self.ITEMS, self.WEIGHTS, self.STRATA, [1, 5], self.SEED)
+
+    def test_values_and_counts_entries_share_validation(self):
+        # 值入口与频次入口沿用同一套校验顺序与异常类别。
+        for entry in (weighted_sample_stratified,
+                      weighted_sample_stratified_counts):
+            with self.assertRaises(TypeError):
+                entry("abcdef", self.WEIGHTS, self.STRATA, self.QUOTAS, 0)
+            with self.assertRaises(TypeError):
+                entry(self.ITEMS, self.WEIGHTS, self.STRATA, [1, True], 0)
+            with self.assertRaises(ValueError):
+                entry(self.ITEMS, self.WEIGHTS, self.STRATA, [2, -1], 0)
+            with self.assertRaises(ValueError):
+                entry(self.ITEMS, self.WEIGHTS, self.STRATA, [9, 1], 0)
+
+    def test_seed_none_keeps_random_semantics(self):
+        # seed=None 按 random.Random 语义使用系统熵, 不保证可复现但必须
+        # 可用且形状正确。
+        groups = weighted_sample_stratified_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS, None)
+        self.assertEqual([len(g) for g in groups], self.QUOTAS)
 
 
 if __name__ == "__main__":

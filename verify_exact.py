@@ -846,6 +846,146 @@ check((list(sc_items), [list(r) for r in sc_schedule]) == sc_snap,
 
 
 # ---------------------------------------------------------------------------
+# 14. 分层配额采样入口
+# ---------------------------------------------------------------------------
+section("分层配额采样")
+
+st_items = list("abcdef")
+st_weights = [1, 3, 0, 2, 5, 0]
+st_strata = [0, 1, 0, 1, 0, 1]
+st_quotas = [2, 1]
+
+# 14.1 结构不变量: 按层返回、层内无重复、位置属于对应层、零权重永不出现;
+#   values 与 indices 逐层逐项对应; counts 与索引入口按位置统计一致。
+st_ok = True
+for seed in range(200):
+    idx_groups = app.weighted_sample_stratified_indices(
+        st_items, st_weights, st_strata, st_quotas, seed)
+    val_groups = app.weighted_sample_stratified(
+        st_items, st_weights, st_strata, st_quotas, seed)
+    counts = app.weighted_sample_stratified_counts(
+        st_items, st_weights, st_strata, st_quotas, seed)
+    if [len(g) for g in idx_groups] != st_quotas:
+        st_ok = False
+    tally = [0] * len(st_items)
+    for number, group in enumerate(idx_groups):
+        if len(group) != len(set(group)):
+            st_ok = False
+        for position in group:
+            if st_strata[position] != number or st_weights[position] == 0:
+                st_ok = False
+            tally[position] += 1
+    if val_groups != [[st_items[i] for i in g] for g in idx_groups]:
+        st_ok = False
+    if counts != tally:
+        st_ok = False
+check(st_ok, "分层结构/无重复/零权重排除, values 与 counts 同索引入口一致")
+
+# 14.2 确定性: 相同 (输入, 配额, seed) 逐项相同。
+st_first = app.weighted_sample_stratified_indices(
+    st_items, st_weights, st_strata, st_quotas, 42)
+check(all(app.weighted_sample_stratified_indices(
+    st_items, st_weights, st_strata, st_quotas, 42) == st_first
+    for _ in range(6)),
+    "相同输入/配额/seed 的分层结果逐项相同")
+
+# 14.3 只有编号为零的单层时与 weighted_sample_indices / weighted_sample
+#   完全一致。
+single_ok = True
+for seed in (0, 1, 42, -7, 1.5, "s"):
+    k = 3
+    strata0 = [0] * len(st_items)
+    if app.weighted_sample_stratified_indices(
+            st_items, st_weights, strata0, [k], seed) != [
+            app.weighted_sample_indices(st_items, st_weights, k, seed)]:
+        single_ok = False
+    if app.weighted_sample_stratified(
+            st_items, st_weights, strata0, [k], seed) != [
+            app.weighted_sample(st_items, st_weights, k, seed)]:
+        single_ok = False
+check(single_ok, "单层(编号全为零)与既有单轮入口完全一致")
+
+# 14.4 零配额分层不消耗随机流: 去掉零配额层后其余各层逐项对应。
+zq = app.weighted_sample_stratified_indices(
+    list("abcde"), [1, 2, 3, 4, 5], [0, 0, 1, 2, 2], [1, 0, 1], 42)
+zq_shrunk = app.weighted_sample_stratified_indices(
+    list("abde"), [1, 2, 4, 5], [0, 0, 1, 1], [1, 1], 42)
+check(zq[1] == [] and zq[0] == zq_shrunk[0]
+      and zq[2] == [i + 1 for i in zq_shrunk[1]],
+      "零配额分层不消耗随机流")
+
+# 14.5 空 items 只接受空 strata/quotas; 全部配额为零返回空层结果; counts
+#   可经 serialize/deserialize 精确往返。
+check(app.weighted_sample_stratified_indices([], [], [], [], 0) == []
+      and app.weighted_sample_stratified_counts([], [], [], [], 0) == [],
+      "空 items + 空 strata/quotas -> 空结果")
+check(app.weighted_sample_stratified_indices(
+    st_items, st_weights, st_strata, [0, 0], 0) == [[], []]
+      and app.weighted_sample_stratified_counts(
+          st_items, st_weights, st_strata, [0, 0], 0) == [0] * 6,
+      "全部配额为零 -> 空层结果与全零计数")
+st_counts = app.weighted_sample_stratified_counts(
+    st_items, st_weights, st_strata, st_quotas, 7)
+check(app.deserialize_metrics(app.serialize_metrics(st_counts)) == st_counts
+      and all(type(c) is int
+              for c in app.deserialize_metrics(app.serialize_metrics(st_counts))),
+      "分层计数经 serialize/deserialize 往返保持精确整数")
+
+# 14.6 异常分类与固定校验顺序。
+raises(TypeError,
+       lambda: app.weighted_sample_stratified_indices(
+           "abcdef", st_weights, st_strata, st_quotas, 0),
+       "分层: items 为文本 -> TypeError")
+raises(TypeError,
+       lambda: app.weighted_sample_stratified_indices(
+           st_items, st_weights, [0, True, 0, 1, 0, 1], st_quotas, 0),
+       "分层: 布尔分层编号 -> TypeError")
+raises(TypeError,
+       lambda: app.weighted_sample_stratified_indices(
+           st_items, st_weights, st_strata, [1, 1.0], 0),
+       "分层: 非整数配额 -> TypeError")
+raises(ValueError,
+       lambda: app.weighted_sample_stratified_indices(
+           st_items, st_weights, [0, 1], st_quotas, 0),
+       "分层: strata 长度不等于 items -> ValueError")
+raises(ValueError,
+       lambda: app.weighted_sample_stratified_indices(
+           st_items, st_weights, [0, -1, 0, 1, 0, 1], st_quotas, 0),
+       "分层: 负分层编号 -> ValueError")
+raises(ValueError,
+       lambda: app.weighted_sample_stratified_indices(
+           st_items, st_weights, st_strata, [2, 1, 0], 0),
+       "分层: quotas 长度不是最大编号加一 -> ValueError")
+raises(ValueError,
+       lambda: app.weighted_sample_stratified_indices(
+           st_items, st_weights, st_strata, [2, -1], 0),
+       "分层: 负配额 -> ValueError")
+raises(ValueError,
+       lambda: app.weighted_sample_stratified_indices(
+           st_items, st_weights, st_strata, [3, 1], 0),
+       "分层: 配额超过该层正权重位置数 -> ValueError")
+raises(ValueError,
+       lambda: app.weighted_sample_stratified_indices(
+           st_items, [1, float("nan"), 0, 2, 5, 0], st_strata, st_quotas, 0),
+       "分层: NaN 权重 -> ValueError")
+# 靠前的校验步骤优先报告: 负配额(ValueError)先于权重元素类型(TypeError)。
+raises(ValueError,
+       lambda: app.weighted_sample_stratified_indices(
+           st_items, [1, True, 0, 2, 5, 0], st_strata, [-1, 1], 0),
+       "分层: 负配额先于权重元素类型检查 -> ValueError")
+
+# 14.7 入参不被修改。
+st_snap = (list(st_items), list(st_weights), list(st_strata), list(st_quotas))
+app.weighted_sample_stratified_indices(
+    st_items, st_weights, st_strata, st_quotas, 5)
+app.weighted_sample_stratified(st_items, st_weights, st_strata, st_quotas, 5)
+app.weighted_sample_stratified_counts(
+    st_items, st_weights, st_strata, st_quotas, 5)
+check((st_items, st_weights, st_strata, st_quotas) == st_snap,
+      "分层入口不修改 items / weights / strata / quotas")
+
+
+# ---------------------------------------------------------------------------
 print()
 if _FAILURES:
     print("结果: %d 项失败" % len(_FAILURES))
