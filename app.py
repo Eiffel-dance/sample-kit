@@ -441,6 +441,34 @@
         weighted_sample_excluding_resume_indices 完全一致(同一套校验
         顺序与异常类别): 每轮按原始位置映射元素值, 返回的下一状态与按索引
         入口逐字段一致, 可再次传入任一恢复入口继续推进。
+    weighted_sample_stratified_indices(items, weights, strata, quotas,
+        seed=0)
+        分层配额采样入口: strata 与 items 等长, 每个位置保存非布尔非负
+        整数分层编号; quotas 的下标对应分层编号, 成员为非布尔非负整数
+        配额, 长度必须恰好等于最大编号加一。分层按编号升序依次处理, 第
+        number 层在其成员位置中按权重比例无放回抽取 quotas[number] 个
+        不同位置, 各层结果按编号升序拼接, 层内按抽样先后排列, 返回原始
+        零基索引。所有层共享同一个由 seed 初始化的随机流, 零配额分层不
+        消耗该流; 相同 (输入, quotas, seed) 唯一确定同一序列; 只有编号
+        为零的单层时与 weighted_sample_indices(items, weights,
+        quotas[0], seed) 逐项相同。零权重位置永不入选; 全部配额为零时
+        返回空列表; 空 items 只接受空 strata 与空 quotas。结构或成员
+        类型错误抛 TypeError; 长度不一致、编号越界、quotas 长度不等于
+        最大编号加一、负配额、配额超过该层正权重位置数、负权重、NaN 或
+        无穷权重抛 ValueError。全部校验在产生任何结果前完成, 不修改
+        入参。
+    weighted_sample_stratified(items, weights, strata, quotas, seed=0)
+        weighted_sample_stratified_indices 的元素值入口: 规则、校验顺序
+        与异常类别完全一致, 按相同索引返回元素值列表, 两个入口逐项对应
+        (相同值的不同位置仍按位置独立处理)。
+    weighted_sample_stratified_counts(items, weights, strata, quotas,
+        seed=0)
+        weighted_sample_stratified_indices 的频次入口: 接受相同的参数
+        语义与固定校验顺序, 返回长度等于 items 的整数 list counts,
+        counts[i] 在位置 i 被选中时为一、其余为零; 结果等于把索引入口
+        同参数的结果按位置摊平计数。计数为任意精度整数, 可直接交给
+        serialize_metrics 并经 deserialize_metrics 精确往返。不修改
+        入参。
     serialize_metrics(metrics)
         将指标树稳定序列化为紧凑 JSON 文本, 任意精度整数保持精确十进制。
         字典键先统一转换为成员名文本(str 原样, None->null, bool->true/false,
@@ -4360,6 +4388,159 @@ def weighted_sample_partition_resume(
         [items[i] for i in group_indices] for group_indices in index_groups
     ]
     return groups, next_state
+
+
+# ---------------------------------------------------------------------------
+# 分层配额采样
+# ---------------------------------------------------------------------------
+
+def _validate_stratified_inputs(items, weights, strata, quotas, seed):
+    """分层配额采样三个入口共用的全部前置校验。
+
+    校验顺序固定: 先 items、weights、seed 的结构/类型(与既有采样入口同一
+    套规则, TypeError), 再 strata、quotas 的结构(非文本且长度可确定的
+    序列)与每个成员的类型(非布尔整数, TypeError); 随后 weights / strata
+    长度与 items 一致、strata 编号非负、quotas 长度等于最大编号加一、
+    配额非负(ValueError); 接着权重元素类型(TypeError)与取值(ValueError)
+    校验; 最后按编号升序逐层校验配额不超过该层正权重位置数(ValueError)。
+    空 items 只接受空 strata 与空 quotas; 全部配额为零同样通过校验。
+    全部校验在产生任何结果前完成, 不修改入参。通过后返回
+    (n, strata 编号副本, quotas 配额副本)。
+    """
+    # ---- 1. 结构与参数类型 (TypeError) ----
+    if not _is_length_determinable_sequence(items):
+        raise TypeError("items must be a length-determinable sequence")
+    if not _is_length_determinable_sequence(weights):
+        raise TypeError("weights must be a length-determinable sequence")
+    if not isinstance(seed, _SEED_TYPES):
+        raise TypeError("unsupported seed type: %s" % type(seed).__name__)
+    if not _is_length_determinable_sequence(strata):
+        raise TypeError("strata must be a length-determinable sequence")
+    strata_numbers = []
+    for member in strata:
+        if isinstance(member, bool) or not isinstance(member, int):
+            raise TypeError("strata members must be non-boolean integers")
+        strata_numbers.append(member)
+    if not _is_length_determinable_sequence(quotas):
+        raise TypeError("quotas must be a length-determinable sequence")
+    quota_values = []
+    for member in quotas:
+        if isinstance(member, bool) or not isinstance(member, int):
+            raise TypeError("quotas members must be non-boolean integers")
+        quota_values.append(member)
+
+    # ---- 2. 长度与编号范围 (ValueError) ----
+    n = len(items)
+    if len(weights) != n:
+        raise ValueError("invalid sample size")
+    if len(strata_numbers) != n:
+        raise ValueError("strata length must equal items length")
+    for number in strata_numbers:
+        if number < 0:
+            raise ValueError("stratum number out of range")
+    # quotas 的下标对应分层编号, 其长度必须恰好是最大编号加一 —— 空 items
+    # 没有最大编号, 只接受空 quotas; 编号越界(大于等于 quotas 长度)与
+    # quotas 尾部多余都体现为同一长度约束。
+    top = max(strata_numbers) if strata_numbers else -1
+    if len(quota_values) != top + 1:
+        raise ValueError("quotas length must equal max stratum number plus one")
+    for quota in quota_values:
+        if quota < 0:
+            raise ValueError("quotas must be non-negative")
+
+    # ---- 3. 权重元素类型与取值 (TypeError / ValueError) ----
+    _validate_weight_elements(weights)
+
+    # ---- 4. 每层配额的正权重可行性 (ValueError) ----
+    # 按编号升序逐层检查: 配额超过该层正权重位置数(含该层没有成员或成员
+    # 权重全为零的情形)时确定抛 ValueError; 零配额分层恒可行。
+    for number, quota in enumerate(quota_values):
+        if quota > 0:
+            layer_weights = [
+                weights[i] for i in range(n) if strata_numbers[i] == number
+            ]
+            if quota > _count_positive_weights(layer_weights):
+                raise ValueError("no positive weight")
+    return n, strata_numbers, quota_values
+
+
+def weighted_sample_stratified_indices(items, weights, strata, quotas, seed=0):
+    """按分层配额做加权无放回抽样, 返回按层拼接的零基原始索引。
+
+    items、weights、seed 沿用 weighted_sample_indices 的全部规则: items、
+    weights 是等长的有限非文本序列, 权重接受非布尔 int / 有限非负
+    float / Fraction / Decimal(可混合, 超大整数、Fraction、Decimal 全程
+    不经过浮点)。strata 是与 items 等长的有限非文本序列, 每个位置保存
+    非布尔非负整数分层编号; quotas 是有限非文本序列, 下标对应分层编号,
+    成员为非布尔非负整数配额, 其长度必须恰好等于最大编号加一。
+
+    分层按编号升序依次处理: 第 number 层在其成员位置中按权重比例无放回
+    抽取 quotas[number] 个不同位置, 层内按抽样先后排列, 各层结果按编号
+    升序依次拼接; 返回的均为原始零基索引, 相同值的不同位置仍按位置独立
+    处理。所有层共享同一个由 seed 初始化的随机流, 零配额分层不消耗该流;
+    相同 (输入, quotas, seed) 唯一确定同一序列。只有编号为零的单层时,
+    结果与 weighted_sample_indices(items, weights, quotas[0], seed)
+    逐项相同。零权重位置永不入选; 全部配额为零时返回空列表。
+
+    结构或成员类型错误(items、weights、strata、quotas、seed 或权重元素)
+    抛 TypeError; 长度不一致、编号越界、quotas 长度不等于最大编号加一、
+    负配额、配额超过该层正权重位置数、负权重、NaN 或无穷权重抛
+    ValueError。空 items 只接受空 strata 与空 quotas。全部校验在产生任何
+    结果前完成, 不修改入参。
+    """
+    n, strata_numbers, quota_values = _validate_stratified_inputs(
+        items, weights, strata, quotas, seed
+    )
+
+    # 复制到本地, 绝不修改入参; 各层按编号升序共享同一条随机流。
+    local_weights = list(weights)
+    rng = random.Random(seed)
+    indices = []
+    for number, quota in enumerate(quota_values):
+        # 零配额分层不消耗随机流, 直接跳过 —— 与既有 k=0 入口的节奏一致。
+        if quota == 0:
+            continue
+        # 层内位置池按原始零基索引升序保留; 每层独立选择抽样计划(单层
+        # 编号为零时层权重即全量权重, 与 weighted_sample_indices 的计划、
+        # 随机流消耗和结果逐项一致)。
+        pool = [i for i in range(n) if strata_numbers[i] == number]
+        pool_weights = [local_weights[i] for i in pool]
+        planned_weights, use_exact = _select_sampling_plan(pool_weights, quota)
+        indices.extend(
+            _draw_indices_once_pool(pool, planned_weights, quota, rng, use_exact)
+        )
+    return indices
+
+
+def weighted_sample_stratified(items, weights, strata, quotas, seed=0):
+    """weighted_sample_stratified_indices 的元素值入口: 规则、校验顺序与
+    异常类别完全一致, 区别仅在于按相同索引返回元素值列表; 两个入口逐项
+    对应(相同值的不同位置仍按位置独立处理)。"""
+    indices = weighted_sample_stratified_indices(
+        items, weights, strata, quotas, seed
+    )
+    return [items[i] for i in indices]
+
+
+def weighted_sample_stratified_counts(items, weights, strata, quotas, seed=0):
+    """weighted_sample_stratified_indices 的频次入口: 接受与该入口完全
+    相同的参数语义、固定校验顺序与异常类别, 按同一条由 seed 初始化的随机
+    流完成同样的分层抽样, 返回长度等于 items 的整数 list counts,
+    counts[i] 在位置 i 被选中时为一、其余为零(每个位置只属于一个分层,
+    层内无放回, 同一位置至多计一次; 相等的元素值仍按不同位置分别累计)。
+    结果等于把 weighted_sample_stratified_indices 同参数的结果按位置
+    摊平计数, 随机流消耗逐项对齐。全部配额为零时返回全零列表(仍完成
+    全部校验); 任何失败都不给出部分计数。计数为任意精度整数, 可直接
+    交给 serialize_metrics 并经 deserialize_metrics 精确往返。不修改
+    入参。
+    """
+    indices = weighted_sample_stratified_indices(
+        items, weights, strata, quotas, seed
+    )
+    counts = [0] * len(items)
+    for position in indices:
+        counts[position] += 1
+    return counts
 
 
 # ---------------------------------------------------------------------------
