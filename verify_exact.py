@@ -846,6 +846,267 @@ check((list(sc_items), [list(r) for r in sc_schedule]) == sc_snap,
 
 
 # ---------------------------------------------------------------------------
+# 14. 固定排除集合 + 按轮样本数计划组合入口 (固定 weights, k_schedule,
+#     excluded): 批量 / 值 / 流式 / 频次 / checkpoint / resume
+# ---------------------------------------------------------------------------
+ek_items = list("abcdef")
+ek_weights = [1, 2, 3, 0, 5, 6]
+ek_ks = [3, 0, 2, 1, 3, 0, 2]
+ek_excluded = (1, 4)
+ek_seed = 42
+ek_full = app.weighted_sample_excluding_k_schedule_indices(
+    ek_items, ek_weights, ek_ks, ek_excluded, len(ek_ks), ek_seed)
+
+# 14.1 结构不变量: 每轮长度等于该轮样本数; 被排除位置与零权重位置(3)绝不
+# 出现; 轮内无重复; 值入口逐位置映射。
+ek_shape_ok = (
+    len(ek_full) == len(ek_ks)
+    and all(len(rd) == ek_ks[j] for j, rd in enumerate(ek_full))
+    and all(all(i in (0, 2, 5) and rd.count(i) == 1 for i in rd)
+            for rd in ek_full)
+    and ek_full[1] == [] and ek_full[5] == []
+    and app.weighted_sample_excluding_k_schedule(
+        ek_items, ek_weights, ek_ks, ek_excluded, len(ek_ks), ek_seed)
+        == [[ek_items[i] for i in rd] for rd in ek_full]
+)
+check(ek_shape_ok, "excluding_k_schedule 轮长/排除/零权重/无重复/值映射")
+
+# 14.2 流式与批量逐轮一致; 频次等于逐轮按位置摊平。
+ek_flat = [0] * len(ek_items)
+for rd in ek_full:
+    for i in rd:
+        ek_flat[i] += 1
+ek_stream_ok = (
+    list(app.weighted_sample_excluding_k_schedule_stream_indices(
+        ek_items, ek_weights, ek_ks, ek_excluded, len(ek_ks), ek_seed))
+        == ek_full
+    and list(app.weighted_sample_excluding_k_schedule_stream(
+        ek_items, ek_weights, ek_ks, ek_excluded, len(ek_ks), ek_seed))
+        == [[ek_items[i] for i in rd] for rd in ek_full]
+    and app.weighted_sample_excluding_k_schedule_counts(
+        ek_items, ek_weights, ek_ks, ek_excluded, len(ek_ks), ek_seed)
+        == ek_flat
+    and ek_flat[1] == 0 and ek_flat[3] == 0 and ek_flat[4] == 0
+)
+check(ek_stream_ok, "excluding_k_schedule 流式==批量, 频次==按位置摊平")
+
+# 14.3 start 窗口切片逐项一致(索引/流式/计数), start 只跳过完整轮次。
+ek_window_ok = True
+for start in range(len(ek_ks) + 1):
+    draws = len(ek_ks) - start
+    got = app.weighted_sample_excluding_k_schedule_indices(
+        ek_items, ek_weights, ek_ks, ek_excluded, draws, ek_seed, start=start)
+    got_stream = list(
+        app.weighted_sample_excluding_k_schedule_stream_indices(
+            ek_items, ek_weights, ek_ks, ek_excluded, draws, ek_seed,
+            start=start))
+    expect = ek_full[start:start + draws]
+    want_counts = [0] * len(ek_items)
+    for rd in expect:
+        for i in rd:
+            want_counts[i] += 1
+    got_counts = app.weighted_sample_excluding_k_schedule_counts(
+        ek_items, ek_weights, ek_ks, ek_excluded, draws, ek_seed, start=start)
+    if not (got == expect == got_stream and got_counts == want_counts):
+        ek_window_ok = False
+check(ek_window_ok, "excluding_k_schedule start 窗口与一次性切片逐项一致")
+
+# 14.4 集合语义: 重复成员与排列顺序不影响结果。
+ek_set_ok = all(
+    app.weighted_sample_excluding_k_schedule_indices(
+        ek_items, ek_weights, ek_ks, ex, len(ek_ks), ek_seed) == ek_full
+    for ex in ((4, 1), (1, 4, 1, 4), [4, 4, 1], (4, 1, 4)))
+check(ek_set_ok, "excluding_k_schedule excluded 集合语义")
+
+# 14.5 退化等价: excluded 为空 == k_schedule 入口; k_schedule 各项相等 ==
+# 固定 k 排除入口。
+ek_uniform = [2] * len(ek_ks)
+ek_equiv_ok = (
+    app.weighted_sample_excluding_k_schedule_indices(
+        ek_items, ek_weights, ek_ks, (), len(ek_ks), ek_seed)
+        == app.weighted_sample_k_schedule_indices(
+            ek_items, ek_weights, ek_ks, len(ek_ks), ek_seed)
+    and app.weighted_sample_excluding_k_schedule_counts(
+        ek_items, ek_weights, ek_ks, (), len(ek_ks), ek_seed)
+        == app.weighted_sample_k_schedule_counts(
+            ek_items, ek_weights, ek_ks, len(ek_ks), ek_seed)
+    and app.weighted_sample_excluding_k_schedule_indices(
+        ek_items, ek_weights, ek_uniform, ek_excluded, len(ek_ks), ek_seed)
+        == app.weighted_sample_many_excluding_indices(
+            ek_items, ek_weights, 2, ek_excluded, len(ek_ks), ek_seed)
+    and list(app.weighted_sample_excluding_k_schedule_stream_indices(
+        ek_items, ek_weights, ek_uniform, ek_excluded, len(ek_ks), ek_seed))
+        == list(app.weighted_sample_stream_excluding_indices(
+            ek_items, ek_weights, 2, ek_excluded, len(ek_ks), ek_seed))
+)
+check(ek_equiv_ok, "excluding_k_schedule 退化与 k_schedule/固定 k 排除入口一致")
+
+# 14.6 draws=0 空轮次/全零计数但完成全部校验; 非法输入按固定顺序分类。
+raises(ValueError, lambda: app.weighted_sample_excluding_k_schedule_indices(
+    ek_items, ek_weights, [4], ek_excluded, 0),
+    "excluding_k_schedule: draws=0 仍做排除后可行性校验 -> ValueError")
+raises(ValueError, lambda: app.weighted_sample_excluding_k_schedule_indices(
+    ek_items, ek_weights, ek_ks, (9,), 0),
+    "excluding_k_schedule: draws=0 仍校验 excluded 越界 -> ValueError")
+raises(TypeError, lambda: app.weighted_sample_excluding_k_schedule_indices(
+    "abcdef", ek_weights, ek_ks, ek_excluded, 0),
+    "excluding_k_schedule: items 为文本 -> TypeError")
+raises(TypeError, lambda: app.weighted_sample_excluding_k_schedule_indices(
+    ek_items, ek_weights, ek_ks, (1.0,), 1),
+    "excluding_k_schedule: excluded 成员非整数 -> TypeError")
+raises(TypeError, lambda: app.weighted_sample_excluding_k_schedule_indices(
+    ek_items, ek_weights, [True], ek_excluded, 1),
+    "excluding_k_schedule: k_schedule 成员为布尔 -> TypeError")
+raises(ValueError, lambda: app.weighted_sample_excluding_k_schedule_indices(
+    ek_items, [1, float("nan"), 3, 0, 5, 6], ek_ks, ek_excluded, 1),
+    "excluding_k_schedule: NaN 权重 -> ValueError")
+check(
+    app.weighted_sample_excluding_k_schedule_indices(
+        ek_items, ek_weights, ek_ks, ek_excluded, 0) == []
+    and list(app.weighted_sample_excluding_k_schedule_stream_indices(
+        ek_items, ek_weights, ek_ks, ek_excluded, 0)) == []
+    and app.weighted_sample_excluding_k_schedule_counts(
+        ek_items, ek_weights, ek_ks, ek_excluded, 0) == [0] * 6,
+    "excluding_k_schedule draws=0 返回空轮次/全零计数")
+
+# 14.7 精确权重路径(Decimal / Fraction / 10**5000 与极小正数混合):
+# 流式/计数一致, checkpoint 分段恢复与一次性逐项一致, 状态与计数精确往返。
+ek_exact_ok = True
+for ek_w in (
+    [Decimal("0.1"), Fraction(1, 3), Fraction(2), 0,
+     Decimal("1E-100"), 6],
+    [10 ** 5000, Fraction(1, 10 ** 100), 3, 0, 5, 6],
+):
+    full = app.weighted_sample_excluding_k_schedule_indices(
+        ek_items, ek_w, ek_ks, ek_excluded, len(ek_ks), seed=13)
+    if list(app.weighted_sample_excluding_k_schedule_stream_indices(
+            ek_items, ek_w, ek_ks, ek_excluded, len(ek_ks), seed=13)) != full:
+        ek_exact_ok = False
+    counts = app.weighted_sample_excluding_k_schedule_counts(
+        ek_items, ek_w, ek_ks, ek_excluded, len(ek_ks), seed=13)
+    if dm(sm(counts)) != counts:
+        ek_exact_ok = False
+    state = app.weighted_sample_excluding_k_schedule_checkpoint(
+        ek_items, ek_w, ek_ks, ek_excluded, seed=13, start=2)
+    if state["exact"] is not True:
+        ek_exact_ok = False
+    restored = dm(sm(state))
+    r1, nxt = app.weighted_sample_excluding_k_schedule_resume_indices(
+        ek_items, ek_w, ek_ks, (4, 1), restored, 3)
+    r2, _ = app.weighted_sample_excluding_k_schedule_resume_indices(
+        ek_items, ek_w, ek_ks, ek_excluded, dm(sm(nxt)), 2)
+    if r1 + r2 != full[2:]:
+        ek_exact_ok = False
+    if not all(isinstance(x, int) for x in restored["rng"]["mt"]):
+        ek_exact_ok = False
+check(ek_exact_ok,
+      "excluding_k_schedule Decimal/Fraction/超大整数精确路径与断点恢复")
+
+# 14.8 checkpoint/resume: 全窗口切片、链式续接、零样本轮不耗随机流、
+# 值入口状态一致、状态规范化 excluded。
+ek_state = app.weighted_sample_excluding_k_schedule_checkpoint(
+    ek_items, ek_weights, ek_ks, ek_excluded, ek_seed)
+ek_ck_ok = (
+    ek_state["kind"] == "excluding_k_schedule"
+    and ek_state["excluded"] == [1, 4]
+    and app.weighted_sample_excluding_k_schedule_checkpoint(
+        ek_items, ek_weights, ek_ks, (4, 1, 4), ek_seed)["excluded"]
+        == [1, 4]
+)
+for start in range(len(ek_ks) + 1):
+    st = app.weighted_sample_excluding_k_schedule_checkpoint(
+        ek_items, ek_weights, ek_ks, ek_excluded, ek_seed, start=start)
+    for d in range(0, len(ek_ks) - start + 1):
+        rr, ns = app.weighted_sample_excluding_k_schedule_resume_indices(
+            ek_items, ek_weights, ek_ks, ek_excluded, st, d)
+        if rr != ek_full[start:start + d] or ns["position"] != start + d:
+            ek_ck_ok = False
+st = app.weighted_sample_excluding_k_schedule_checkpoint(
+    ek_items, ek_weights, ek_ks, ek_excluded, ek_seed)
+chained = []
+for d in (2, 0, 3, 2):
+    rr, st = app.weighted_sample_excluding_k_schedule_resume_indices(
+        ek_items, ek_weights, ek_ks, ek_excluded, st, d)
+    chained.extend(rr)
+if chained != ek_full:
+    ek_ck_ok = False
+# 零样本轮只推进位置, RNG 不变。
+zst = app.weighted_sample_excluding_k_schedule_checkpoint(
+    ek_items, ek_weights, [0, 0], ek_excluded, seed=7, start=1)
+zrr, znext = app.weighted_sample_excluding_k_schedule_resume_indices(
+    ek_items, ek_weights, [0, 0], ek_excluded, zst, 1)
+if not (zrr == [[]] and znext["position"] == 2
+        and znext["rng"] == zst["rng"]
+        == app._rng_state_to_jsonable(random.Random(7).getstate())):
+    ek_ck_ok = False
+# 值入口下一状态与索引入口逐字段一致。
+vst = app.weighted_sample_excluding_k_schedule_checkpoint(
+    ek_items, ek_weights, ek_ks, ek_excluded, ek_seed, start=1)
+_, vns = app.weighted_sample_excluding_k_schedule_resume(
+    ek_items, ek_weights, ek_ks, ek_excluded, vst, 3)
+_, ins = app.weighted_sample_excluding_k_schedule_resume_indices(
+    ek_items, ek_weights, ek_ks, ek_excluded, vst, 3)
+if vns != ins:
+    ek_ck_ok = False
+# draws=0 返回状态副本; 计划末尾只接受空窗口。
+end = app.weighted_sample_excluding_k_schedule_checkpoint(
+    ek_items, ek_weights, ek_ks, ek_excluded, ek_seed,
+    start=len(ek_ks))
+e0, e0next = app.weighted_sample_excluding_k_schedule_resume_indices(
+    ek_items, ek_weights, ek_ks, ek_excluded, end, 0)
+if not (e0 == [] and e0next == end and e0next is not end):
+    ek_ck_ok = False
+check(ek_ck_ok, "excluding_k_schedule checkpoint/resume 切片/链式/零样本轮")
+
+# 14.9 状态安全: 非映射 TypeError; 字段缺失/篡改/跨 kind/输入或 excluded
+# 不匹配 ValueError; 值入口先校验输入; 全部失败不出部分结果。
+raises(TypeError, lambda: app.weighted_sample_excluding_k_schedule_resume_indices(
+    ek_items, ek_weights, ek_ks, ek_excluded, 42, 1),
+    "excluding_k_schedule resume: 非映射状态 -> TypeError")
+raises(ValueError, lambda: app.weighted_sample_excluding_k_schedule_resume_indices(
+    ek_items, ek_weights, ek_ks, ek_excluded, end, 1),
+    "excluding_k_schedule resume: 窗口越界 -> ValueError")
+tampered = _copy.deepcopy(ek_state)
+tampered["position"] += 1
+raises(ValueError, lambda: app.weighted_sample_excluding_k_schedule_resume_indices(
+    ek_items, ek_weights, ek_ks, ek_excluded, tampered, 1),
+    "excluding_k_schedule resume: 位置篡改 -> ValueError")
+raises(ValueError, lambda: app.weighted_sample_excluding_k_schedule_resume_indices(
+    ek_items, ek_weights, ek_ks, (), ek_state, 1),
+    "excluding_k_schedule resume: excluded 不匹配 -> ValueError")
+raises(ValueError, lambda: app.weighted_sample_excluding_k_schedule_resume_indices(
+    list("abcdeg"), ek_weights, ek_ks, ek_excluded, ek_state, 1),
+    "excluding_k_schedule resume: items 不匹配 -> ValueError")
+raises(ValueError, lambda: app.weighted_sample_excluding_k_schedule_resume_indices(
+    ek_items, ek_weights, ek_ks, ek_excluded,
+    app.weighted_sample_k_schedule_checkpoint(
+        ek_items, ek_weights, ek_ks, ek_seed), 1),
+    "excluding_k_schedule resume: 跨 kind 状态 -> ValueError")
+raises(TypeError, lambda: app.weighted_sample_excluding_k_schedule_resume(
+    "abcdef", ek_weights, ek_ks, ek_excluded, "x", 1),
+    "excluding_k_schedule 值恢复: 非法输入先于状态报 TypeError")
+
+# 14.10 入参不被修改。
+ek_snap = (list(ek_items), list(ek_weights), list(ek_ks), list(ek_excluded))
+app.weighted_sample_excluding_k_schedule_indices(
+    ek_items, ek_weights, ek_ks, list(ek_excluded), len(ek_ks), ek_seed)
+app.weighted_sample_excluding_k_schedule_counts(
+    ek_items, ek_weights, ek_ks, list(ek_excluded), len(ek_ks), ek_seed)
+list(app.weighted_sample_excluding_k_schedule_stream_indices(
+    ek_items, ek_weights, ek_ks, list(ek_excluded), len(ek_ks), ek_seed))
+app.weighted_sample_excluding_k_schedule_checkpoint(
+    ek_items, ek_weights, ek_ks, list(ek_excluded), ek_seed, start=4)
+app.weighted_sample_excluding_k_schedule_resume_indices(
+    ek_items, ek_weights, ek_ks, list(ek_excluded),
+    app.weighted_sample_excluding_k_schedule_checkpoint(
+        ek_items, ek_weights, ek_ks, ek_excluded, ek_seed), 3)
+check(
+    (list(ek_items), list(ek_weights), list(ek_ks), list(ek_excluded))
+    == ek_snap,
+    "excluding_k_schedule 各入口不修改 items/weights/k_schedule/excluded")
+
+
+# ---------------------------------------------------------------------------
 print()
 if _FAILURES:
     print("结果: %d 项失败" % len(_FAILURES))
