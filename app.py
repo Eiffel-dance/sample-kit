@@ -6431,6 +6431,338 @@ def weighted_sample_stratified_schedule_stream(items, weights, strata,
 
 
 # ---------------------------------------------------------------------------
+# 分层配额 + 位置排除 + 按轮配额计划的组合采样
+# ---------------------------------------------------------------------------
+
+def _validate_stratified_excluding_schedule_inputs(
+    items, weights, strata, quotas_schedule, excluded, draws, seed, start
+):
+    """"分层配额 + 位置排除 + 按轮配额计划"组合入口共用的全部前置校验。
+
+    校验顺序固定: 先 items、weights、seed 的结构/类型(与既有采样入口同一
+    套规则, TypeError), 再 strata 的结构与成员类型(非布尔整数, TypeError),
+    然后 quotas_schedule 及其每一行的结构(非文本且长度可确定的序列)与每个
+    成员的类型(非布尔整数, TypeError), 再 draws、start(非布尔非负整数);
+    随后 weights / strata 长度与 items 一致、strata 编号非负、每一行长度
+    等于最大编号加一、配额非负、窗口 [start, start+draws) 不越过计划范围
+    (ValueError); 接着权重元素类型(TypeError)与取值(ValueError)校验; 然后
+    excluded(非文本且长度可确定的序列、非布尔整数成员, TypeError; 越界
+    位置, ValueError), 按集合语义解释, 重复成员与排列顺序不影响结果; 最后
+    对完整计划的每一行按编号升序逐层校验配额不超过该层未排除位置中的正
+    权重位置数(ValueError)。空 items 只接受空 strata、空 excluded 且每行
+    配额也为空; draws=0 同样完成完整计划、每行可行性与窗口的全部校验。
+    全部校验在产生任何结果前完成, 不修改入参。通过后返回
+    (n, strata 编号副本, 逐行配额副本, 排除位置集合)。
+    """
+    # ---- 1. 结构与参数类型 (TypeError) ----
+    if not _is_length_determinable_sequence(items):
+        raise TypeError("items must be a length-determinable sequence")
+    if not _is_length_determinable_sequence(weights):
+        raise TypeError("weights must be a length-determinable sequence")
+    if not isinstance(seed, _SEED_TYPES):
+        raise TypeError("unsupported seed type: %s" % type(seed).__name__)
+    if not _is_length_determinable_sequence(strata):
+        raise TypeError("strata must be a length-determinable sequence")
+    strata_numbers = []
+    for member in strata:
+        if isinstance(member, bool) or not isinstance(member, int):
+            raise TypeError("strata members must be non-boolean integers")
+        strata_numbers.append(member)
+    if not _is_length_determinable_sequence(quotas_schedule):
+        raise TypeError(
+            "quotas_schedule must be a length-determinable sequence"
+        )
+    quota_rows = []
+    for row in quotas_schedule:
+        if not _is_length_determinable_sequence(row):
+            raise TypeError(
+                "quotas_schedule rows must be length-determinable sequences"
+            )
+        quota_row = []
+        for member in row:
+            if isinstance(member, bool) or not isinstance(member, int):
+                raise TypeError(
+                    "quotas_schedule members must be non-boolean integers"
+                )
+            quota_row.append(member)
+        quota_rows.append(quota_row)
+    _validate_draws(draws)
+    _validate_start(start)
+
+    # ---- 2. 长度、编号范围与窗口 (ValueError) ----
+    n = len(items)
+    if len(weights) != n:
+        raise ValueError("invalid sample size")
+    if len(strata_numbers) != n:
+        raise ValueError("strata length must equal items length")
+    for number in strata_numbers:
+        if number < 0:
+            raise ValueError("stratum number out of range")
+    # 与 _validate_stratified_schedule_inputs 同一约束: 每行配额的下标对应
+    # 分层编号, 行长必须恰好是最大编号加一 —— 空 items 没有最大编号, 每行
+    # 都必须是空序列。
+    top = max(strata_numbers) if strata_numbers else -1
+    for row in quota_rows:
+        if len(row) != top + 1:
+            raise ValueError(
+                "quotas row length must equal max stratum number plus one"
+            )
+        for quota in row:
+            if quota < 0:
+                raise ValueError("quotas must be non-negative")
+    if start + draws > len(quota_rows):
+        raise ValueError("quotas schedule window out of range")
+
+    # ---- 3. 权重元素类型与取值 (TypeError / ValueError) ----
+    _validate_weight_elements(weights)
+
+    # ---- 4. excluded 结构与成员 (TypeError), 越界位置 (ValueError) ----
+    excluded_set = _validate_excluded_positions(excluded, n)
+
+    # ---- 5. 完整计划每一行、每一层排除后配额的正权重可行性 (ValueError) ----
+    # 与 _check_stratified_excluding_quotas 同一规则, 对完整计划的每一行
+    # 逐层检查: 配额超过该层未被排除位置中的正权重位置数时确定抛
+    # ValueError; 零配额分层恒可行。draws=0 也不省略 —— 完整计划的每一行
+    # 都在产生任何结果前校验。
+    for row in quota_rows:
+        _check_stratified_excluding_quotas(
+            weights, strata_numbers, row, excluded_set, n
+        )
+    return n, strata_numbers, quota_rows, excluded_set
+
+
+def _stratified_excluding_schedule_round_plans(
+    local_weights, strata_numbers, quota_rows, excluded_set, n, stop
+):
+    """窗口 [0, stop) 内每一轮的逐层抽样计划列表。
+
+    每一轮(含被跳过的轮次)都按自己那一行的配额经
+    _stratified_excluding_round_plan 选定逐层计划 —— 与一次性"分层配额 +
+    位置排除"入口为同一行配额选择的计划一致(层内位置池先按 excluded_set
+    剔除被排除位置, 零配额分层不构造计划、不消耗随机流)。全部确定性工作
+    在迭代前完成, 迭代期间不会再抛出任何异常。只读取权重, 不修改入参。
+    """
+    return [
+        _stratified_excluding_round_plan(
+            local_weights, strata_numbers, quota_rows[j], excluded_set, n
+        )
+        for j in range(stop)
+    ]
+
+
+def weighted_sample_stratified_excluding_schedule_indices(
+    items, weights, strata, quotas_schedule, excluded, draws, seed=0, start=0
+):
+    """"分层配额 + 位置排除 + 按轮配额计划"组合采样的批量入口: 一次调用
+    生成 draws 轮分层样本, 返回各轮按层拼接的零基原始索引列表。
+
+    items、weights、strata、seed 沿用 weighted_sample_stratified_indices
+    的全部规则; quotas_schedule 沿用 weighted_sample_stratified_schedule_
+    indices 的全部规则(有限非文本序列, 每个成员都是长度等于最大分层编号
+    加一的配额行, 成员为非布尔非负整数); excluded 沿用
+    weighted_sample_excluding_indices 的全部规则(非文本且长度可确定的
+    序列, 成员为非布尔整数且在 items 零基范围内, 按集合语义解释, 重复
+    成员与排列顺序不影响结果)。
+
+    第 start+j 轮(零基)使用 quotas_schedule[start+j]: 在该行配额下按编号
+    升序逐层处理, 第 number 层只在该层且未被 excluded 排除的位置中按权重
+    比例无放回抽取配额个不同位置, 各层结果按编号升序拼接作为该轮的零基
+    原始索引列表; 返回长度等于 draws 的外层 list。每轮都从所有未排除位置
+    重新开始(轮内每个位置至多出现一次, 轮次之间恢复全部未排除位置、允许
+    再次选中同一位置, 重复值按位置区分); 被排除的位置即使权重为正也绝不
+    出现, 未排除的零权重位置仍永不入选。所有轮次与轮内各层共享同一个由
+    seed 初始化的随机流, 零配额分层不消耗该流; 相同 (输入, quotas_schedule,
+    excluded, seed) 唯一确定同一序列。start 只跳过前面的完整轮次 —— 被
+    跳过的第 j 轮同样按 quotas_schedule[j] 的各行配额消耗同一条随机流 ——
+    结果与 start=0 的完整调用按零基区间 [start, start+draws) 切片逐项
+    一致。excluded 为空时与 weighted_sample_stratified_schedule_indices
+    逐项相同; quotas_schedule 只有一行 [quotas] 时, start=0 的首轮与
+    weighted_sample_stratified_excluding_indices(items, weights, strata,
+    quotas, excluded, seed) 逐项相同。
+
+    全部校验在返回任何轮次前完成(draws=0 也校验完整计划、每行排除后的
+    可行性与窗口): 结构或成员类型错误(items、weights、strata、
+    quotas_schedule 及其成员、excluded、seed、draws、start 或权重元素)
+    抛 TypeError; 长度不一致、编号越界、行长不等于最大编号加一、负配额、
+    excluded 越界位置、窗口越界、负权重、NaN、无穷权重或任一行某层排除
+    后正权重不足配额抛 ValueError。权重元素继续接受非布尔 int、有限非负
+    float、Fraction、Decimal(可混合; 超大整数、Fraction、Decimal 全程不
+    经过浮点)。draws=0 返回空 list; 全部配额为零的轮次返回空列表且不消耗
+    随机流。任何失败都不返回部分结果, 不修改入参与 quotas_schedule、
+    excluded。
+    """
+    n, strata_numbers, quota_rows, excluded_set = (
+        _validate_stratified_excluding_schedule_inputs(
+            items, weights, strata, quotas_schedule, excluded,
+            draws, seed, start
+        )
+    )
+
+    # draws=0: 全部校验已在上面完成, 直接返回空结果, 不消耗随机流。
+    if draws == 0:
+        return []
+
+    # 复制到本地, 绝不修改入参; 窗口 [0, start+draws) 内每一轮(含被跳过
+    # 的轮次)都按自己那一行的配额选定逐层抽样计划, 被跳过的轮次同样消耗
+    # 同一条由 seed 初始化的随机流, 因此跳过 start 个完整轮次与从 0 生成
+    # 时消耗的随机流完全相同。
+    local_weights = list(weights)
+    rng = random.Random(seed)
+    plans = _stratified_excluding_schedule_round_plans(
+        local_weights, strata_numbers, quota_rows, excluded_set, n,
+        start + draws
+    )
+    for j in range(start):
+        _draw_stratified_round(plans[j], rng)
+    return [
+        _draw_stratified_round(plans[j], rng)
+        for j in range(start, start + draws)
+    ]
+
+
+def weighted_sample_stratified_excluding_schedule(
+    items, weights, strata, quotas_schedule, excluded, draws, seed=0, start=0
+):
+    """weighted_sample_stratified_excluding_schedule_indices 的元素值入口:
+    规则、校验顺序与异常类别完全一致, 区别仅在于每轮按相同索引返回元素值
+    列表; 两个入口逐轮逐项对应(相同值的不同位置仍按位置独立处理)。
+    """
+    rounds = weighted_sample_stratified_excluding_schedule_indices(
+        items, weights, strata, quotas_schedule, excluded, draws, seed, start
+    )
+    return [[items[i] for i in round_indices] for round_indices in rounds]
+
+
+def weighted_sample_stratified_excluding_schedule_counts(
+    items, weights, strata, quotas_schedule, excluded, draws, seed=0, start=0
+):
+    """weighted_sample_stratified_excluding_schedule_indices 的批量频次
+    入口。
+
+    接受与该入口完全相同的参数语义、固定校验顺序与异常类别, 按同一条由
+    seed 初始化的随机流先生成(并跳过)start 个完整轮次, 再生成 draws 轮;
+    返回长度等于 items 的整数 list counts, counts[i] 即零基区间
+    [start, start+draws) 内位置 i 被选中的总次数(每轮各层无放回, 同一
+    位置每轮至多计一次, 轮间恢复全部未排除位置; 相等的元素值仍按不同
+    位置分别累计)。被排除位置的计数始终为零(即使其权重为正), 未排除的
+    零权重位置仍永不入选。结果等于把
+    weighted_sample_stratified_excluding_schedule_indices 对应窗口的全部
+    轮次按位置摊平计数, 随机流消耗逐项对齐。draws=0 或窗口内配额全为零
+    时返回全零列表, 但仍完成完整计划、每行排除后可行性与窗口的全部校验;
+    任何失败都不给出部分计数。计数为任意精度整数, 可直接交给
+    serialize_metrics 并经 deserialize_metrics 精确往返。不修改入参与
+    quotas_schedule、excluded。
+    """
+    n, strata_numbers, quota_rows, excluded_set = (
+        _validate_stratified_excluding_schedule_inputs(
+            items, weights, strata, quotas_schedule, excluded,
+            draws, seed, start
+        )
+    )
+
+    counts = [0] * n
+    # draws=0: 全部校验已在上面完成, 直接返回全零列表, 不消耗随机流。
+    if draws == 0:
+        return counts
+
+    # 与索引入口完全相同的计划选择、跳过与生成节奏, 随机流消耗逐项对齐。
+    # 抽样器只返回未排除的原始位置, 被排除位置在 counts 中自然始终保持
+    # 为零。
+    local_weights = list(weights)
+    rng = random.Random(seed)
+    plans = _stratified_excluding_schedule_round_plans(
+        local_weights, strata_numbers, quota_rows, excluded_set, n,
+        start + draws
+    )
+    for j in range(start):
+        _draw_stratified_round(plans[j], rng)
+    for j in range(start, start + draws):
+        for position in _draw_stratified_round(plans[j], rng):
+            counts[position] += 1
+    return counts
+
+
+def weighted_sample_stratified_excluding_schedule_stream_indices(
+    items, weights, strata, quotas_schedule, excluded, draws, seed=0, start=0
+):
+    """weighted_sample_stratified_excluding_schedule_indices 的按需逐轮
+    入口。
+
+    返回一个可迭代对象, 每次迭代产出一轮"分层配额 + 位置排除"的零基原始
+    索引列表(各层结果按编号升序拼接, 层内按抽样先后排列, 相同值的不同
+    位置仍按位置独立处理), 共 draws 轮; 对相同输入和种子, 转成列表后与
+    weighted_sample_stratified_excluding_schedule_indices(...) 的全部轮次
+    完全一致(第 start+j 轮使用 quotas_schedule[start+j] 的配额行)。每轮
+    都从所有未排除位置重新开始, 轮内各层无放回, 轮次之间允许再次选中
+    同一位置; 被排除的位置即使权重为正也绝不出现, 未排除的零权重位置仍
+    永不入选。
+
+    可选的 start(默认 0)与批量入口语义相同: 迭代时先从该 seed 对应的
+    轮次流按需跳过 start 个完整轮次(被跳过的第 j 轮同样按
+    quotas_schedule[j] 的各行配额消耗同一条确定性随机流, 零配额分层不
+    消耗), 再逐轮产出 draws 轮; start 不改变后续随机序列, 结果与
+    start=0 的完整调用按零基区间 [start, start+draws) 切片逐项一致。
+
+    与批量入口不同, 轮次在调用方消费时才逐轮生成, 长批次不必一次物化;
+    但全部校验(items / weights / seed / strata / quotas_schedule 及每一行
+    的结构与成员类型、长度、编号与配额取值、excluded、draws / start、窗口
+    范围、权重取值、完整计划每一行每一层排除后的正权重可行性)都在创建时
+    完成 —— 非法输入在调用当场抛出稳定的 TypeError / ValueError, 绝不会
+    延迟到已经产出部分轮次之后; draws=0 也不省略任何校验, 返回不产出
+    元素的迭代对象; 全部配额为零的轮次产出空列表且不消耗随机流。不修改
+    入参与 quotas_schedule、excluded。连续消费同一迭代器只推进当前随机流,
+    不重新播种。
+    """
+    n, strata_numbers, quota_rows, excluded_set = (
+        _validate_stratified_excluding_schedule_inputs(
+            items, weights, strata, quotas_schedule, excluded,
+            draws, seed, start
+        )
+    )
+
+    # 与批量入口完全相同的计划选择: 窗口 [0, start+draws) 内每一轮(含被
+    # 跳过的轮次)都在创建时按自己那一行的配额选定逐层抽样计划 —— 全部
+    # 确定性工作在迭代前完成, 迭代期间不会再抛出任何异常。
+    local_weights = list(weights)
+    rng = random.Random(seed)
+    plans = _stratified_excluding_schedule_round_plans(
+        local_weights, strata_numbers, quota_rows, excluded_set, n,
+        start + draws
+    )
+
+    def _rounds():
+        # 按需跳过 start 个完整轮次: 与完整序列消耗同一条确定性随机流。
+        # 零配额分层不消耗随机流, draws=0 时跳过与否都不影响空结果, 无需
+        # 空转 —— 与既有流式入口同一节奏。
+        if draws > 0:
+            for j in range(start):
+                _draw_stratified_round(plans[j], rng)
+        for j in range(start, start + draws):
+            yield _draw_stratified_round(plans[j], rng)
+
+    return _rounds()
+
+
+def weighted_sample_stratified_excluding_schedule_stream(
+    items, weights, strata, quotas_schedule, excluded, draws, seed=0, start=0
+):
+    """weighted_sample_stratified_excluding_schedule 的按需逐轮入口, 规则
+    与 weighted_sample_stratified_excluding_schedule_stream_indices 完全
+    一致(同一套创建时校验与 start 窗口语义), 区别仅在于每轮按相同索引
+    产出元素值列表; 两个流式入口逐轮逐项对应(相同值的不同位置仍按位置
+    独立处理)。
+    """
+    stream_indices = (
+        weighted_sample_stratified_excluding_schedule_stream_indices(
+            items, weights, strata, quotas_schedule, excluded,
+            draws, seed, start
+        )
+    )
+    return ([items[i] for i in round_indices]
+            for round_indices in stream_indices)
+
+
+# ---------------------------------------------------------------------------
 # 可暂停 / 恢复的按轮分层配额计划采样会话
 # ---------------------------------------------------------------------------
 

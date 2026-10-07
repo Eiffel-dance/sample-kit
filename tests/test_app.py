@@ -57,6 +57,11 @@ from app import (
     weighted_sample_stratified_excluding_counts,
     weighted_sample_stratified_excluding_stream_indices,
     weighted_sample_stratified_excluding_stream,
+    weighted_sample_stratified_excluding_schedule_indices,
+    weighted_sample_stratified_excluding_schedule,
+    weighted_sample_stratified_excluding_schedule_counts,
+    weighted_sample_stratified_excluding_schedule_stream_indices,
+    weighted_sample_stratified_excluding_schedule_stream,
     weighted_sample_stream,
     weighted_sample_stream_indices,
     weighted_sample_many_excluding,
@@ -10974,6 +10979,520 @@ class WeightedSampleStratifiedExcludingTest(unittest.TestCase):
                 self.ITEMS, self.WEIGHTS, 3, (0, 4), 42),
             weighted_sample_excluding_indices(
                 self.ITEMS, self.WEIGHTS, 3, (4, 0, 0), 42))
+
+
+class WeightedSampleStratifiedExcludingScheduleTest(unittest.TestCase):
+    ITEMS = ["a", "b", "c", "d", "e", "f", "g", "h"]
+    WEIGHTS = [5, 1, 3, 2, 4, 1, 2, 6]
+    STRATA = [0, 0, 1, 1, 2, 2, 2, 2]
+    # 排除 [0, 4] 后各层未排除正权重位置数为 1、2、3, 每行配额均不超过。
+    SCHEDULE = [[1, 1, 2], [0, 2, 1], [1, 0, 3], [0, 0, 0], [1, 1, 1]]
+    EXCLUDED = [0, 4]
+    SEED = 20240521
+
+    def _batch(self, draws, seed=None, start=0, excluded=None):
+        return weighted_sample_stratified_excluding_schedule_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.SCHEDULE,
+            self.EXCLUDED if excluded is None else excluded,
+            draws, self.SEED if seed is None else seed, start)
+
+    def test_deterministic_same_seed(self):
+        first = self._batch(4)
+        second = self._batch(4)
+        self.assertEqual(first, second)
+        self.assertEqual(
+            first,
+            weighted_sample_stratified_excluding_schedule_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.SCHEDULE,
+                excluded=self.EXCLUDED, draws=4, seed=self.SEED, start=0))
+
+    def test_excluded_positions_never_chosen(self):
+        for seed in range(30):
+            rounds = self._batch(5, seed=seed)
+            self.assertEqual(len(rounds), 5)
+            for row, round_indices in zip(self.SCHEDULE, rounds):
+                self.assertEqual(len(round_indices), sum(row))
+                self.assertEqual(len(set(round_indices)), len(round_indices))
+                for position in self.EXCLUDED:
+                    self.assertNotIn(position, round_indices)
+
+    def test_strata_processed_in_ascending_number_order(self):
+        rounds = self._batch(5)
+        for row, round_indices in zip(self.SCHEDULE, rounds):
+            cursor = 0
+            for number, quota in enumerate(row):
+                segment = round_indices[cursor:cursor + quota]
+                cursor += quota
+                self.assertEqual(len(segment), quota)
+                for position in segment:
+                    self.assertEqual(self.STRATA[position], number)
+
+    def test_excluded_set_semantics_ignore_order_and_duplicates(self):
+        base = self._batch(4, excluded=[0, 4])
+        for excluded in ([4, 0], [0, 0, 4], (4, 0, 0, 4), [4, 0, 4]):
+            self.assertEqual(base, self._batch(4, excluded=excluded))
+
+    def test_empty_excluded_matches_stratified_schedule_entries(self):
+        for seed in (0, 1, self.SEED, 987654):
+            self.assertEqual(
+                self._batch(4, seed=seed, excluded=[]),
+                weighted_sample_stratified_schedule_indices(
+                    self.ITEMS, self.WEIGHTS, self.STRATA, self.SCHEDULE,
+                    4, seed))
+            self.assertEqual(
+                weighted_sample_stratified_excluding_schedule(
+                    self.ITEMS, self.WEIGHTS, self.STRATA, self.SCHEDULE,
+                    (), 4, seed),
+                weighted_sample_stratified_schedule(
+                    self.ITEMS, self.WEIGHTS, self.STRATA, self.SCHEDULE,
+                    4, seed))
+            self.assertEqual(
+                weighted_sample_stratified_excluding_schedule_counts(
+                    self.ITEMS, self.WEIGHTS, self.STRATA, self.SCHEDULE,
+                    [], 4, seed, 1),
+                weighted_sample_stratified_schedule_counts(
+                    self.ITEMS, self.WEIGHTS, self.STRATA, self.SCHEDULE,
+                    4, seed, 1))
+            self.assertEqual(
+                list(weighted_sample_stratified_excluding_schedule_stream_indices(
+                    self.ITEMS, self.WEIGHTS, self.STRATA, self.SCHEDULE,
+                    (), 3, seed, 1)),
+                list(weighted_sample_stratified_schedule_stream_indices(
+                    self.ITEMS, self.WEIGHTS, self.STRATA, self.SCHEDULE,
+                    3, seed, 1)))
+
+    def test_single_row_matches_stratified_excluding_entries(self):
+        quotas = [1, 1, 2]
+        for seed in (0, 7, self.SEED):
+            rounds = weighted_sample_stratified_excluding_schedule_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, [quotas],
+                self.EXCLUDED, 1, seed)
+            self.assertEqual(len(rounds), 1)
+            self.assertEqual(
+                rounds[0],
+                weighted_sample_stratified_excluding_indices(
+                    self.ITEMS, self.WEIGHTS, self.STRATA, quotas,
+                    self.EXCLUDED, seed))
+
+    def test_values_entry_corresponds_to_indices_entry(self):
+        index_rounds = self._batch(4)
+        value_rounds = weighted_sample_stratified_excluding_schedule(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.SCHEDULE,
+            self.EXCLUDED, 4, self.SEED)
+        self.assertEqual(
+            value_rounds,
+            [[self.ITEMS[i] for i in round_indices]
+             for round_indices in index_rounds])
+
+    def test_duplicate_values_distinct_positions(self):
+        items = ["x", "x", "x", "x"]
+        weights = [1, 1, 1, 1]
+        strata = [0, 0, 1, 1]
+        schedule = [[1, 1], [0, 1], [1, 0]]
+        rounds = weighted_sample_stratified_excluding_schedule_indices(
+            items, weights, strata, schedule, [0], 3, 5)
+        self.assertEqual([len(r) for r in rounds], [2, 1, 1])
+        for round_indices in rounds:
+            self.assertEqual(len(set(round_indices)), len(round_indices))
+            self.assertNotIn(0, round_indices)
+        values = weighted_sample_stratified_excluding_schedule(
+            items, weights, strata, schedule, [0], 3, 5)
+        self.assertEqual(
+            values, [[items[i] for i in r] for r in rounds])
+
+    def test_zero_quota_rounds_return_empty_and_consume_no_randomness(self):
+        schedule = [[1, 1, 2], [0, 0, 0], [1, 0, 3]]
+        trimmed = [[1, 1, 2], [1, 0, 3]]
+        full = weighted_sample_stratified_excluding_schedule_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA, schedule,
+            self.EXCLUDED, 3, self.SEED)
+        self.assertEqual(full[1], [])
+        # 全零配额轮次不消耗随机流: 去掉该行后其余轮次逐项一致。
+        rest = weighted_sample_stratified_excluding_schedule_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA, trimmed,
+            self.EXCLUDED, 2, self.SEED)
+        self.assertEqual([full[0], full[2]], rest)
+        # 全部配额为零的计划每轮都返回空列表。
+        zeros = weighted_sample_stratified_excluding_schedule_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA,
+            [[0, 0, 0], [0, 0, 0]], self.EXCLUDED, 2, self.SEED)
+        self.assertEqual(zeros, [[], []])
+
+    def test_start_window_matches_full_slice(self):
+        full = self._batch(5)
+        for start, draws in ((1, 3), (2, 2), (4, 1), (0, 5)):
+            self.assertEqual(
+                self._batch(draws, start=start), full[start:start + draws])
+            window = list(
+                weighted_sample_stratified_excluding_schedule_stream_indices(
+                    self.ITEMS, self.WEIGHTS, self.STRATA, self.SCHEDULE,
+                    self.EXCLUDED, draws, self.SEED, start))
+            self.assertEqual(window, full[start:start + draws])
+
+    def test_stream_matches_batch_entry(self):
+        for start, draws in ((0, 5), (2, 3), (4, 1)):
+            self.assertEqual(
+                list(weighted_sample_stratified_excluding_schedule_stream_indices(
+                    self.ITEMS, self.WEIGHTS, self.STRATA, self.SCHEDULE,
+                    self.EXCLUDED, draws, self.SEED, start)),
+                self._batch(draws, start=start))
+
+    def test_stream_values_entry_corresponds_to_indices_entry(self):
+        index_rounds = list(
+            weighted_sample_stratified_excluding_schedule_stream_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.SCHEDULE,
+                self.EXCLUDED, 4, self.SEED, 1))
+        value_rounds = list(
+            weighted_sample_stratified_excluding_schedule_stream(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.SCHEDULE,
+                self.EXCLUDED, 4, self.SEED, 1))
+        self.assertEqual(
+            value_rounds,
+            [[self.ITEMS[i] for i in round_indices]
+             for round_indices in index_rounds])
+
+    def test_stream_draws_zero_validates_and_yields_nothing(self):
+        stream = weighted_sample_stratified_excluding_schedule_stream_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.SCHEDULE,
+            self.EXCLUDED, 0, self.SEED, 5)
+        self.assertEqual(list(stream), [])
+        # draws=0 仍完成全部校验(含窗口与排除后逐层可行性)。
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_schedule_stream_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.SCHEDULE,
+                self.EXCLUDED, 0, self.SEED, 6)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_schedule_stream_indices(
+                self.ITEMS, [-1] + self.WEIGHTS[1:], self.STRATA,
+                self.SCHEDULE, self.EXCLUDED, 0, self.SEED)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_schedule_stream_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.SCHEDULE,
+                [0, 1], 0, self.SEED)
+        with self.assertRaises(TypeError):
+            weighted_sample_stratified_excluding_schedule_stream_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.SCHEDULE,
+                "04", 0, self.SEED)
+
+    def test_stream_validation_happens_at_creation(self):
+        # 非法输入在创建迭代对象时抛出, 不延迟到迭代期间。
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_schedule_stream_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.SCHEDULE,
+                [0, 1], 2, self.SEED)
+        with self.assertRaises(TypeError):
+            weighted_sample_stratified_excluding_schedule_stream(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.SCHEDULE,
+                self.EXCLUDED, 1.5, self.SEED)
+
+    def test_counts_match_stream_indices_flattened(self):
+        for start, draws in ((0, 5), (2, 3), (4, 1), (0, 1)):
+            rounds = list(
+                weighted_sample_stratified_excluding_schedule_stream_indices(
+                    self.ITEMS, self.WEIGHTS, self.STRATA, self.SCHEDULE,
+                    self.EXCLUDED, draws, self.SEED, start))
+            counts = weighted_sample_stratified_excluding_schedule_counts(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.SCHEDULE,
+                self.EXCLUDED, draws, self.SEED, start)
+            self.assertEqual(len(counts), len(self.ITEMS))
+            flattened = [0] * len(self.ITEMS)
+            for round_indices in rounds:
+                for position in round_indices:
+                    flattened[position] += 1
+            self.assertEqual(counts, flattened)
+            expected = sum(
+                sum(self.SCHEDULE[j]) for j in range(start, start + draws))
+            self.assertEqual(sum(counts), expected)
+            for position in self.EXCLUDED:
+                self.assertEqual(counts[position], 0)
+
+    def test_counts_excluded_positions_always_zero(self):
+        counts = weighted_sample_stratified_excluding_schedule_counts(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.SCHEDULE,
+            self.EXCLUDED, 5, self.SEED)
+        self.assertEqual(counts[0], 0)
+        self.assertEqual(counts[4], 0)
+
+    def test_counts_draws_zero_returns_all_zeros_after_validation(self):
+        self.assertEqual(
+            weighted_sample_stratified_excluding_schedule_counts(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.SCHEDULE,
+                self.EXCLUDED, 0, self.SEED, 5),
+            [0] * len(self.ITEMS))
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_schedule_counts(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.SCHEDULE,
+                [0, 1], 0, self.SEED)
+
+    def test_counts_serialize_roundtrip_exact(self):
+        counts = weighted_sample_stratified_excluding_schedule_counts(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.SCHEDULE,
+            self.EXCLUDED, 4, self.SEED, 1)
+        text = serialize_metrics(counts)
+        self.assertEqual(deserialize_metrics(text), counts)
+        self.assertEqual(
+            deserialize_metrics(serialize_metrics({"counts": counts})),
+            {"counts": counts})
+
+    def test_fraction_decimal_and_huge_integer_weights(self):
+        items = ["a", "b", "c", "d"]
+        weights = [Fraction(1, 10 ** 30), Decimal("1E-25"), 10 ** 80, 2]
+        strata = [0, 0, 1, 1]
+        schedule = [[1, 1], [1, 1]]
+        first = weighted_sample_stratified_excluding_schedule_indices(
+            items, weights, strata, schedule, [0], 2, 17)
+        second = weighted_sample_stratified_excluding_schedule_indices(
+            items, weights, strata, schedule, [0], 2, 17)
+        self.assertEqual(first, second)
+        for round_indices in first:
+            self.assertEqual(len(round_indices), 2)
+            self.assertNotIn(0, round_indices)
+            # 超大整数权重在该层中必然被选中。
+            self.assertIn(2, round_indices)
+        # excluded 为空时与按轮分层计划入口在精确权重路径上逐项一致。
+        self.assertEqual(
+            weighted_sample_stratified_excluding_schedule_indices(
+                items, weights, strata, schedule, [], 2, 17),
+            weighted_sample_stratified_schedule_indices(
+                items, weights, strata, schedule, 2, 17))
+
+    def test_all_zero_quotas_schedule_still_validates(self):
+        zeros = [[0, 0, 0], [0, 0, 0]]
+        self.assertEqual(
+            weighted_sample_stratified_excluding_schedule_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, zeros,
+                self.EXCLUDED, 2, self.SEED),
+            [[], []])
+        self.assertEqual(
+            weighted_sample_stratified_excluding_schedule_counts(
+                self.ITEMS, self.WEIGHTS, self.STRATA, zeros,
+                self.EXCLUDED, 2, self.SEED),
+            [0] * len(self.ITEMS))
+        # 全部配额为零仍完成权重取值与 excluded 校验。
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_schedule_indices(
+                self.ITEMS, [-1] + self.WEIGHTS[1:], self.STRATA, zeros,
+                self.EXCLUDED, 2, self.SEED)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_schedule_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, zeros,
+                [8], 2, self.SEED)
+
+    def test_empty_items_requires_empty_rows_and_excluded(self):
+        self.assertEqual(
+            weighted_sample_stratified_excluding_schedule_indices(
+                [], [], [], [[], []], [], 2), [[], []])
+        self.assertEqual(
+            weighted_sample_stratified_excluding_schedule(
+                [], [], [], [[]], [], 1), [[]])
+        self.assertEqual(
+            weighted_sample_stratified_excluding_schedule_counts(
+                [], [], [], [[], []], [], 2, 0), [])
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_schedule_indices(
+                [], [], [], [[0]], [], 1)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_schedule_indices(
+                [], [], [], [[]], [0], 1)
+
+    def test_excluded_may_make_any_schedule_row_infeasible(self):
+        # 第 0 层位置 0、1 权重均为正; 都排除后第一行配额 1 不可行。
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_schedule_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.SCHEDULE,
+                [0, 1], 2, self.SEED)
+        # 窗口外的行同样参与完整计划校验: 最后一行要求第 0 层配额 1,
+        # 排除 [0, 1] 后即使 draws 只覆盖前面的行也抛 ValueError。
+        schedule = [[0, 1, 1], [1, 0, 0]]
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_schedule_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, schedule,
+                [0, 1], 1, self.SEED)
+        # 只排除一个仍可行, 且第 0 层只能选中另一个。
+        rounds = weighted_sample_stratified_excluding_schedule_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA, [[1, 0, 0]],
+            [0], 1, self.SEED)
+        self.assertEqual(rounds, [[1]])
+
+    def test_validation_type_errors(self):
+        good = (self.ITEMS, self.WEIGHTS, self.STRATA, self.SCHEDULE,
+                self.EXCLUDED, 2)
+        # items / weights / strata / quotas_schedule / excluded 结构错误。
+        with self.assertRaises(TypeError):
+            weighted_sample_stratified_excluding_schedule_indices(
+                "abcdefgh", *good[1:], seed=self.SEED)
+        with self.assertRaises(TypeError):
+            weighted_sample_stratified_excluding_schedule_indices(
+                self.ITEMS, "12345678", self.STRATA, self.SCHEDULE,
+                self.EXCLUDED, 2, seed=self.SEED)
+        with self.assertRaises(TypeError):
+            weighted_sample_stratified_excluding_schedule_indices(
+                self.ITEMS, self.WEIGHTS, "00012222", self.SCHEDULE,
+                self.EXCLUDED, 2, seed=self.SEED)
+        with self.assertRaises(TypeError):
+            weighted_sample_stratified_excluding_schedule_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, "112",
+                self.EXCLUDED, 2, seed=self.SEED)
+        with self.assertRaises(TypeError):
+            weighted_sample_stratified_excluding_schedule_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, ["112"],
+                self.EXCLUDED, 2, seed=self.SEED)
+        with self.assertRaises(TypeError):
+            weighted_sample_stratified_excluding_schedule_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.SCHEDULE,
+                "04", 2, seed=self.SEED)
+        # seed 类型错误。
+        with self.assertRaises(TypeError):
+            weighted_sample_stratified_excluding_schedule_indices(
+                *good, seed=object())
+        # strata / quotas_schedule / excluded 成员类型错误。
+        with self.assertRaises(TypeError):
+            weighted_sample_stratified_excluding_schedule_indices(
+                self.ITEMS, self.WEIGHTS, [True] * 8, self.SCHEDULE,
+                self.EXCLUDED, 2, seed=self.SEED)
+        with self.assertRaises(TypeError):
+            weighted_sample_stratified_excluding_schedule_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, [[1, 1, 2.0]],
+                self.EXCLUDED, 1, seed=self.SEED)
+        with self.assertRaises(TypeError):
+            weighted_sample_stratified_excluding_schedule_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, [[True, 0, 0]],
+                self.EXCLUDED, 1, seed=self.SEED)
+        with self.assertRaises(TypeError):
+            weighted_sample_stratified_excluding_schedule_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.SCHEDULE,
+                [0.5], 2, seed=self.SEED)
+        with self.assertRaises(TypeError):
+            weighted_sample_stratified_excluding_schedule_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.SCHEDULE,
+                [True], 2, seed=self.SEED)
+        # 权重元素类型错误。
+        with self.assertRaises(TypeError):
+            weighted_sample_stratified_excluding_schedule_indices(
+                self.ITEMS, [True] * 8, self.STRATA, self.SCHEDULE,
+                self.EXCLUDED, 2, seed=self.SEED)
+        with self.assertRaises(TypeError):
+            weighted_sample_stratified_excluding_schedule_indices(
+                self.ITEMS, ["1"] * 8, self.STRATA, self.SCHEDULE,
+                self.EXCLUDED, 2, seed=self.SEED)
+        # draws / start 类型错误。
+        for entry in (
+                weighted_sample_stratified_excluding_schedule_indices,
+                weighted_sample_stratified_excluding_schedule_counts,
+                weighted_sample_stratified_excluding_schedule_stream_indices):
+            with self.assertRaises(TypeError):
+                entry(self.ITEMS, self.WEIGHTS, self.STRATA, self.SCHEDULE,
+                      self.EXCLUDED, 1.5, self.SEED)
+            with self.assertRaises(TypeError):
+                entry(self.ITEMS, self.WEIGHTS, self.STRATA, self.SCHEDULE,
+                      self.EXCLUDED, True, self.SEED)
+            with self.assertRaises(TypeError):
+                entry(self.ITEMS, self.WEIGHTS, self.STRATA, self.SCHEDULE,
+                      self.EXCLUDED, 1, self.SEED, 0.5)
+
+    def test_validation_value_errors(self):
+        # 长度不一致。
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_schedule_indices(
+                self.ITEMS, self.WEIGHTS[:-1], self.STRATA, self.SCHEDULE,
+                self.EXCLUDED, 2, self.SEED)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_schedule_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA[:-1], self.SCHEDULE,
+                self.EXCLUDED, 2, self.SEED)
+        # 编号越界与配额行长度约束。
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_schedule_indices(
+                self.ITEMS, self.WEIGHTS, [-1] + self.STRATA[1:],
+                self.SCHEDULE, self.EXCLUDED, 2, self.SEED)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_schedule_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, [[1, 1]],
+                self.EXCLUDED, 1, self.SEED)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_schedule_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, [[1, 1, -1]],
+                self.EXCLUDED, 1, self.SEED)
+        # 窗口越界。
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_schedule_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.SCHEDULE,
+                self.EXCLUDED, 4, self.SEED, 2)
+        # 权重取值错误。
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_schedule_indices(
+                self.ITEMS, [-1] + self.WEIGHTS[1:], self.STRATA,
+                self.SCHEDULE, self.EXCLUDED, 2, self.SEED)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_schedule_indices(
+                self.ITEMS, [float("nan")] * 8, self.STRATA,
+                self.SCHEDULE, self.EXCLUDED, 2, self.SEED)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_schedule_indices(
+                self.ITEMS, [float("inf")] + self.WEIGHTS[1:], self.STRATA,
+                self.SCHEDULE, self.EXCLUDED, 2, self.SEED)
+        # excluded 越界。
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_schedule_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.SCHEDULE,
+                [8], 2, self.SEED)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_schedule_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.SCHEDULE,
+                [-1], 2, self.SEED)
+        # draws / start 取值错误。
+        for entry in (
+                weighted_sample_stratified_excluding_schedule_indices,
+                weighted_sample_stratified_excluding_schedule_counts,
+                weighted_sample_stratified_excluding_schedule_stream_indices):
+            with self.assertRaises(ValueError):
+                entry(self.ITEMS, self.WEIGHTS, self.STRATA, self.SCHEDULE,
+                      self.EXCLUDED, -1, self.SEED)
+            with self.assertRaises(ValueError):
+                entry(self.ITEMS, self.WEIGHTS, self.STRATA, self.SCHEDULE,
+                      self.EXCLUDED, 1, self.SEED, -1)
+
+    def test_failure_produces_no_partial_result_and_inputs_unchanged(self):
+        items = list(self.ITEMS)
+        weights = list(self.WEIGHTS)
+        strata = list(self.STRATA)
+        schedule = [list(row) for row in self.SCHEDULE]
+        excluded = list(self.EXCLUDED)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_schedule_counts(
+                items, weights, strata, schedule, excluded, -1, self.SEED)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_schedule_indices(
+                items, weights, strata, schedule, [0, 1], 2, self.SEED)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_schedule_indices(
+                items, weights, strata, schedule, excluded, 4,
+                self.SEED, 2)
+        self.assertEqual(items, self.ITEMS)
+        self.assertEqual(weights, self.WEIGHTS)
+        self.assertEqual(strata, self.STRATA)
+        self.assertEqual(schedule, [list(row) for row in self.SCHEDULE])
+        self.assertEqual(excluded, self.EXCLUDED)
+
+    def test_existing_entries_unchanged(self):
+        # 组合入口的存在不改变既有分层、排除、计划与采样入口的行为。
+        self.assertEqual(
+            weighted_sample_stratified_schedule_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.SCHEDULE,
+                4, self.SEED),
+            weighted_sample_stratified_excluding_schedule_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.SCHEDULE,
+                (), 4, self.SEED))
+        self.assertEqual(
+            weighted_sample_stratified_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, [1, 1, 2],
+                self.SEED),
+            weighted_sample_stratified_excluding_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, [1, 1, 2],
+                (), self.SEED))
+        self.assertEqual(
+            weighted_sample_indices(self.ITEMS, self.WEIGHTS, 3, 42),
+            weighted_sample_indices(self.ITEMS, self.WEIGHTS, 3, 42))
 
 
 if __name__ == "__main__":
