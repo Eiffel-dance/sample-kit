@@ -5394,6 +5394,286 @@ def weighted_sample_stratified_stream(items, weights, strata, quotas, draws,
 
 
 # ---------------------------------------------------------------------------
+# 分层配额 + 按位置排除的组合采样
+# ---------------------------------------------------------------------------
+
+def _validate_stratified_excluding_inputs(
+    items, weights, strata, quotas, excluded, seed
+):
+    """分层排除组合采样各入口共用的结构与取值前置校验。
+
+    校验顺序固定: 先按 _validate_stratified_inputs 完成 items、weights、
+    seed、strata、quotas 的全部结构、成员类型、长度、编号、配额与权重
+    取值校验(以及各层未考虑排除时的正权重可行性), 再按
+    _validate_excluded_positions 校验 excluded(非文本且长度可确定的
+    序列, 成员为非布尔整数且在 items 零基范围内; 结构或成员类型错误抛
+    TypeError, 越界位置抛 ValueError; 重复成员与排列顺序按集合语义
+    忽略)。全部校验在产生任何结果前完成, 不修改入参。通过后返回
+    (n, strata 编号副本, quotas 配额副本, 排除位置集合)。
+    """
+    n, strata_numbers, quota_values = _validate_stratified_inputs(
+        items, weights, strata, quotas, seed
+    )
+    excluded_set = _validate_excluded_positions(excluded, n)
+    return n, strata_numbers, quota_values, excluded_set
+
+
+def _check_stratified_excluding_feasibility(
+    weights, strata_numbers, quota_values, excluded_set, n
+):
+    """排除后逐层配额的正权重可行性检查 (ValueError)。
+
+    按编号升序逐层检查: 配额超过该层未被排除位置中的正权重个数(含该层
+    成员全部被排除或剩余成员权重全为零的情形)时确定抛 ValueError; 零
+    配额分层恒可行。调用前权重与 excluded 均已通过校验; 只读取, 不修改
+    入参。
+    """
+    for number, quota in enumerate(quota_values):
+        if quota > 0:
+            layer_weights = [
+                weights[i] for i in range(n)
+                if strata_numbers[i] == number and i not in excluded_set
+            ]
+            if quota > _count_positive_weights(layer_weights):
+                raise ValueError("no positive weight")
+
+
+def _validate_stratified_excluding_batch_inputs(
+    items, weights, strata, quotas, excluded, draws, seed, start
+):
+    """分层排除组合采样批量/流式入口共用的全部前置校验。
+
+    校验顺序固定: 先 _validate_stratified_excluding_inputs(items、
+    weights、seed、strata、quotas、excluded), 再 draws、start(非布尔
+    非负整数, TypeError / ValueError), 最后做排除后逐层配额的正权重
+    可行性检查(ValueError)。全部失败都在任何一轮物化之前确定抛出,
+    绝不返回部分结果(即使 draws=0 也不例外)。通过后返回
+    (n, strata 编号副本, quotas 配额副本, 排除位置集合)。不修改入参。
+    """
+    n, strata_numbers, quota_values, excluded_set = (
+        _validate_stratified_excluding_inputs(
+            items, weights, strata, quotas, excluded, seed
+        )
+    )
+    _validate_draws(draws)
+    _validate_start(start)
+    _check_stratified_excluding_feasibility(
+        weights, strata_numbers, quota_values, excluded_set, n
+    )
+    return n, strata_numbers, quota_values, excluded_set
+
+
+def _stratified_excluding_round_plan(
+    local_weights, strata_numbers, quota_values, excluded_set, n
+):
+    """一轮分层排除抽样的确定性计划: 逐层 (pool, planned_weights, quota,
+    use_exact) 或 None(零配额层)。
+
+    与分层入口为每层选择的计划一致, 区别仅在于层内位置池先按 excluded
+    剔除(保留下来的位置按原始零基索引升序保留, 仍携带原始零基索引);
+    每层以自己的未排除成员权重与配额经 _select_sampling_plan 选定抽样
+    路径(Fraction / Decimal / 超大整数走纯整数精确路径, 不被浮点吞掉);
+    零配额分层不构造计划、不消耗随机流。只读取权重, 不修改入参。
+    """
+    plans = []
+    for number, quota in enumerate(quota_values):
+        if quota == 0:
+            plans.append(None)
+            continue
+        pool = [
+            i for i in range(n)
+            if strata_numbers[i] == number and i not in excluded_set
+        ]
+        pool_weights = [local_weights[i] for i in pool]
+        planned_weights, use_exact = _select_sampling_plan(pool_weights, quota)
+        plans.append((pool, planned_weights, quota, use_exact))
+    return plans
+
+
+def weighted_sample_stratified_excluding_indices(
+    items, weights, strata, quotas, excluded=(), seed=0
+):
+    """分层配额与按位置排除组合的加权无放回抽样, 返回按层拼接的零基
+    原始索引。
+
+    items、weights、strata、quotas、seed 沿用
+    weighted_sample_stratified_indices 的全部规则; excluded 沿用
+    weighted_sample_excluding_indices 的全部规则(非文本且长度可确定的
+    序列, 成员为非布尔整数且在 items 零基范围内, 按集合语义解释, 重复
+    成员与排列顺序不影响结果)。分层按编号升序依次处理: 第 number 层在
+    该层且未被 excluded 排除的位置中按权重比例无放回抽取 quotas[number]
+    个不同位置, 层内按抽样先后排列, 各层结果按编号升序依次拼接; 返回的
+    均为原始零基索引, 相同值的不同位置仍按位置独立处理。被排除的位置
+    即使权重为正也绝不出现, 未排除的零权重位置仍永不入选。所有层共享
+    同一个由 seed 初始化的随机流, 零配额分层不消耗该流; 相同
+    (输入, excluded, seed) 唯一确定同一序列。excluded 为空时与
+    weighted_sample_stratified_indices(items, weights, strata, quotas,
+    seed) 逐项相同(同一随机流、同一抽样计划)。全部配额为零时返回空
+    列表。
+
+    结构或成员类型错误(items、weights、strata、quotas、excluded、seed
+    或权重元素)抛 TypeError; 长度不一致、编号越界、quotas 长度不等于
+    最大编号加一、负配额、excluded 位置越界、负权重、NaN 或无穷权重、
+    排除后某层正权重位置数不足配额抛 ValueError。空 items 只接受空
+    strata、空 quotas 与空 excluded。全部校验在产生任何结果前完成,
+    不修改入参。
+    """
+    n, strata_numbers, quota_values, excluded_set = (
+        _validate_stratified_excluding_inputs(
+            items, weights, strata, quotas, excluded, seed
+        )
+    )
+    _check_stratified_excluding_feasibility(
+        weights, strata_numbers, quota_values, excluded_set, n
+    )
+
+    # 复制到本地, 绝不修改入参; 各层按编号升序共享同一条随机流。
+    local_weights = list(weights)
+    rng = random.Random(seed)
+    plans = _stratified_excluding_round_plan(
+        local_weights, strata_numbers, quota_values, excluded_set, n
+    )
+    return _draw_stratified_round(plans, rng)
+
+
+def weighted_sample_stratified_excluding(
+    items, weights, strata, quotas, excluded=(), seed=0
+):
+    """weighted_sample_stratified_excluding_indices 的元素值入口: 规则、
+    校验顺序与异常类别完全一致, 区别仅在于按相同索引返回元素值列表; 两个
+    入口逐项对应(相同值的不同位置仍按位置独立处理)。"""
+    indices = weighted_sample_stratified_excluding_indices(
+        items, weights, strata, quotas, excluded, seed
+    )
+    return [items[i] for i in indices]
+
+
+def weighted_sample_stratified_excluding_stream_indices(
+    items, weights, strata, quotas, excluded, draws, seed=0, start=0
+):
+    """weighted_sample_stratified_excluding_indices 的按需逐轮入口。
+
+    返回一个可迭代对象, 每次迭代产出一轮按层拼接的零基原始索引列表(层内
+    按抽样先后排列, 相同值的不同位置仍按位置独立处理), 共 draws 轮;
+    对相同输入和种子, start=0 时第一轮与
+    weighted_sample_stratified_excluding_indices(items, weights, strata,
+    quotas, excluded, seed) 逐项相同, 后续轮次继续消耗同一条由 seed 初始
+    化的随机流。每轮都从同一组未排除位置重新开始(轮内各层无放回, 同一
+    位置每轮至多出现一次, 轮次之间恢复全部未排除位置, 允许再次选中同一
+    位置); 所有轮次与轮内各层共享同一个随机流, 零配额分层不消耗该流。
+
+    可选的 start(默认 0)与既有批量/流式入口语义相同: 迭代时先从该 seed
+    对应的轮次流按需跳过 start 个完整轮次(只消耗同一条确定性随机流,
+    不改变任何选择规则), 再逐轮产出 draws 轮; 因此转成列表后与 start=0
+    的完整轮次序列按零基区间 [start, start+draws) 切片逐项一致。
+
+    与一次性入口不同, 轮次在调用方消费时才逐轮生成; 但全部校验都在创建
+    时完成, 绝不把错误拖到迭代期间: 先按分层排除入口完成 items、weights、
+    seed、strata、quotas、excluded 的结构、成员类型、长度、编号、配额、
+    排除位置与权重取值校验, 再要求 draws、start 为非布尔非负整数, 最后
+    做排除后逐层配额的正权重可行性检查。结构或成员类型错误抛 TypeError;
+    长度、编号、配额或排除位置越界、负数、负权重、NaN、无穷权重以及排除
+    后某层正权重不足配额抛 ValueError。draws=0 仍完成全部校验并返回不
+    产出元素的迭代对象。任何失败都不产生部分结果, 也不修改入参。连续
+    消费同一迭代器只推进当前随机流, 不重新播种。
+    """
+    n, strata_numbers, quota_values, excluded_set = (
+        _validate_stratified_excluding_batch_inputs(
+            items, weights, strata, quotas, excluded, draws, seed, start
+        )
+    )
+
+    # 复制到本地, 绝不修改入参; 每轮使用同一份逐层计划(配额与权重固定),
+    # 抽样器只作用于副本, 因此每轮都从同一组未排除位置重新开始; 全部
+    # 确定性工作在迭代前完成, 迭代期间不会再抛出任何异常。
+    local_weights = list(weights)
+    rng = random.Random(seed)
+    plans = _stratified_excluding_round_plan(
+        local_weights, strata_numbers, quota_values, excluded_set, n
+    )
+
+    def _rounds():
+        # 按需跳过 start 个完整轮次: 与完整序列消耗同一条确定性随机流。
+        # draws=0 时跳过与否都不影响空结果, 无需空转 —— 与既有流式入口
+        # 同一节奏。
+        if draws > 0:
+            for _ in range(start):
+                _draw_stratified_round(plans, rng)
+        for _ in range(draws):
+            yield _draw_stratified_round(plans, rng)
+
+    return _rounds()
+
+
+def weighted_sample_stratified_excluding_stream(
+    items, weights, strata, quotas, excluded, draws, seed=0, start=0
+):
+    """weighted_sample_stratified_excluding 的按需逐轮入口, 规则与
+    weighted_sample_stratified_excluding_stream_indices 完全一致(同一套
+    创建时校验与 start 窗口语义), 区别仅在于每轮按相同索引产出元素值
+    列表; 两个入口逐轮逐项对应(相同值的不同位置仍按位置独立处理)。
+    """
+    index_stream = weighted_sample_stratified_excluding_stream_indices(
+        items, weights, strata, quotas, excluded, draws, seed, start
+    )
+    return ([items[i] for i in round_indices] for round_indices in index_stream)
+
+
+def weighted_sample_stratified_excluding_counts(
+    items, weights, strata, quotas, excluded, draws, seed=0, start=0
+):
+    """weighted_sample_stratified_excluding_stream_indices 的批量频次
+    入口: 直接按原始零基位置累计窗口内的选中次数, 免去调用方逐轮遍历。
+
+    接受与 weighted_sample_stratified_excluding_stream_indices 完全相同
+    的 items、weights、strata、quotas、excluded、draws、seed、start 语义
+    与固定校验顺序(items/weights/seed/strata/quotas、excluded、draws、
+    start, 随后排除后逐层配额的正权重可行性检查; excluded 按集合语义
+    解释, 重复成员与排列顺序忽略)。按同一条由 seed 初始化的随机流先生成
+    (并跳过)start 个完整轮次, 再生成 draws 轮; 返回长度等于 items 的
+    整数 list counts, counts[i] 即零基区间 [start, start+draws) 内位置
+    i 被选中的总次数(每轮各层无放回, 同一位置每轮至多计一次, 轮间恢复
+    全部未排除位置; 相等的元素值仍按不同位置分别累计)。被排除位置的
+    计数始终为零(即使其权重为正), 未排除的零权重位置仍永不入选。因此
+    对相同输入, 本入口与把
+    weighted_sample_stratified_excluding_stream_indices 对应窗口的全部
+    轮次按位置摊平计数逐项一致 —— 首轮、后续轮次、相同种子以及零配额
+    分层的随机流消耗都与对应索引入口逐项对齐。
+
+    draws=0 或全部配额为零时返回全零列表(零配额分层不消耗随机流), 但
+    仍完成既有全部校验(含 excluded 与排除后逐层正权重可行性检查); 任何
+    失败都不给出部分计数。计数为任意精度整数, 可直接交给
+    serialize_metrics 并经 deserialize_metrics 精确往返。不修改入参,
+    也不修改 excluded。
+    """
+    n, strata_numbers, quota_values, excluded_set = (
+        _validate_stratified_excluding_batch_inputs(
+            items, weights, strata, quotas, excluded, draws, seed, start
+        )
+    )
+
+    counts = [0] * n
+    # draws=0: 全部校验已在上面完成, 直接返回全零列表, 不消耗随机流。
+    if draws == 0:
+        return counts
+
+    # 与流式索引入口完全相同的计划选择、跳过与生成节奏, 随机流消耗逐项
+    # 对齐。抽样器只返回未排除的原始位置, 被排除位置在 counts 中自然
+    # 始终保持为零。
+    local_weights = list(weights)
+    rng = random.Random(seed)
+    plans = _stratified_excluding_round_plan(
+        local_weights, strata_numbers, quota_values, excluded_set, n
+    )
+    for _ in range(start):
+        _draw_stratified_round(plans, rng)
+    for _ in range(draws):
+        for position in _draw_stratified_round(plans, rng):
+            counts[position] += 1
+    return counts
+
+
+# ---------------------------------------------------------------------------
 # 可暂停 / 恢复的分层配额采样会话
 # ---------------------------------------------------------------------------
 
