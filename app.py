@@ -4811,6 +4811,118 @@ def weighted_sample_partition(items, weights, group_sizes, seed=0):
     return [[items[i] for i in group_indices] for group_indices in groups]
 
 
+def weighted_sample_partition_stream_indices(
+    items, weights, group_sizes, draws, seed=0, start=0
+):
+    """weighted_sample_partition_indices 的按需逐组入口。
+
+    返回一个可迭代对象, 每次迭代产出一组按抽样先后排列的零基原始索引
+    列表, 共 draws 组; 外层第 j 个列表即组编号 start+j 的分组结果。分组
+    仍由一次长度为 sum(group_sizes) 的加权无放回位置序列按组边界切出,
+    与 weighted_sample_partition_indices(items, weights, group_sizes,
+    seed) 的零基区间 [start, start+draws) 逐组逐项一致, 也与
+    weighted_sample_partition_checkpoint 创建后以同一窗口恢复的结果
+    完全一致; 组内与组间位置都不重复, 零权重位置永不出现, 重复值按位置
+    区分。
+
+    可选的 start(默认 0)从完整组计划的第 start 组开始: 整条位置序列只
+    由一次加权无放回抽样产生, start 只移动组边界窗口, 不改变序列本身。
+    draws、start 必须是非布尔非负整数(其他类型抛 TypeError, 负数抛
+    ValueError), 且窗口 [start, start+draws) 不得越过组计划(越界抛
+    ValueError, 计划末尾只接受空窗口)。
+
+    与一次性入口不同, 各组在调用方消费时才逐组切出; 但全部校验都在创建
+    时完成, 绝不把错误拖到迭代期间: 先按分组入口完成 items、weights、
+    seed、group_sizes 的结构、成员类型、长度、组大小与权重取值、总组
+    大小的正权重可行性校验, 再校验 draws、start 与窗口范围。结构或成员
+    类型错误抛 TypeError; 长度不一致、负组大小、负权重、NaN、无穷权重、
+    正权重不足以及窗口越界抛 ValueError。draws=0 仍完成全部校验并返回
+    不产出元素的迭代对象; 全零组大小的组在窗口内产出空列表。任何失败
+    都不产生部分结果, 也不修改入参。
+    """
+    n, groups = _validate_partition_inputs(items, weights, group_sizes, seed)
+    _validate_draws(draws)
+    _validate_start(start)
+    if start + draws > len(groups):
+        raise ValueError("partition stream window out of range")
+
+    # 与一次性分组入口完全相同的抽样节奏: 复制到本地(绝不修改入参),
+    # 整条位置序列只由一次加权无放回抽样产生, 在创建时全部抽出 —— 全部
+    # 确定性工作在迭代前完成, 迭代期间不会再抛出任何异常。
+    total = sum(groups)
+    pool_weights = list(weights)
+    rng = random.Random(seed)
+    planned_weights, use_exact = _select_sampling_plan(pool_weights, total)
+    sequence = _draw_indices_once(n, planned_weights, total, rng, use_exact)
+
+    def _groups():
+        # 按需按组边界切出窗口 [start, start+draws): 与一次性入口和断点
+        # 恢复对同一窗口的切片逐项一致。
+        cursor = sum(groups[:start])
+        for size in groups[start:start + draws]:
+            yield sequence[cursor:cursor + size]
+            cursor += size
+
+    return _groups()
+
+
+def weighted_sample_partition_stream(
+    items, weights, group_sizes, draws, seed=0, start=0
+):
+    """weighted_sample_partition 的按需逐组入口, 规则与
+    weighted_sample_partition_stream_indices 完全一致(同一套创建时
+    校验与 draws/start 窗口语义), 区别仅在于每组按相同索引产出元素值
+    列表; 与 weighted_sample_partition 在相同组窗口的结果逐组逐项一致
+    (相同值的不同位置仍按位置独立处理)。
+    """
+    index_stream = weighted_sample_partition_stream_indices(
+        items, weights, group_sizes, draws, seed, start
+    )
+    return ([items[i] for i in group_indices] for group_indices in index_stream)
+
+
+def weighted_sample_partition_counts(
+    items, weights, group_sizes, draws, seed=0, start=0
+):
+    """weighted_sample_partition_indices 的组窗口频次入口: 直接按原始
+    零基位置累计窗口内各组的选中次数, 免去调用方逐组遍历。
+
+    接受与 weighted_sample_partition_stream_indices 完全相同的 items、
+    weights、group_sizes、draws、seed、start 语义与固定校验顺序(分组
+    入口校验、draws、start, 随后窗口范围检查), 按同一条由 seed 初始化
+    的随机流做一次长度为 sum(group_sizes) 的加权无放回抽样, 返回长度
+    等于 items 的整数 list counts, counts[i] 即零基组区间
+    [start, start+draws) 内位置 i 被选中的总次数(整条序列无放回, 同一
+    位置在完整计划中至多计一次; 相等的元素值仍按不同位置分别累计)。
+    因此对相同输入, 本入口与把同窗口的分组结果(一次性、流式或断点恢复)
+    按位置摊平计数逐项一致, 随机流消耗与对应索引入口逐项对齐。
+
+    draws=0 或窗口只覆盖全零组大小时返回全零列表, 但仍完成既有全部
+    校验; 任何失败都不给出部分计数。计数为任意精度整数, 可直接交给
+    serialize_metrics 并经 deserialize_metrics 精确往返。不修改入参。
+    """
+    n, groups = _validate_partition_inputs(items, weights, group_sizes, seed)
+    _validate_draws(draws)
+    _validate_start(start)
+    if start + draws > len(groups):
+        raise ValueError("partition stream window out of range")
+
+    # 与流式索引入口相同的抽样节奏: 整条位置序列只由一次加权无放回
+    # 抽样产生, 窗口内的位置前缀即计数对象。
+    total = sum(groups)
+    pool_weights = list(weights)
+    rng = random.Random(seed)
+    planned_weights, use_exact = _select_sampling_plan(pool_weights, total)
+    sequence = _draw_indices_once(n, planned_weights, total, rng, use_exact)
+
+    counts = [0] * n
+    begin = sum(groups[:start])
+    end = sum(groups[:start + draws])
+    for position in sequence[begin:end]:
+        counts[position] += 1
+    return counts
+
+
 def _group_sizes_fingerprint(group_sizes):
     """对组大小计划取指纹: 逐项十进制规范化后整体 sha256。"""
     body = "\n".join(

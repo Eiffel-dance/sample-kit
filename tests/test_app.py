@@ -38,6 +38,9 @@ from app import (
     weighted_sample_partition_checkpoint,
     weighted_sample_partition_resume_indices,
     weighted_sample_partition_resume,
+    weighted_sample_partition_stream_indices,
+    weighted_sample_partition_stream,
+    weighted_sample_partition_counts,
     weighted_sample_stratified_indices,
     weighted_sample_stratified,
     weighted_sample_stratified_counts,
@@ -7954,6 +7957,273 @@ class WeightedSamplePartitionTest(unittest.TestCase):
         self.assertEqual(weights, self.WEIGHTS)
         self.assertEqual(group_sizes, self.GROUP_SIZES)
         self.assertEqual(state, state_snapshot)
+
+
+class WeightedSamplePartitionStreamCountsTest(unittest.TestCase):
+    """分组结果的按需消费与频次统计:
+    weighted_sample_partition_stream_indices /
+    weighted_sample_partition_stream /
+    weighted_sample_partition_counts。"""
+
+    ITEMS = list("abcdef")
+    WEIGHTS = [1, 3, 0, 2, 5, 0]
+    GROUP_SIZES = [2, 1, 0, 1]
+    SEED = 42
+
+    def _full(self):
+        return weighted_sample_partition_indices(
+            self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, self.SEED)
+
+    def _stream(self, draws, start=0):
+        return list(weighted_sample_partition_stream_indices(
+            self.ITEMS, self.WEIGHTS, self.GROUP_SIZES,
+            draws, self.SEED, start))
+
+    # ------------------------------------------------------------------
+    # 流式索引入口
+    # ------------------------------------------------------------------
+    def test_stream_matches_one_shot_every_window(self):
+        full = self._full()
+        for start in range(len(self.GROUP_SIZES) + 1):
+            for draws in range(len(self.GROUP_SIZES) - start + 1):
+                self.assertEqual(
+                    self._stream(draws, start), full[start:start + draws])
+
+    def test_stream_matches_checkpoint_resume_window(self):
+        state = weighted_sample_partition_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, self.SEED, start=1)
+        resumed, _ = weighted_sample_partition_resume_indices(
+            self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, state, 2)
+        self.assertEqual(self._stream(2, 1), resumed)
+
+    def test_stream_is_lazy_iterator(self):
+        stream = weighted_sample_partition_stream_indices(
+            self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, 2, self.SEED, 1)
+        self.assertFalse(isinstance(stream, list))
+        self.assertEqual(list(stream), self._full()[1:3])
+
+    def test_stream_zero_draws_returns_empty_iterator(self):
+        self.assertEqual(self._stream(0), [])
+        # 计划末尾的空窗口同样合法。
+        self.assertEqual(self._stream(0, len(self.GROUP_SIZES)), [])
+
+    def test_stream_zero_sized_groups_yield_empty_lists(self):
+        # 全零组大小的组(编号 2)在窗口内产出空列表。
+        self.assertEqual(self._stream(3, 1), self._full()[1:4])
+        self.assertEqual(self._stream(1, 2), [[]])
+
+    # ------------------------------------------------------------------
+    # 流式元素值入口
+    # ------------------------------------------------------------------
+    def test_value_stream_maps_positions(self):
+        index_groups = self._stream(3, 1)
+        value_groups = list(weighted_sample_partition_stream(
+            self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, 3, self.SEED, 1))
+        self.assertEqual(
+            value_groups,
+            [[self.ITEMS[i] for i in group] for group in index_groups],
+        )
+        self.assertEqual(
+            value_groups,
+            [[self.ITEMS[i] for i in group] for group in self._full()[1:4]],
+        )
+
+    def test_value_stream_duplicate_values_distinct_positions(self):
+        items = ["x", "y", "x", "z", "y", "q"]
+        index_groups = list(weighted_sample_partition_stream_indices(
+            items, self.WEIGHTS, [2, 2], 2, 5, 0))
+        value_groups = list(weighted_sample_partition_stream(
+            items, self.WEIGHTS, [2, 2], 2, 5, 0))
+        self.assertEqual(
+            value_groups,
+            [[items[i] for i in group] for group in index_groups],
+        )
+        flattened = [p for group in index_groups for p in group]
+        self.assertEqual(len(flattened), len(set(flattened)))
+
+    # ------------------------------------------------------------------
+    # 频次入口
+    # ------------------------------------------------------------------
+    def test_counts_match_flattened_window(self):
+        full = self._full()
+        for start in range(len(self.GROUP_SIZES) + 1):
+            for draws in range(len(self.GROUP_SIZES) - start + 1):
+                expected = [0] * len(self.ITEMS)
+                for group in full[start:start + draws]:
+                    for position in group:
+                        expected[position] += 1
+                self.assertEqual(
+                    weighted_sample_partition_counts(
+                        self.ITEMS, self.WEIGHTS, self.GROUP_SIZES,
+                        draws, self.SEED, start),
+                    expected,
+                )
+
+    def test_counts_shape_and_zero_draws(self):
+        counts = weighted_sample_partition_counts(
+            self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, 2, self.SEED, 1)
+        self.assertEqual(len(counts), len(self.ITEMS))
+        self.assertTrue(all(
+            isinstance(member, int) and not isinstance(member, bool)
+            for member in counts))
+        self.assertEqual(
+            weighted_sample_partition_counts(
+                self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, 0, self.SEED, 2),
+            [0] * len(self.ITEMS),
+        )
+        # 窗口只覆盖全零组大小时同样返回全零列表。
+        self.assertEqual(
+            weighted_sample_partition_counts(
+                self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, 1, self.SEED, 2),
+            [0] * len(self.ITEMS),
+        )
+
+    def test_counts_serialize_round_trip(self):
+        counts = weighted_sample_partition_counts(
+            self.ITEMS, self.WEIGHTS, self.GROUP_SIZES,
+            len(self.GROUP_SIZES), self.SEED, 0)
+        text = app.serialize_metrics({"counts": counts})
+        self.assertEqual(
+            app.deserialize_metrics(text)["counts"], counts)
+
+    # ------------------------------------------------------------------
+    # 精确路径与确定性
+    # ------------------------------------------------------------------
+    def test_exact_paths_match_one_shot(self):
+        cases = [
+            [Fraction(1, 7), Decimal("0.2"), 0, 1, 10 ** 80, 0],
+            [10 ** 400, 1, 0, 10 ** 399, 2, 0],
+            [Fraction(1, 10 ** 300), 3, 0, 1, 1, 0],
+            [Decimal("1E-30"), Decimal("2.5"), 0, 1, 1, 0],
+            [1e-300, 2.0, 0.0, 1e-320, 1.0, 0.0],
+        ]
+        for weights in cases:
+            one_shot = weighted_sample_partition_indices(
+                self.ITEMS, weights, self.GROUP_SIZES, 7)
+            streamed = list(weighted_sample_partition_stream_indices(
+                self.ITEMS, weights, self.GROUP_SIZES,
+                len(self.GROUP_SIZES), 7, 0))
+            self.assertEqual(streamed, one_shot)
+            expected = [0] * len(self.ITEMS)
+            for group in one_shot:
+                for position in group:
+                    expected[position] += 1
+            self.assertEqual(
+                weighted_sample_partition_counts(
+                    self.ITEMS, weights, self.GROUP_SIZES,
+                    len(self.GROUP_SIZES), 7, 0),
+                expected,
+            )
+
+    def test_determinism_same_seed(self):
+        self.assertEqual(self._stream(4), self._stream(4))
+        self.assertEqual(
+            weighted_sample_partition_counts(
+                self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, 4, self.SEED, 0),
+            weighted_sample_partition_counts(
+                self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, 4, self.SEED, 0),
+        )
+
+    def test_empty_items_only_zero_plan(self):
+        self.assertEqual(
+            list(weighted_sample_partition_stream_indices(
+                [], [], [0, 0], 2, 0, 0)),
+            [[], []],
+        )
+        self.assertEqual(
+            list(weighted_sample_partition_stream([], [], [0], 1, 0, 0)),
+            [[]],
+        )
+        self.assertEqual(
+            weighted_sample_partition_counts([], [], [0, 0], 2, 0, 0), [])
+        with self.assertRaises(ValueError):
+            weighted_sample_partition_counts([], [], [1], 1, 0, 0)
+
+    # ------------------------------------------------------------------
+    # 校验: 三个入口同一顺序、同一异常类别
+    # ------------------------------------------------------------------
+    def _for_each_entry(self, check):
+        entries = [
+            lambda *args: list(weighted_sample_partition_stream_indices(*args)),
+            lambda *args: list(weighted_sample_partition_stream(*args)),
+            lambda *args: weighted_sample_partition_counts(*args),
+        ]
+        for entry in entries:
+            check(entry)
+
+    def test_validation_type_errors(self):
+        def check(entry):
+            te = lambda fn: self.assertRaises(TypeError, fn)
+            items, weights, groups = self.ITEMS, self.WEIGHTS, self.GROUP_SIZES
+            te(lambda: entry("abcdef", weights, groups, 1, 0, 0))
+            te(lambda: entry(items, iter(weights), groups, 1, 0, 0))
+            te(lambda: entry(items, weights, "abc", 1, 0, 0))
+            te(lambda: entry(items, weights, iter(groups), 1, 0, 0))
+            te(lambda: entry(items, weights, [1, True], 1, 0, 0))
+            te(lambda: entry(items, weights, [1, 1.0], 1, 0, 0))
+            te(lambda: entry(items, weights, groups, 1.5, 0, 0))
+            te(lambda: entry(items, weights, groups, True, 0, 0))
+            te(lambda: entry(items, weights, groups, 1, 0, 1.5))
+            te(lambda: entry(items, weights, groups, 1, 0, True))
+            te(lambda: entry(items, weights, groups, 1, object(), 0))
+            te(lambda: entry(items, [1, "x", 1, 1, 1, 1], groups, 1, 0, 0))
+            te(lambda: entry(items, [1, True, 1, 1, 1, 1], groups, 1, 0, 0))
+        self._for_each_entry(check)
+
+    def test_validation_value_errors(self):
+        def check(entry):
+            ve = lambda fn: self.assertRaises(ValueError, fn)
+            items, weights, groups = self.ITEMS, self.WEIGHTS, self.GROUP_SIZES
+            ve(lambda: entry(items, weights[:-1], groups, 1, 0, 0))
+            ve(lambda: entry(items, weights, [1, -1], 1, 0, 0))
+            ve(lambda: entry(items, [-1] + weights[1:], groups, 1, 0, 0))
+            ve(lambda: entry(items, [float("nan")] + weights[1:], groups, 1, 0, 0))
+            ve(lambda: entry(items, [float("inf")] + weights[1:], groups, 1, 0, 0))
+            ve(lambda: entry(items, weights, groups, -1, 0, 0))
+            ve(lambda: entry(items, weights, groups, 1, 0, -1))
+            # 窗口越界: start 越过组数或 start+draws 越过组数。
+            ve(lambda: entry(items, weights, groups, 1, 0, len(groups)))
+            ve(lambda: entry(items, weights, groups, len(groups) + 1, 0, 0))
+            ve(lambda: entry(items, weights, groups, 2, 0, len(groups) - 1))
+            # 完整计划的正权重不足(即使 draws=0 也在创建时失败)。
+            ve(lambda: entry(items, weights, [5, 5], 0, 0, 0))
+        self._for_each_entry(check)
+
+    def test_stream_validation_is_eager(self):
+        # 流式入口的全部校验都在创建时完成, 不延迟到迭代期间。
+        with self.assertRaises(ValueError):
+            weighted_sample_partition_stream_indices(
+                self.ITEMS, self.WEIGHTS[:-1], self.GROUP_SIZES, 1, 0, 0)
+        with self.assertRaises(ValueError):
+            weighted_sample_partition_stream_indices(
+                self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, 1, 0, 99)
+        with self.assertRaises(TypeError):
+            weighted_sample_partition_stream(
+                self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, True, 0, 0)
+
+    def test_zero_draws_still_validates(self):
+        def check(entry):
+            with self.assertRaises(ValueError):
+                entry(self.ITEMS, self.WEIGHTS, [1, -1], 0, 0, 0)
+            with self.assertRaises(TypeError):
+                entry(self.ITEMS, self.WEIGHTS, [1, True], 0, 0, 0)
+            with self.assertRaises(ValueError):
+                entry(self.ITEMS, self.WEIGHTS, self.GROUP_SIZES, 0, 0, 99)
+        self._for_each_entry(check)
+
+    def test_inputs_not_mutated(self):
+        items = list(self.ITEMS)
+        weights = list(self.WEIGHTS)
+        group_sizes = list(self.GROUP_SIZES)
+        list(weighted_sample_partition_stream_indices(
+            items, weights, group_sizes, 4, self.SEED, 0))
+        list(weighted_sample_partition_stream(
+            items, weights, group_sizes, 4, self.SEED, 0))
+        weighted_sample_partition_counts(
+            items, weights, group_sizes, 4, self.SEED, 0)
+        self.assertEqual(items, self.ITEMS)
+        self.assertEqual(weights, self.WEIGHTS)
+        self.assertEqual(group_sizes, self.GROUP_SIZES)
 
 
 class WeightedSamplePlanTest(unittest.TestCase):
