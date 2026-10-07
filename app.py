@@ -5146,6 +5146,118 @@ def weighted_sample_partition_resume(
     return groups, next_state
 
 
+def _validate_partition_window(groups, draws, start):
+    """分组流式/频次入口共用的窗口校验。
+
+    调用前 group_sizes 已通过 _validate_partition_inputs 校验并复制为本地
+    groups。draws、start 必须是非布尔非负整数(TypeError / ValueError),
+    且窗口 [start, start+draws) 不得越过组计划范围(ValueError); 与既有
+    批量/流式入口的 draws、start 规则及分组恢复入口的窗口检查保持一致。
+    """
+    _validate_draws(draws)
+    _validate_start(start)
+    if start + draws > len(groups):
+        raise ValueError("partition stream window out of range")
+
+
+def weighted_sample_partition_stream_indices(
+    items, weights, group_sizes, draws, seed=0, start=0
+):
+    """weighted_sample_partition_indices 的按需逐组入口。
+
+    返回一个可迭代对象, 每次迭代产出一个组的零基原始索引列表(组内按抽样
+    先后排列, 相同值的不同位置仍按位置独立处理), 共 draws 个; 外层第 j 个
+    列表即完整组计划中编号 start+j 的组。对相同输入和种子, 把 start=0 且
+    draws 等于 len(group_sizes) 的全部产出转成列表, 与
+    weighted_sample_partition_indices(items, weights, group_sizes, seed)
+    逐组逐项一致; 一般地, 物化结果与一次性分组及断点恢复在同一窗口
+    [start, start+draws) 的结果逐组一致 —— 三个入口共享同一条由一次加权
+    无放回抽样产生的位置序列, start 只选择该序列上的组边界窗口, 不改变
+    序列本身。组内与组间位置都不重复, 零权重位置永不出现。
+
+    与一次性入口不同, 各组在调用方消费时才逐组物化; 但全部校验都在创建时
+    完成, 绝不把错误拖到迭代期间: 先按分组入口完成 items、weights、seed、
+    group_sizes 的结构、成员类型、长度、权重取值与总组大小的正权重可行性
+    校验, 再要求 draws、start 为非布尔非负整数且窗口 [start, start+draws)
+    不越过组计划(计划末尾只接受空窗口)。结构或成员类型错误抛 TypeError;
+    长度不一致、负组大小、非法权重、正权重不足或窗口越界抛 ValueError。
+    draws=0 仍完成全部校验并返回不产出元素的迭代对象; 全零组大小的组在
+    窗口内产出空列表。任何失败都不产生部分结果, 也不修改入参。
+    """
+    n, groups = _validate_partition_inputs(items, weights, group_sizes, seed)
+    _validate_partition_window(groups, draws, start)
+
+    # 与一次性分组入口完全相同的抽样节奏: 整条长度为 sum(group_sizes) 的
+    # 无放回位置序列只由一次加权无放回抽样产生, start 只是该序列上的组
+    # 边界偏移 —— 窗口 [start, start+draws) 因此与一次性分组及断点恢复的
+    # 同一窗口逐组逐项一致。draws=0 时结果必为空, 无需空转抽样。
+    total = sum(groups)
+    if draws > 0:
+        pool_weights = list(weights)
+        rng = random.Random(seed)
+        planned_weights, use_exact = _select_sampling_plan(pool_weights, total)
+        sequence = _draw_indices_once(n, planned_weights, total, rng, use_exact)
+    else:
+        sequence = []
+
+    def _groups():
+        # 按需逐组切出窗口内的连续切片; 全部确定性工作已在创建时完成,
+        # 迭代期间不会再抛出任何异常。
+        cursor = sum(groups[:start])
+        for size in groups[start:start + draws]:
+            yield sequence[cursor:cursor + size]
+            cursor += size
+
+    return _groups()
+
+
+def weighted_sample_partition_stream(
+    items, weights, group_sizes, draws, seed=0, start=0
+):
+    """weighted_sample_partition 的按需逐组入口, 规则与
+    weighted_sample_partition_stream_indices 完全一致(同一套创建时校验
+    与 draws/start 窗口语义), 区别仅在于每组按相同索引产出元素值列表;
+    与 weighted_sample_partition 在相同组窗口的结果逐组逐项一致(相同值
+    的不同位置仍按位置独立处理)。"""
+    index_stream = weighted_sample_partition_stream_indices(
+        items, weights, group_sizes, draws, seed, start
+    )
+    return ([items[i] for i in group_indices] for group_indices in index_stream)
+
+
+def weighted_sample_partition_counts(
+    items, weights, group_sizes, draws, seed=0, start=0
+):
+    """分组采样的批量频次入口: 直接按原始零基位置累计窗口内的选中次数,
+    免去调用方逐组遍历。
+
+    接受与 weighted_sample_partition_stream_indices 完全相同的 items、
+    weights、group_sizes、draws、seed、start 语义、固定校验顺序与异常
+    类别(全部校验在返回前完成), 按同一条由一次加权无放回抽样产生的位置
+    序列, 返回长度等于 items 的整数 list counts, counts[i] 即组窗口
+    [start, start+draws) 内位置 i 被选中的次数(整条序列无放回, 同一位置
+    在完整计划中至多出现一次, 因此每个计数非零即一; 相等的元素值仍按
+    不同位置分别累计)。结果等于把 weighted_sample_partition_stream_indices
+    同窗口的全部组按位置摊平计数, 也与一次性分组及断点恢复的同一窗口
+    逐项一致; 零权重位置与窗口外位置的计数始终为零。
+
+    draws=0 或全零组计划返回全零列表, 但仍完成全部校验; 任何失败都不
+    给出部分计数。计数为任意精度普通整数, 可直接交给 serialize_metrics
+    并经 deserialize_metrics 精确往返(全程不经过浮点)。不修改入参。
+    """
+    # 校验与窗口语义完全交给流式索引入口: 它返回时全部校验已完成, 此后
+    # len(items) 与迭代都不会再抛出异常; 计数因此与流式物化结果按构造
+    # 逐项一致。
+    index_stream = weighted_sample_partition_stream_indices(
+        items, weights, group_sizes, draws, seed, start
+    )
+    counts = [0] * len(items)
+    for group_indices in index_stream:
+        for position in group_indices:
+            counts[position] += 1
+    return counts
+
+
 # ---------------------------------------------------------------------------
 # 分层配额采样
 # ---------------------------------------------------------------------------
