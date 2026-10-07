@@ -158,6 +158,57 @@
         都不给出部分计数。计数为任意精度整数, 可直接交给
         serialize_metrics 并经 deserialize_metrics 精确往返。不修改入参
         与两个计划。
+    weighted_sample_plan_excluding_indices(items, weights_schedule,
+        k_schedule, excluded_schedule, draws, seed=0, start=0)
+        按轮权重、按轮样本数与按轮排除三者联合计划的批量入口: 三份计划
+        是等长的有限非文本序列, weights_schedule 每行与 items 等长,
+        k_schedule 成员均为非布尔非负整数且不超过 items 长度,
+        excluded_schedule 每行是该轮的排除位置序列(非文本且长度可确定,
+        成员为 items 零基范围内的非布尔整数, 按集合语义解释, 重复成员与
+        排列顺序不影响结果); 第 start+j 轮(零基)同时使用三份计划的第
+        start+j 行, 从所有位置去掉该轮排除集合后按权重无放回抽样。返回
+        draws 轮, 每轮是按抽样先后排列的零基原始索引; 每轮从该轮未排除
+        位置重新开始, 轮内无放回, 轮间恢复该轮位置池, 重复值按位置区分;
+        被排除位置与零权重位置永不出现。所有轮共享由 seed 初始化的一条
+        随机流; start 只跳过完整轮次并消耗与从 0 生成时相同的随机流,
+        结果与 start=0 的完整调用按零基区间 [start, start+draws) 切片
+        逐项一致, 样本数为零的轮次返回空列表且不消耗随机流; 排除行全部
+        为空时与 weighted_sample_plan_indices 同参逐轮逐项一致。校验
+        顺序固定为 items、weights_schedule、k_schedule、excluded_schedule、
+        seed、draws、start, 再检查行长度、计划等长、窗口范围、权重取值与
+        每一轮排除后的正权重可行性: 结构或成员类型错误抛 TypeError, 长度
+        不符、越界、负数、窗口越界、负权重、NaN、无穷或排除后正权重不足
+        抛 ValueError; draws=0 仍完成全部校验并返回空列表。不修改入参
+        与三份计划。
+    weighted_sample_plan_excluding(items, weights_schedule, k_schedule,
+        excluded_schedule, draws, seed=0, start=0)
+        与 weighted_sample_plan_excluding_indices 同规则(同一套校验顺序
+        与异常类别), 但每轮按相同索引返回元素值列表, 两个入口逐轮逐项
+        对应。
+    weighted_sample_plan_excluding_counts(items, weights_schedule,
+        k_schedule, excluded_schedule, draws, seed=0, start=0)
+        weighted_sample_plan_excluding_indices 的批量频次入口: 接受与该
+        入口相同的参数语义与固定校验顺序, 按同一随机流(每轮同一权重行、
+        同一样本数、同一排除集合与同一抽样计划)生成窗口内的轮次, 返回
+        长度等于 items 的整数 list counts, counts[i] 是零基区间
+        [start, start+draws) 中原始位置 i 被选中的次数(每轮无放回, 相等
+        的元素值仍按不同位置分别累计, 被排除位置始终为零)。结果等于把
+        weighted_sample_plan_excluding_indices 对应窗口的全部轮次按位置
+        摊平计数。draws=0 返回全零列表(仍完成全部校验), 任何失败都不
+        给出部分计数。计数为任意精度整数, 可直接交给 serialize_metrics
+        并经 deserialize_metrics 精确往返。不修改入参与三份计划。
+    weighted_sample_plan_excluding_stream_indices(items, weights_schedule,
+        k_schedule, excluded_schedule, draws, seed=0, start=0)
+        weighted_sample_plan_excluding_indices 的按需逐轮入口: 返回一个
+        可迭代对象, 调用方逐轮取得与批量入口完全一致的轮次, 不必一次
+        物化全部 draws 轮。全部参数与可行性校验都在创建时完成并当场抛出,
+        不会延迟到已经产出部分轮次之后; start 在迭代时按需跳过完整轮次,
+        样本数为零的轮次产出空列表且不消耗随机流。
+    weighted_sample_plan_excluding_stream(items, weights_schedule,
+        k_schedule, excluded_schedule, draws, seed=0, start=0)
+        与 weighted_sample_plan_excluding_stream_indices 同规则(同一套
+        创建时校验与 start 窗口语义), 但每轮按相同索引产出元素值列表,
+        与 weighted_sample_plan_excluding 逐轮对应。
     weighted_sample_k_schedule_checkpoint(items, weights, k_schedule,
         seed=0, start=0)
         创建按轮样本数计划采样会话的断点: 沿用 weighted_sample_k_schedule_
@@ -2236,6 +2287,345 @@ def weighted_sample_plan_counts(items, weights_schedule, k_schedule, draws,
                 ):
                     counts[position] += 1
     return counts
+
+
+def _validate_plan_excluding_inputs(
+    items, weights_schedule, k_schedule, excluded_schedule, draws, seed,
+    start
+):
+    """联合计划 + 按轮排除入口共用的全部前置校验, 返回 (n, pools)。
+
+    校验顺序固定: 先 items、weights_schedule 及其每一行的结构(非文本且
+    长度可确定的序列, TypeError), 再 k_schedule 的结构与每个成员的类型
+    (非布尔整数, TypeError), 然后 excluded_schedule 及其每一行的结构
+    (非文本且长度可确定的序列, TypeError)与每个排除成员(非布尔整数,
+    类型错误抛 TypeError, 越界位置抛 ValueError; 每行按集合语义解释,
+    重复成员与排列顺序不影响结果), 接着 seed、draws、start(非布尔非负
+    整数); 随后每一行权重长度与 items 一致、每个 k_schedule 成员落在
+    [0, n] 内、三份计划等长、窗口 [start, start+draws) 不超出计划范围
+    (ValueError); 接着对每一行权重做与单轮入口完全相同的元素类型
+    (TypeError)与取值(ValueError)校验; 最后对每一轮做排除后的正权重
+    可行性检查(第 j 轮样本数 k_schedule[j] 超过第 j 行未排除位置的正
+    权重个数时抛 ValueError)。全部校验在产生任何一轮之前完成, draws=0
+    也不例外; 不修改入参与三份计划。
+
+    通过后返回 (n, pools): n 为位置总数, pools[j] 是第 j 轮按原始顺序
+    保留的未排除位置(携带原始零基索引), 供各入口按行复制权重并选择
+    抽样计划。
+    """
+    # ---- 1. 结构与参数类型 (TypeError) ----
+    if not _is_length_determinable_sequence(items):
+        raise TypeError("items must be a length-determinable sequence")
+    if not _is_length_determinable_sequence(weights_schedule):
+        raise TypeError(
+            "weights_schedule must be a length-determinable sequence"
+        )
+    for row in weights_schedule:
+        if not _is_length_determinable_sequence(row):
+            raise TypeError(
+                "weights_schedule rows must be length-determinable sequences"
+            )
+    if not _is_length_determinable_sequence(k_schedule):
+        raise TypeError("k_schedule must be a length-determinable sequence")
+    for member in k_schedule:
+        if isinstance(member, bool) or not isinstance(member, int):
+            raise TypeError(
+                "k_schedule members must be non-boolean integers"
+            )
+    if not _is_length_determinable_sequence(excluded_schedule):
+        raise TypeError(
+            "excluded_schedule must be a length-determinable sequence"
+        )
+    n = len(items)
+    excluded_sets = []
+    for row in excluded_schedule:
+        # 每一行排除集合与固定排除入口同一套规则: 非文本且长度可确定的
+        # 序列(TypeError), 成员为非布尔整数(TypeError)且在 items 零基
+        # 范围内(ValueError); 按集合语义解释, 重复成员与排列顺序忽略。
+        excluded_sets.append(_validate_excluded_positions(row, n))
+    if not isinstance(seed, _SEED_TYPES):
+        raise TypeError("unsupported seed type: %s" % type(seed).__name__)
+    _validate_draws(draws)
+    _validate_start(start)
+
+    # ---- 2. 行长度、计划成员取值、计划等长与窗口范围 (ValueError) ----
+    for row in weights_schedule:
+        if len(row) != n:
+            raise ValueError("invalid sample size")
+    for member in k_schedule:
+        if member < 0 or member > n:
+            raise ValueError("invalid sample size")
+    if len(weights_schedule) != len(k_schedule) or \
+            len(excluded_schedule) != len(k_schedule):
+        raise ValueError("schedule length mismatch")
+    if start + draws > len(k_schedule):
+        raise ValueError("schedule window out of range")
+
+    # ---- 3. 每一行的权重元素类型与取值 (TypeError / ValueError) ----
+    for row in weights_schedule:
+        _validate_weight_elements(row)
+
+    # ---- 4. 每一轮排除后的正权重可行性 (ValueError) ----
+    # 第 j 轮以 weights_schedule[j] 在未排除位置上的投影抽取
+    # k_schedule[j] 个位置: 任一轮的样本数超过该轮未排除位置中的正权重
+    # 个数都在产生任何一轮之前确定抛 ValueError; 样本数为零的轮次即使
+    # 全部位置被排除或权重全为零也始终合法。
+    pools = [
+        [i for i in range(n) if i not in excluded_sets[j]]
+        for j in range(len(excluded_sets))
+    ]
+    for j, row in enumerate(weights_schedule):
+        if k_schedule[j] > _count_positive_weights(
+            [row[i] for i in pools[j]]
+        ):
+            raise ValueError("no positive weight")
+    return n, pools
+
+
+def weighted_sample_plan_excluding_indices(
+    items, weights_schedule, k_schedule, excluded_schedule, draws, seed=0,
+    start=0
+):
+    """按轮权重、按轮样本数与按轮排除三者联合计划的批量入口: 第
+    start+j 轮(零基)同时使用 weights_schedule[start+j] 的权重行、
+    k_schedule[start+j] 的样本数与 excluded_schedule[start+j] 的排除
+    集合, 从所有位置去掉该轮排除集合后按权重无放回抽样。
+
+    weights_schedule 是有限非文本序列, 成员均为与 items 等长的权重
+    序列; k_schedule 是等长的有限非文本序列, 成员均为非布尔非负整数
+    且不超过 items 长度; excluded_schedule 是等长的有限非文本序列,
+    成员均为排除位置序列(非文本且长度可确定, 成员为 items 零基范围内
+    的非布尔整数, 每行按集合语义解释, 重复成员与排列顺序不影响结果)。
+    返回长度等于 draws 的外层 list, 每个元素是一轮按抽样先后排列的
+    零基原始索引。每轮都从该轮未排除位置重新开始(同一轮内位置最多
+    出现一次, 轮次之间恢复该轮的位置池, 重复值按位置区分); 被排除的
+    位置即使权重为正也绝不出现, 未排除的零权重位置仍永不入选。所有
+    轮次共享同一个由 seed 初始化的随机流。三份计划的排除行都为空时
+    与 weighted_sample_plan_indices 同参调用逐轮逐项一致。
+
+    可选的 start(默认 0)表示先从该 seed 对应的轮次流开始跳过 start 个
+    完整轮次 —— 被跳过的第 j 轮同样按 weights_schedule[j] 的权重、
+    k_schedule[j] 的样本数与 excluded_schedule[j] 的排除集合消耗同一条
+    确定性随机流, 不改变任何选择规则 —— 再生成 draws 轮; 结果与
+    start=0 的完整调用按零基区间 [start, start+draws) 切片逐项一致。
+    样本数为零的轮次返回空列表且不消耗随机流。
+
+    校验顺序固定为 items、weights_schedule、k_schedule、
+    excluded_schedule、seed、draws、start, 随后检查行长度、计划等长、
+    窗口范围、权重取值与每一轮排除后的正权重可行性: 结构或成员类型、
+    seed、draws、start 的类型错误统一抛 TypeError, 长度不符、计划成员
+    或排除位置越界、负数、窗口越界、负权重、NaN、无穷权重, 或任一轮
+    排除后正权重不足统一抛 ValueError。权重元素规则与既有入口相同
+    (非布尔 int、有限非负 float、Fraction、Decimal, 可混合; 超大整数、
+    Fraction、Decimal 全程不经过浮点)。全部校验在返回任何轮次前完成,
+    失败绝不返回部分结果 —— 即使 draws=0 也不例外; draws=0 返回空
+    list。seed=None 保留现有随机语义。不修改入参与三份计划。
+    """
+    n, pools = _validate_plan_excluding_inputs(
+        items, weights_schedule, k_schedule, excluded_schedule, draws,
+        seed, start
+    )
+
+    # draws=0: 全部校验已在上面完成, 直接返回空结果, 不消耗随机流。
+    if draws == 0:
+        return []
+
+    rng = random.Random(seed)
+    # 窗口 [0, start+draws) 内每一轮(含被跳过的轮次)都按自己那一行的
+    # 权重在该轮未排除位置上的投影与自己那一项的样本数选择抽样计划:
+    # 每轮复制一份权重, 绝不修改任何计划; 被跳过的第 j 轮同样按第 j 轮
+    # 的计划消耗随机流, 因此跳过 start 个完整轮次与从 0 生成时消耗的
+    # 随机流完全相同。排除行全部为空时 pools[j] 即 range(n)、投影即该行
+    # 复制, 与 weighted_sample_plan_indices 的随机流消耗和结果逐项一致。
+    plans = [
+        _select_sampling_plan(
+            [weights_schedule[j][i] for i in pools[j]], k_schedule[j]
+        )
+        for j in range(start + draws)
+    ]
+
+    # 先跳过 start 个完整轮次: 与完整序列消耗同一条确定性随机流。样本数
+    # 为零的轮次不消耗随机流, 无需空转 —— 与既有批量入口同一节奏。
+    for j in range(start):
+        if k_schedule[j] > 0:
+            planned_weights, use_exact = plans[j]
+            _draw_indices_once_pool(
+                pools[j], planned_weights, k_schedule[j], rng, use_exact
+            )
+
+    rounds = []
+    for j in range(start, start + draws):
+        planned_weights, use_exact = plans[j]
+        rounds.append(
+            _draw_indices_once_pool(
+                pools[j], planned_weights, k_schedule[j], rng, use_exact
+            )
+        )
+    return rounds
+
+
+def weighted_sample_plan_excluding(
+    items, weights_schedule, k_schedule, excluded_schedule, draws, seed=0,
+    start=0
+):
+    """weighted_sample_plan_excluding_indices 的元素值入口: 规则、校验
+    顺序与异常类别完全一致, 区别仅在于每轮按相同索引返回元素值列表;
+    两个入口逐轮逐项对应(相同值的不同位置仍按位置独立处理)。
+    """
+    rounds = weighted_sample_plan_excluding_indices(
+        items, weights_schedule, k_schedule, excluded_schedule, draws,
+        seed, start
+    )
+    return [[items[i] for i in round_indices] for round_indices in rounds]
+
+
+def weighted_sample_plan_excluding_counts(
+    items, weights_schedule, k_schedule, excluded_schedule, draws, seed=0,
+    start=0
+):
+    """weighted_sample_plan_excluding_indices 的批量频次入口: 直接按
+    原始零基位置累计窗口内的选中次数, 免去调用方逐轮遍历。
+
+    接受与 weighted_sample_plan_excluding_indices 完全相同的 items、
+    weights_schedule、k_schedule、excluded_schedule、draws、seed、
+    start 语义与固定校验顺序, 按同一条由 seed 初始化的随机流先生成
+    (并跳过)start 个完整轮次, 再生成 draws 轮; 返回长度等于 items 的
+    list, counts[i] 即零基区间 [start, start+draws) 内位置 i 被选中的
+    总次数(每轮无放回, 同一位置每轮至多计一次; 相等的元素值仍按不同
+    位置分别累计)。任何一轮被排除的位置计数始终为零(即使其权重为
+    正), 未排除的零权重位置仍永不入选。因此对相同输入, 本入口与逐轮
+    调用 weighted_sample_plan_excluding_indices 后再按位置摊平计数
+    逐项一致 —— 同一随机流、每轮同一权重行、同一样本数、同一排除
+    集合与同一抽样计划; 样本数为零的轮次的随机流消耗与对应索引入口
+    逐项对齐。
+
+    draws=0 返回全零列表(仍完成全部校验); 任一轮排除后正权重不足、
+    行长不符、计划不等长、窗口越界、负权重、NaN 或无穷权重都在返回
+    列表前抛 TypeError / ValueError。全部失败都不返回部分计数。计数
+    为任意精度整数, 可直接交给 serialize_metrics 并经
+    deserialize_metrics 精确往返。不修改入参与三份计划。
+    """
+    n, pools = _validate_plan_excluding_inputs(
+        items, weights_schedule, k_schedule, excluded_schedule, draws,
+        seed, start
+    )
+
+    counts = [0] * n
+    # draws=0: 全部校验已在上面完成, 直接返回全零列表, 不消耗随机流。
+    if draws == 0:
+        return counts
+
+    rng = random.Random(seed)
+    # 与 weighted_sample_plan_excluding_indices 完全相同的计划选择、
+    # 跳过与生成节奏: 窗口 [0, start+draws) 内每一轮(含被跳过的轮次)
+    # 都按自己那一行的权重在该轮未排除位置上的投影选择抽样计划, 每轮
+    # 复制一份权重, 绝不修改任何计划; 样本数为零的轮次不消耗随机流,
+    # draws=0 已提前返回 —— 计数入口与索引入口的随机流消耗因此逐项
+    # 对齐。抽样器只返回该轮未排除的原始位置, 被排除位置在 counts 中
+    # 自然始终保持为零。
+    plans = [
+        _select_sampling_plan(
+            [weights_schedule[j][i] for i in pools[j]], k_schedule[j]
+        )
+        for j in range(start + draws)
+    ]
+    for j in range(start):
+        if k_schedule[j] > 0:
+            planned_weights, use_exact = plans[j]
+            _draw_indices_once_pool(
+                pools[j], planned_weights, k_schedule[j], rng, use_exact
+            )
+    for j in range(start, start + draws):
+        if k_schedule[j] > 0:
+            planned_weights, use_exact = plans[j]
+            for position in _draw_indices_once_pool(
+                pools[j], planned_weights, k_schedule[j], rng, use_exact
+            ):
+                counts[position] += 1
+    return counts
+
+
+def weighted_sample_plan_excluding_stream_indices(
+    items, weights_schedule, k_schedule, excluded_schedule, draws, seed=0,
+    start=0
+):
+    """weighted_sample_plan_excluding_indices 的按需逐轮入口。
+
+    返回一个可迭代对象, 每次迭代产出一轮按抽样先后排列的零基原始索引
+    列表, 共 draws 轮; 对相同输入和种子, 转成列表后与
+    weighted_sample_plan_excluding_indices(...) 的全部轮次完全一致
+    (第 start+j 轮同时使用 weights_schedule[start+j] 的权重行、
+    k_schedule[start+j] 的样本数与 excluded_schedule[start+j] 的排除
+    集合)。每轮都从该轮未排除位置重新开始, 轮内不放回, 轮间恢复该轮
+    的位置池, 重复值按位置区分; 被排除位置与零权重位置永不出现。
+
+    可选的 start(默认 0)与批量入口语义相同: 迭代时先从该 seed 对应的
+    轮次流按需跳过 start 个完整轮次(被跳过的第 j 轮同样按该轮的权重
+    行、样本数与排除集合消耗同一条确定性随机流), 再逐轮产出 draws 轮;
+    转成列表后与 start=0 的完整结果按零基区间 [start, start+draws)
+    切片逐项一致, start 不改变后续随机序列。
+
+    与批量入口不同, 轮次在调用方消费时才逐轮生成, 长批次不必一次物化;
+    但全部校验(items / weights_schedule / k_schedule / excluded_schedule
+    及各自每一行的结构与成员类型、seed、draws / start 类型与取值、行长、
+    计划等长、窗口范围、权重 NaN / 无穷 / 负数、每一轮排除后的正权重
+    可行性)都在创建时完成 —— 非法输入在调用当场抛出稳定的 TypeError /
+    ValueError, 绝不会延迟到已经产出部分轮次之后; draws=0 或零样本
+    轮次也不省略任何校验。draws=0 时返回不产出元素的迭代对象; 样本数
+    为零的轮次产出空列表且不消耗随机流。不修改入参与三份计划。
+    """
+    n, pools = _validate_plan_excluding_inputs(
+        items, weights_schedule, k_schedule, excluded_schedule, draws,
+        seed, start
+    )
+
+    rng = random.Random(seed)
+    # 与批量入口完全相同的计划选择: 窗口 [0, start+draws) 内每一轮(含
+    # 被跳过的轮次)都按自己那一行的权重在该轮未排除位置上的投影选择
+    # 抽样计划, 每轮复制一份权重, 绝不修改任何计划。draws=0 时 plans
+    # 覆盖 [0, start), 仅用于跳过, 迭代器本身不产出任何元素。
+    plans = [
+        _select_sampling_plan(
+            [weights_schedule[j][i] for i in pools[j]], k_schedule[j]
+        )
+        for j in range(start + draws)
+    ]
+
+    def _rounds():
+        # 按需跳过 start 个完整轮次: 与完整序列消耗同一条确定性随机流。
+        # 样本数为零的轮次不消耗随机流, draws=0 时跳过与否不影响空结果,
+        # 两种情形都无需空转 —— 与既有流式入口同一节奏。
+        if draws > 0:
+            for j in range(start):
+                if k_schedule[j] > 0:
+                    planned_weights, use_exact = plans[j]
+                    _draw_indices_once_pool(
+                        pools[j], planned_weights, k_schedule[j], rng,
+                        use_exact
+                    )
+        for j in range(start, start + draws):
+            planned_weights, use_exact = plans[j]
+            yield _draw_indices_once_pool(
+                pools[j], planned_weights, k_schedule[j], rng, use_exact
+            )
+
+    return _rounds()
+
+
+def weighted_sample_plan_excluding_stream(
+    items, weights_schedule, k_schedule, excluded_schedule, draws, seed=0,
+    start=0
+):
+    """weighted_sample_plan_excluding 的按需逐轮入口, 规则与
+    weighted_sample_plan_excluding_stream_indices 完全一致(同一套
+    创建时校验与 start 窗口语义), 区别仅在于每轮按相同索引产出元素值
+    列表; 与 weighted_sample_plan_excluding 的逐轮结果完全一致。
+    """
+    index_stream = weighted_sample_plan_excluding_stream_indices(
+        items, weights_schedule, k_schedule, excluded_schedule, draws,
+        seed, start
+    )
+    return ([items[i] for i in round_indices] for round_indices in index_stream)
 
 
 def weighted_sample_counts(items, weights, k, draws, seed=0, start=0):

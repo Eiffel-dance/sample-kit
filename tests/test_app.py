@@ -41,6 +41,11 @@ from app import (
     weighted_sample_plan_checkpoint,
     weighted_sample_plan_resume_indices,
     weighted_sample_plan_resume,
+    weighted_sample_plan_excluding_indices,
+    weighted_sample_plan_excluding,
+    weighted_sample_plan_excluding_counts,
+    weighted_sample_plan_excluding_stream_indices,
+    weighted_sample_plan_excluding_stream,
     weighted_sample_partition_indices,
     weighted_sample_partition,
     weighted_sample_partition_checkpoint,
@@ -13923,6 +13928,466 @@ class WeightedSampleStratifiedExcludingScheduleCheckpointTest(unittest.TestCase)
             weighted_sample_stratified_schedule_resume_indices(
                 self.ITEMS, self.WEIGHTS, self.STRATA, self.SCHEDULE,
                 mine, 1)
+
+
+class WeightedSamplePlanExcludingTest(unittest.TestCase):
+    """按轮权重、按轮样本数与按轮排除三者联合计划的入口:
+    weighted_sample_plan_excluding_indices / weighted_sample_plan_excluding /
+    weighted_sample_plan_excluding_counts /
+    weighted_sample_plan_excluding_stream_indices /
+    weighted_sample_plan_excluding_stream。"""
+
+    ITEMS = list("aabbcc")
+    WEIGHTS_SCHEDULE = [
+        [1, 2, 3, 0, 1, 2],
+        [2, 2, 2, 2, 2, 2],
+        [Fraction(1, 2), 1, 0, 3, 2, 1],
+        [1, 1, 1, 1, 1, 1],
+        [Decimal("0.5"), 2, 1, 0, 1, 3],
+    ]
+    K_SCHEDULE = [2, 0, 3, 1, 2]
+    EXCLUDED_SCHEDULE = [[], [0, 2], [1], [0, 0, 5], [3]]
+    SEED = 7
+
+    def _full(self):
+        return weighted_sample_plan_excluding_indices(
+            self.ITEMS, self.WEIGHTS_SCHEDULE, self.K_SCHEDULE,
+            self.EXCLUDED_SCHEDULE, len(self.K_SCHEDULE), self.SEED)
+
+    def test_outer_shape_and_round_lengths(self):
+        rounds = self._full()
+        self.assertEqual(len(rounds), len(self.K_SCHEDULE))
+        for j, round_indices in enumerate(rounds):
+            self.assertEqual(len(round_indices), self.K_SCHEDULE[j])
+            self.assertEqual(len(set(round_indices)), len(round_indices))
+            for position in round_indices:
+                self.assertIn(position, range(len(self.ITEMS)))
+
+    def test_excluded_and_zero_weight_positions_never_chosen(self):
+        rounds = self._full()
+        for j, round_indices in enumerate(rounds):
+            for position in round_indices:
+                self.assertNotIn(position, set(self.EXCLUDED_SCHEDULE[j]))
+        # 第 0 行位置 3 权重为零且未被排除, 仍永不入选; 第 1 轮样本数为
+        # 零, 为空列表。
+        self.assertNotIn(3, rounds[0])
+        self.assertEqual(rounds[1], [])
+        # 被排除位置即使权重为正也绝不出现: 第 2 轮排除位置 1(权重为 1)。
+        self.assertNotIn(1, rounds[2])
+
+    def test_exclusion_rows_use_set_semantics(self):
+        # 重复成员与排列顺序不影响结果。
+        reordered = [[], [2, 0, 0], [1, 1], [5, 0], [3, 3]]
+        self.assertEqual(
+            weighted_sample_plan_excluding_indices(
+                self.ITEMS, self.WEIGHTS_SCHEDULE, self.K_SCHEDULE,
+                reordered, len(self.K_SCHEDULE), self.SEED),
+            self._full(),
+        )
+
+    def test_values_entry_corresponds_round_by_round(self):
+        index_rounds = self._full()
+        value_rounds = weighted_sample_plan_excluding(
+            self.ITEMS, self.WEIGHTS_SCHEDULE, self.K_SCHEDULE,
+            self.EXCLUDED_SCHEDULE, len(self.K_SCHEDULE), self.SEED)
+        self.assertEqual(
+            value_rounds,
+            [[self.ITEMS[i] for i in round_indices]
+             for round_indices in index_rounds],
+        )
+
+    def test_duplicate_values_distinct_positions(self):
+        rounds = weighted_sample_plan_excluding_indices(
+            ["x", "x", "x"], [[1, 1, 1]] * 3, [3, 3, 3],
+            [[], [], []], 3, seed=5)
+        for round_indices in rounds:
+            self.assertEqual(sorted(round_indices), [0, 1, 2])
+
+    def test_start_equals_slice_of_full_run(self):
+        full = self._full()
+        total = len(self.K_SCHEDULE)
+        for start in range(total + 1):
+            for draws in range(0, total - start + 1):
+                with self.subTest(start=start, draws=draws):
+                    self.assertEqual(
+                        weighted_sample_plan_excluding_indices(
+                            self.ITEMS, self.WEIGHTS_SCHEDULE,
+                            self.K_SCHEDULE, self.EXCLUDED_SCHEDULE,
+                            draws, self.SEED, start),
+                        full[start:start + draws],
+                    )
+
+    def test_same_seed_same_result(self):
+        self.assertEqual(self._full(), self._full())
+
+    def test_empty_excluded_rows_match_plan_entry(self):
+        empty_rows = [[] for _ in self.K_SCHEDULE]
+        self.assertEqual(
+            weighted_sample_plan_excluding_indices(
+                self.ITEMS, self.WEIGHTS_SCHEDULE, self.K_SCHEDULE,
+                empty_rows, len(self.K_SCHEDULE), self.SEED),
+            weighted_sample_plan_indices(
+                self.ITEMS, self.WEIGHTS_SCHEDULE, self.K_SCHEDULE,
+                len(self.K_SCHEDULE), self.SEED),
+        )
+
+    def test_uniform_plans_match_many_excluding_entry(self):
+        # 权重各行相同、样本数各项相同且排除行相同时, 与固定排除批量入口
+        # 逐轮一致。
+        uniform_rows = [[1, 2, 3, 0, 1, 2]] * 4
+        uniform_ks = [2] * 4
+        uniform_excluded = [[0, 4]] * 4
+        self.assertEqual(
+            weighted_sample_plan_excluding_indices(
+                self.ITEMS, uniform_rows, uniform_ks, uniform_excluded,
+                4, seed=3),
+            weighted_sample_many_excluding_indices(
+                self.ITEMS, uniform_rows[0], 2, [0, 4], 4, seed=3),
+        )
+
+    def test_uniform_excluded_matches_excluding_schedule_entry(self):
+        uniform_ks = [2] * len(self.K_SCHEDULE)
+        uniform_excluded = [[1]] * len(self.K_SCHEDULE)
+        self.assertEqual(
+            weighted_sample_plan_excluding_indices(
+                self.ITEMS, self.WEIGHTS_SCHEDULE, uniform_ks,
+                uniform_excluded, len(uniform_ks), self.SEED),
+            weighted_sample_excluding_schedule_indices(
+                self.ITEMS, self.WEIGHTS_SCHEDULE, 2, [1],
+                len(uniform_ks), self.SEED),
+        )
+
+    def test_uniform_rows_excluded_match_excluding_k_schedule_entry(self):
+        uniform_rows = [[1, 2, 3, 0, 1, 2]] * len(self.K_SCHEDULE)
+        uniform_excluded = [[2]] * len(self.K_SCHEDULE)
+        self.assertEqual(
+            weighted_sample_plan_excluding_indices(
+                self.ITEMS, uniform_rows, self.K_SCHEDULE,
+                uniform_excluded, len(self.K_SCHEDULE), self.SEED),
+            weighted_sample_excluding_k_schedule_indices(
+                self.ITEMS, uniform_rows[0], self.K_SCHEDULE, [2],
+                len(self.K_SCHEDULE), self.SEED),
+        )
+
+    def test_counts_match_flattened_index_rounds(self):
+        full = self._full()
+        total = len(self.K_SCHEDULE)
+        for start in range(total + 1):
+            for draws in range(0, total - start + 1):
+                with self.subTest(start=start, draws=draws):
+                    counts = weighted_sample_plan_excluding_counts(
+                        self.ITEMS, self.WEIGHTS_SCHEDULE,
+                        self.K_SCHEDULE, self.EXCLUDED_SCHEDULE,
+                        draws, self.SEED, start)
+                    flat = [0] * len(self.ITEMS)
+                    for round_indices in full[start:start + draws]:
+                        for position in round_indices:
+                            flat[position] += 1
+                    self.assertEqual(counts, flat)
+
+    def test_counts_zero_for_always_excluded_positions(self):
+        excluded_rows = [[3]] * len(self.K_SCHEDULE)
+        counts = weighted_sample_plan_excluding_counts(
+            self.ITEMS, self.WEIGHTS_SCHEDULE, self.K_SCHEDULE,
+            excluded_rows, len(self.K_SCHEDULE), self.SEED)
+        self.assertEqual(counts[3], 0)
+        self.assertEqual(sum(counts), sum(self.K_SCHEDULE))
+
+    def test_counts_are_exact_integers_and_serialize_roundtrip(self):
+        counts = weighted_sample_plan_excluding_counts(
+            self.ITEMS, self.WEIGHTS_SCHEDULE, self.K_SCHEDULE,
+            self.EXCLUDED_SCHEDULE, len(self.K_SCHEDULE), self.SEED)
+        self.assertTrue(all(isinstance(c, int) for c in counts))
+        self.assertEqual(
+            deserialize_metrics(serialize_metrics(counts)), counts)
+
+    def test_index_rounds_serialize_roundtrip(self):
+        rounds = self._full()
+        self.assertEqual(
+            deserialize_metrics(serialize_metrics(rounds)), rounds)
+
+    def test_draws_zero_returns_empty_after_full_validation(self):
+        self.assertEqual(
+            weighted_sample_plan_excluding_indices(
+                self.ITEMS, self.WEIGHTS_SCHEDULE, self.K_SCHEDULE,
+                self.EXCLUDED_SCHEDULE, 0, self.SEED), [])
+        self.assertEqual(
+            weighted_sample_plan_excluding(
+                self.ITEMS, self.WEIGHTS_SCHEDULE, self.K_SCHEDULE,
+                self.EXCLUDED_SCHEDULE, 0, self.SEED), [])
+        self.assertEqual(
+            weighted_sample_plan_excluding_counts(
+                self.ITEMS, self.WEIGHTS_SCHEDULE, self.K_SCHEDULE,
+                self.EXCLUDED_SCHEDULE, 0, self.SEED),
+            [0] * len(self.ITEMS))
+        self.assertEqual(
+            list(weighted_sample_plan_excluding_stream_indices(
+                self.ITEMS, self.WEIGHTS_SCHEDULE, self.K_SCHEDULE,
+                self.EXCLUDED_SCHEDULE, 0, self.SEED)), [])
+        # draws=0 仍完成全部校验。
+        with self.assertRaises(ValueError):
+            weighted_sample_plan_excluding_indices(
+                self.ITEMS, self.WEIGHTS_SCHEDULE, self.K_SCHEDULE,
+                self.EXCLUDED_SCHEDULE, 0, self.SEED,
+                len(self.K_SCHEDULE) + 1)
+        with self.assertRaises(TypeError):
+            weighted_sample_plan_excluding_indices(
+                self.ITEMS, self.WEIGHTS_SCHEDULE, self.K_SCHEDULE,
+                "not-seq", 0, self.SEED)
+        with self.assertRaises(ValueError):
+            weighted_sample_plan_excluding_counts(
+                self.ITEMS, [[0] * len(self.ITEMS)] * len(self.K_SCHEDULE),
+                [1] * len(self.K_SCHEDULE),
+                self.EXCLUDED_SCHEDULE, 0, self.SEED)
+
+    def test_structure_errors_raise_type_error(self):
+        ws = self.WEIGHTS_SCHEDULE
+        ks = self.K_SCHEDULE
+        xs = self.EXCLUDED_SCHEDULE
+        with self.assertRaises(TypeError):
+            weighted_sample_plan_excluding_indices("aabbcc", ws, ks, xs, 1)
+        with self.assertRaises(TypeError):
+            weighted_sample_plan_excluding_indices(
+                self.ITEMS, "not-seq", ks, xs, 1)
+        with self.assertRaises(TypeError):
+            weighted_sample_plan_excluding_indices(
+                self.ITEMS, [1, 2], ks[:2], xs[:2], 1)
+        with self.assertRaises(TypeError):
+            weighted_sample_plan_excluding_indices(
+                self.ITEMS, ws, "ks", xs, 1)
+        with self.assertRaises(TypeError):
+            weighted_sample_plan_excluding_indices(
+                self.ITEMS, ws, [1.5] * 5, xs, 1)
+        with self.assertRaises(TypeError):
+            weighted_sample_plan_excluding_indices(
+                self.ITEMS, ws, [True] * 5, xs, 1)
+        with self.assertRaises(TypeError):
+            weighted_sample_plan_excluding_indices(
+                self.ITEMS, ws, ks, "xs", 1)
+        with self.assertRaises(TypeError):
+            weighted_sample_plan_excluding_indices(
+                self.ITEMS, ws, ks, [1, 2, 3, 4, 5], 1)
+        with self.assertRaises(TypeError):
+            weighted_sample_plan_excluding_indices(
+                self.ITEMS, ws, ks, [[0.5]] * 5, 1)
+        with self.assertRaises(TypeError):
+            weighted_sample_plan_excluding_indices(
+                self.ITEMS, ws, ks, [[True]] * 5, 1)
+        with self.assertRaises(TypeError):
+            weighted_sample_plan_excluding_indices(
+                self.ITEMS, ws, ks, xs, 1.5)
+        with self.assertRaises(TypeError):
+            weighted_sample_plan_excluding_indices(
+                self.ITEMS, ws, ks, xs, True)
+        with self.assertRaises(TypeError):
+            weighted_sample_plan_excluding_indices(
+                self.ITEMS, ws, ks, xs, 1, 0, 1.5)
+        with self.assertRaises(TypeError):
+            weighted_sample_plan_excluding_indices(
+                self.ITEMS, ws, ks, xs, 1, object())
+        with self.assertRaises(TypeError):
+            weighted_sample_plan_excluding_indices(
+                self.ITEMS, [[True] * 6] * 5, ks, xs, 1)
+        with self.assertRaises(TypeError):
+            weighted_sample_plan_excluding_indices(
+                self.ITEMS, [["x"] * 6] * 5, ks, xs, 1)
+
+    def test_value_errors(self):
+        ws = self.WEIGHTS_SCHEDULE
+        ks = self.K_SCHEDULE
+        xs = self.EXCLUDED_SCHEDULE
+        n = len(self.ITEMS)
+        # 负 draws / 负 start / 窗口越界。
+        with self.assertRaises(ValueError):
+            weighted_sample_plan_excluding_indices(
+                self.ITEMS, ws, ks, xs, -1)
+        with self.assertRaises(ValueError):
+            weighted_sample_plan_excluding_indices(
+                self.ITEMS, ws, ks, xs, 1, 0, -1)
+        with self.assertRaises(ValueError):
+            weighted_sample_plan_excluding_indices(
+                self.ITEMS, ws, ks, xs, len(ks) + 1)
+        with self.assertRaises(ValueError):
+            weighted_sample_plan_excluding_indices(
+                self.ITEMS, ws, ks, xs, 2, 0, len(ks) - 1)
+        # 三份计划不等长。
+        with self.assertRaises(ValueError):
+            weighted_sample_plan_excluding_indices(
+                self.ITEMS, ws, ks + [1], xs, 1)
+        with self.assertRaises(ValueError):
+            weighted_sample_plan_excluding_indices(
+                self.ITEMS, ws + [ws[0]], ks, xs, 1)
+        with self.assertRaises(ValueError):
+            weighted_sample_plan_excluding_indices(
+                self.ITEMS, ws, ks, xs + [[]], 1)
+        # 行长度不等于 items。
+        with self.assertRaises(ValueError):
+            weighted_sample_plan_excluding_indices(
+                self.ITEMS, [[1, 2]] * 5, ks, xs, 1)
+        # 计划成员为负或超过位置数。
+        with self.assertRaises(ValueError):
+            weighted_sample_plan_excluding_indices(
+                self.ITEMS, ws, [-1] * 5, xs, 1)
+        with self.assertRaises(ValueError):
+            weighted_sample_plan_excluding_indices(
+                self.ITEMS, ws, [n + 1] * 5, xs, 1)
+        # 排除位置越界。
+        with self.assertRaises(ValueError):
+            weighted_sample_plan_excluding_indices(
+                self.ITEMS, ws, ks, [[n]] * 5, 1)
+        with self.assertRaises(ValueError):
+            weighted_sample_plan_excluding_indices(
+                self.ITEMS, ws, ks, [[-1]] * 5, 1)
+        # 负权重 / NaN / 无穷。
+        with self.assertRaises(ValueError):
+            weighted_sample_plan_excluding_indices(
+                self.ITEMS, [[-1] * n] * 5, ks, xs, 1)
+        with self.assertRaises(ValueError):
+            weighted_sample_plan_excluding_indices(
+                self.ITEMS, [[float("nan")] * n] * 5, ks, xs, 1)
+        with self.assertRaises(ValueError):
+            weighted_sample_plan_excluding_indices(
+                self.ITEMS, [[float("inf")] * n] * 5, ks, xs, 1)
+        # 排除后正权重不足。
+        with self.assertRaises(ValueError):
+            weighted_sample_plan_excluding_indices(
+                self.ITEMS, [[0] * n] * 5, [1, 0, 0, 0, 0],
+                [[]] * 5, 1)
+        with self.assertRaises(ValueError):
+            weighted_sample_plan_excluding_indices(
+                self.ITEMS, [[1, 1, 0, 0, 0, 0]] * 5, [1, 0, 0, 0, 0],
+                [[0, 1]] * 5, 1)
+        with self.assertRaises(ValueError):
+            weighted_sample_plan_excluding_indices(
+                self.ITEMS, [[1, 0, 0, 0, 0, 0]] * 5, [1, 0, 0, 0, 0],
+                [[0]] * 5, 1)
+
+    def test_validation_order_is_fixed(self):
+        ws = self.WEIGHTS_SCHEDULE
+        ks = self.K_SCHEDULE
+        xs = self.EXCLUDED_SCHEDULE
+        # items 结构错误先于 weights_schedule 结构错误。
+        with self.assertRaises(TypeError):
+            weighted_sample_plan_excluding_indices(
+                "aabbcc", "not-seq", "ks", "xs", 1, object())
+        # weights_schedule 结构错误先于 k_schedule 结构错误。
+        with self.assertRaises(TypeError):
+            weighted_sample_plan_excluding_indices(
+                self.ITEMS, "not-seq", "ks", "xs", 1, object())
+        # k_schedule 结构错误先于 excluded_schedule 结构错误。
+        with self.assertRaises(TypeError):
+            weighted_sample_plan_excluding_indices(
+                self.ITEMS, ws, "ks", "xs", 1, object())
+        # excluded_schedule 结构错误先于 seed 类型错误。
+        with self.assertRaises(TypeError):
+            weighted_sample_plan_excluding_indices(
+                self.ITEMS, ws, ks, "xs", 1, object())
+        # 排除位置越界(ValueError)先于 seed 类型错误。
+        with self.assertRaises(ValueError):
+            weighted_sample_plan_excluding_indices(
+                self.ITEMS, ws, ks, [[len(self.ITEMS)]] * 5, 1, object())
+        # seed 类型错误先于 draws 类型错误。
+        with self.assertRaises(TypeError):
+            weighted_sample_plan_excluding_indices(
+                self.ITEMS, ws, ks, xs, 1.5, object())
+        # draws 类型错误先于 start 类型错误。
+        with self.assertRaises(TypeError):
+            weighted_sample_plan_excluding_indices(
+                self.ITEMS, ws, ks, xs, 1.5, 0, 1.5)
+
+    def test_zero_k_rounds_do_not_consume_rng(self):
+        # 全零样本数计划: 任意窗口都只产出空轮次, 跳轮不消耗随机流。
+        zero_ks = [0] * 5
+        full = weighted_sample_plan_excluding_indices(
+            self.ITEMS, self.WEIGHTS_SCHEDULE, zero_ks,
+            self.EXCLUDED_SCHEDULE, 5, seed=11)
+        self.assertEqual(full, [[]] * 5)
+        shifted = weighted_sample_plan_excluding_indices(
+            self.ITEMS, self.WEIGHTS_SCHEDULE, zero_ks,
+            self.EXCLUDED_SCHEDULE, 2, seed=11, start=3)
+        self.assertEqual(shifted, [[]] * 2)
+
+    def test_inputs_not_mutated(self):
+        items = list(self.ITEMS)
+        ws = [list(row) for row in self.WEIGHTS_SCHEDULE]
+        ks = list(self.K_SCHEDULE)
+        xs = [list(row) for row in self.EXCLUDED_SCHEDULE]
+        weighted_sample_plan_excluding_indices(
+            items, ws, ks, xs, len(ks), self.SEED)
+        weighted_sample_plan_excluding(
+            items, ws, ks, xs, len(ks), self.SEED)
+        weighted_sample_plan_excluding_counts(
+            items, ws, ks, xs, len(ks), self.SEED)
+        list(weighted_sample_plan_excluding_stream_indices(
+            items, ws, ks, xs, len(ks), self.SEED))
+        self.assertEqual(items, self.ITEMS)
+        self.assertEqual(ws, [list(row) for row in self.WEIGHTS_SCHEDULE])
+        self.assertEqual(ks, self.K_SCHEDULE)
+        self.assertEqual(xs, [list(row) for row in self.EXCLUDED_SCHEDULE])
+
+    def test_fraction_decimal_and_huge_integer_weights(self):
+        items = list("abcd")
+        ws = [
+            [Fraction(1, 10**100), 1, 0, 2],
+            [Decimal("1E-100"), 1, 1, 0],
+            [10**400, 1, 1, 1],
+        ]
+        ks = [1, 2, 3]
+        xs = [[3], [], [1]]
+        rounds = weighted_sample_plan_excluding_indices(
+            items, ws, ks, xs, 3, seed=9)
+        self.assertEqual(rounds, weighted_sample_plan_excluding_indices(
+            items, ws, ks, xs, 3, seed=9))
+        for j, round_indices in enumerate(rounds):
+            self.assertEqual(len(round_indices), ks[j])
+            for position in round_indices:
+                self.assertNotIn(position, xs[j])
+        # 微小正权重位置仍保留候选资格: 精确路径下零权重位置绝不出现。
+        self.assertNotIn(2, rounds[0])
+
+    def test_stream_entries_match_batch_round_by_round(self):
+        total = len(self.K_SCHEDULE)
+        for start in range(total + 1):
+            for draws in range(0, total - start + 1):
+                with self.subTest(start=start, draws=draws):
+                    batch_indices = weighted_sample_plan_excluding_indices(
+                        self.ITEMS, self.WEIGHTS_SCHEDULE,
+                        self.K_SCHEDULE, self.EXCLUDED_SCHEDULE,
+                        draws, self.SEED, start)
+                    self.assertEqual(
+                        list(weighted_sample_plan_excluding_stream_indices(
+                            self.ITEMS, self.WEIGHTS_SCHEDULE,
+                            self.K_SCHEDULE, self.EXCLUDED_SCHEDULE,
+                            draws, self.SEED, start)),
+                        batch_indices,
+                    )
+                    self.assertEqual(
+                        list(weighted_sample_plan_excluding_stream(
+                            self.ITEMS, self.WEIGHTS_SCHEDULE,
+                            self.K_SCHEDULE, self.EXCLUDED_SCHEDULE,
+                            draws, self.SEED, start)),
+                        [[self.ITEMS[i] for i in round_indices]
+                         for round_indices in batch_indices],
+                    )
+
+    def test_stream_validates_at_creation(self):
+        ws = self.WEIGHTS_SCHEDULE
+        ks = self.K_SCHEDULE
+        xs = self.EXCLUDED_SCHEDULE
+        # 校验在创建时完成: 不迭代也立即抛出。
+        with self.assertRaises(TypeError):
+            weighted_sample_plan_excluding_stream_indices(
+                self.ITEMS, ws, ks, "xs", 1)
+        with self.assertRaises(ValueError):
+            weighted_sample_plan_excluding_stream_indices(
+                self.ITEMS, ws, ks, xs, len(ks) + 1)
+        with self.assertRaises(ValueError):
+            weighted_sample_plan_excluding_stream(
+                self.ITEMS, [[0] * len(self.ITEMS)] * 5,
+                [1] * 5, [[]] * 5, 1)
+        with self.assertRaises(TypeError):
+            weighted_sample_plan_excluding_stream(
+                self.ITEMS, ws, ks, xs, 1, object())
 
 
 if __name__ == "__main__":
