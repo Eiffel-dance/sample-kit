@@ -6234,6 +6234,456 @@ def weighted_sample_stratified_resume(items, weights, strata, quotas, state,
 
 
 # ---------------------------------------------------------------------------
+# 可暂停 / 恢复的"分层配额 + 位置排除"采样会话
+# ---------------------------------------------------------------------------
+
+_STRATIFIED_EXCLUDING_CHECKPOINT_KIND = "stratified_excluding"
+
+
+def _stratified_excluding_exact_flags(
+    weights, strata_numbers, quota_values, excluded_set, n
+):
+    """排除后逐层抽样路径标记(完整计划的一部分), 返回长度等于层数的 bool
+    列表。
+
+    与 _stratified_exact_flags 同一规则, 区别仅在于层内位置池先按
+    excluded_set 剔除被排除位置: 正配额分层以其未排除成员权重与配额经
+    _select_sampling_plan 求得 exact 标记(与一次性组合入口为该层选择的
+    抽样路径一致, Fraction / Decimal / 超大整数走纯整数精确路径); 零配额
+    分层不消耗随机流、不构造抽样计划, 标记恒为 False。只读取权重, 不修改
+    入参。
+    """
+    flags = []
+    for number, quota in enumerate(quota_values):
+        if quota == 0:
+            flags.append(False)
+            continue
+        pool_weights = [
+            weights[i]
+            for i in range(n)
+            if strata_numbers[i] == number and i not in excluded_set
+        ]
+        _, use_exact = _select_sampling_plan(pool_weights, quota)
+        flags.append(bool(use_exact))
+    return flags
+
+
+def _stratified_excluding_checkpoint_binding_digest(
+    seed_tagged, position, n, strata_count, excluded_list,
+    items_digest, weights_digest, strata_digest, quotas_digest,
+    exact, rng_payload,
+):
+    """把带排除的分层断点各字段绑定为一个防篡改摘要。
+
+    与 _stratified_checkpoint_binding_digest 同一构造(serialize_metrics
+    规范化后 sha256), 额外绑定规范化后的 excluded 位置列表: 对排除集合、
+    位置、n、分层数、任一指纹、逐层抽样路径标记、标签化 seed 或 RNG 快照
+    的改动若不重算摘要, 恢复时都会在产出任何分层前被发现, 因此长计划分段
+    交接无需从头重放随机流。
+    """
+    return _hash_text(serialize_metrics({
+        "kind": _STRATIFIED_EXCLUDING_CHECKPOINT_KIND,
+        "seed": seed_tagged,
+        "position": position,
+        "n": n,
+        "strata_count": strata_count,
+        "excluded": excluded_list,
+        "items_digest": items_digest,
+        "weights_digest": weights_digest,
+        "strata_digest": strata_digest,
+        "quotas_digest": quotas_digest,
+        "exact": exact,
+        "rng": rng_payload,
+    }))
+
+
+def weighted_sample_stratified_excluding_checkpoint(
+    items, weights, strata, quotas, excluded=(), seed=0, start=0
+):
+    """创建"分层配额 + 位置排除"采样会话的断点(只含 JSON 原生值的状态
+    映射)。
+
+    校验沿用 weighted_sample_stratified_excluding_indices 的全部规则与
+    固定顺序(items、weights、seed、strata、quotas 的结构与成员类型;
+    长度一致、编号范围、quotas 长度等于最大编号加一、配额非负、权重有限
+    非负; excluded 为非文本可确定长度序列、成员为范围内非布尔整数, 按
+    集合语义解释, 重复成员与排列顺序不影响结果), start 必须是非布尔非负
+    整数且不超过分层数(start == 分层数允许, 表示计划已全部消费), 随后在
+    产生任何状态前完成排除后逐层配额的正权重可行性检查。结构或成员类型
+    错误抛 TypeError; 长度不符、编号越界、quotas 长度不符、负配额、
+    excluded 越界位置、排除后某层正权重不足配额、负权重、NaN、无穷权重、
+    start 越过计划范围抛 ValueError。全部校验在返回状态前完成, 失败不
+    返回部分结果, 也不修改入参与 excluded。
+
+    校验通过后按编号升序处理前 start 个分层(与一次性组合入口同一节奏
+    消耗同一条由 seed 初始化的随机流; 层内位置池先剔除被排除位置, 零配额
+    或无成员分层只推进位置且不消耗随机流), 再返回当前位置与只含 JSON
+    原生值的状态; 状态绑定版本、标签 kind、position、n、分层数、规范化
+    后的 excluded(按原始位置升序去重)、items / weights / strata / quotas
+    指纹、标签化 seed、逐层抽样路径标记、随机流快照与完整性摘要, 可直接
+    交给 serialize_metrics 落盘, 也可经 deserialize_metrics 还原(甚至跨
+    进程)后交给 weighted_sample_stratified_excluding_resume_indices
+    恢复, 恢复时从随机流快照续接, 无需从头重放; 随机状态中的超大整数
+    始终保持精确十进制, 不经过浮点。excluded 为空时, 恢复结果与
+    weighted_sample_stratified_checkpoint 的对应窗口逐项一致。
+    """
+    n, strata_numbers, quota_values, excluded_set = (
+        _validate_stratified_excluding_inputs(
+            items, weights, strata, quotas, seed, excluded
+        )
+    )
+    _validate_start(start)
+    if start > len(quota_values):
+        raise ValueError("stratified start out of range")
+    _check_stratified_excluding_quotas(
+        weights, strata_numbers, quota_values, excluded_set, n
+    )
+
+    # 复制到本地, 绝不修改入参; 完整逐层计划与一次性组合入口为各层选择的
+    # 计划一致(层内位置池先剔除被排除位置)。按编号升序推进前 start 个分层,
+    # 与一次性入口的随机流消耗逐项对齐(零配额分层计划为 None, 不消耗
+    # 随机流)。
+    local_weights = list(weights)
+    plans = _stratified_excluding_round_plan(
+        local_weights, strata_numbers, quota_values, excluded_set, n
+    )
+    rng = random.Random(seed)
+    for number in range(start):
+        plan = plans[number]
+        if plan is None:
+            continue
+        pool, planned_weights, quota, use_exact = plan
+        _draw_indices_once_pool(pool, planned_weights, quota, rng, use_exact)
+
+    # 集合语义规范化: 升序去重的位置列表是 excluded 的唯一状态表示。
+    excluded_list = sorted(excluded_set)
+    seed_tagged = _seed_to_tagged_value(seed)
+    rng_payload = _rng_state_to_jsonable(rng.getstate())
+    items_digest = _items_fingerprint(items)
+    weights_digest = _weights_fingerprint(weights)
+    strata_digest = _strata_fingerprint(strata_numbers)
+    quotas_digest = _quotas_fingerprint(quota_values)
+    exact = _stratified_excluding_exact_flags(
+        local_weights, strata_numbers, quota_values, excluded_set, n
+    )
+    strata_count = len(quota_values)
+    state = {
+        "version": _CHECKPOINT_VERSION,
+        "kind": _STRATIFIED_EXCLUDING_CHECKPOINT_KIND,
+        "position": start,
+        "n": n,
+        "strata_count": strata_count,
+        "excluded": excluded_list,
+        "items_digest": items_digest,
+        "weights_digest": weights_digest,
+        "strata_digest": strata_digest,
+        "quotas_digest": quotas_digest,
+        "seed": seed_tagged,
+        "exact": exact,
+        "rng": rng_payload,
+    }
+    state["digest"] = _stratified_excluding_checkpoint_binding_digest(
+        seed_tagged, start, n, strata_count, excluded_list, items_digest,
+        weights_digest, strata_digest, quotas_digest, exact, rng_payload,
+    )
+    return state
+
+
+def _validate_stratified_excluding_checkpoint_state(state):
+    """校验带排除的分层断点状态本身的结构与版本, 返回规范化字段。
+
+    调用前须已确认 state 是映射(否则 TypeError 在外层抛出)。字段缺失、
+    未知(多余)字段、类型错误、非法取值、版本不支持、kind 不符、excluded
+    不是规范化位置列表、逐层标记与分层数不同形等一切结构问题统一抛
+    ValueError。
+    """
+    required = ("version", "kind", "position", "n", "strata_count",
+                "excluded", "items_digest", "weights_digest",
+                "strata_digest", "quotas_digest", "seed", "exact", "rng",
+                "digest")
+    if not all(key in state for key in required):
+        raise ValueError("invalid checkpoint state: missing fields")
+    if set(state) != set(required):
+        raise ValueError("invalid checkpoint state: unexpected fields")
+
+    version = state["version"]
+    if (isinstance(version, bool) or not isinstance(version, int)
+            or version != _CHECKPOINT_VERSION):
+        raise ValueError("unsupported checkpoint version: %r" % (version,))
+    if state["kind"] != _STRATIFIED_EXCLUDING_CHECKPOINT_KIND:
+        raise ValueError("invalid checkpoint state: unexpected kind")
+    position = state["position"]
+    n = state["n"]
+    strata_count = state["strata_count"]
+    for name, value in (("position", position), ("n", n),
+                        ("strata_count", strata_count)):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError("invalid checkpoint state: %s" % name)
+    if position > strata_count:
+        raise ValueError("invalid checkpoint state: position exceeds strata")
+    for name in ("items_digest", "weights_digest", "strata_digest",
+                 "quotas_digest", "digest"):
+        if not isinstance(state[name], str):
+            raise ValueError("invalid checkpoint state: %s" % name)
+
+    # excluded 在状态中只以规范化形式(升序去重的非布尔整数位置列表, 全部
+    # 处于 [0, n))出现; 任何其他结构都视为非法状态。经 json /
+    # deserialize_metrics 往返后成员仍是 int, 规范化形式保持不变。
+    excluded_list = state["excluded"]
+    if not isinstance(excluded_list, list):
+        raise ValueError("invalid checkpoint state: excluded")
+    for member in excluded_list:
+        if (isinstance(member, bool) or not isinstance(member, int)
+                or member < 0 or member >= n):
+            raise ValueError("invalid checkpoint state: excluded")
+    if excluded_list != sorted(set(excluded_list)):
+        raise ValueError("invalid checkpoint state: excluded")
+
+    # 逐层抽样路径标记必须是长度等于分层数的 bool 列表。
+    exact = state["exact"]
+    if not isinstance(exact, list) or len(exact) != strata_count \
+            or any(not isinstance(flag, bool) for flag in exact):
+        raise ValueError("invalid checkpoint state: exact")
+
+    # 状态可能经 serialize_metrics + deserialize_metrics 还原: 其中的
+    # Decimal 载荷(只可能出现在标签化 seed 或 RNG 高斯缓存中)先还原为
+    # 等值 float, 再解码与核对摘要 —— 两条文本路径解析出的状态因此可
+    # 互换恢复。
+    seed_payload = _normalize_checkpoint_numbers(state["seed"])
+    rng_payload = _normalize_checkpoint_numbers(state["rng"])
+
+    # 两个逆运算对内部结构问题统一抛 ValueError。
+    seed = _tagged_value_to_seed(seed_payload)
+    rng_state = _rng_state_from_jsonable(rng_payload)
+
+    # 绑定摘要: 任何对字段的篡改(position、kind、excluded、分层数、抽样
+    # 路径标记、seed、RNG 快照、指纹)若不附带重算的摘要, 都会在这里被
+    # 发现 —— 因此恢复时不必从头重放随机流。
+    expected_digest = _stratified_excluding_checkpoint_binding_digest(
+        seed_payload, position, n, strata_count, excluded_list,
+        state["items_digest"], state["weights_digest"],
+        state["strata_digest"], state["quotas_digest"], exact, rng_payload,
+    )
+    if not hmac.compare_digest(expected_digest, state["digest"]):
+        raise ValueError("invalid checkpoint state: digest mismatch")
+    return (position, n, strata_count, excluded_list, exact, seed, rng_state,
+            seed_payload)
+
+
+def _resume_stratified_excluding_slots_indices(
+    items, weights, strata, quotas, excluded, state, draws
+):
+    """两个带排除的分层恢复入口共用的已校验核心: 只产出索引列表与下一
+    状态。
+
+    调用约定: 外层已确认 state 是映射并校验过 draws。先校验状态本身的
+    结构/版本/摘要, 再以状态携带的 seed 完成 items、weights、strata、
+    quotas、excluded 的组合入口校验与排除后逐层可行性检查; 然后核对恢复
+    窗口 [position, position+draws) 不越过计划范围(计划末尾之后只接受空
+    窗口)、状态与当前输入的绑定(n、分层数、excluded 集合、strata /
+    quotas / items / weights 指纹)以及逐层抽样路径标记。任一失败都在
+    物化任何结果之前抛出既有 TypeError / ValueError; JSON / Decimal /
+    random 层面的意外异常统一收敛为 ValueError, 绝不以其他类型泄漏。全部
+    通过后直接从 RNG 快照续接, 窗口内零配额分层只推进位置且不消耗随机
+    流, 正配额分层在未排除位置上按成员权重重建确定性抽样计划后抽样,
+    返回 (按编号拼接的零基索引列表, 下一状态); 不修改入参, 也不修改
+    传入的状态映射。
+    """
+    (position, state_n, strata_count, state_excluded, exact, seed, rng_state,
+     seed_payload) = _validate_stratified_excluding_checkpoint_state(state)
+
+    # 与一次性组合入口同一套校验; strata_numbers / quota_values 是本地
+    # 副本, excluded 按集合语义解释。
+    n, strata_numbers, quota_values, excluded_set = (
+        _validate_stratified_excluding_inputs(
+            items, weights, strata, quotas, seed, excluded
+        )
+    )
+    _check_stratified_excluding_quotas(
+        weights, strata_numbers, quota_values, excluded_set, n
+    )
+
+    # 恢复窗口不得越过计划范围; position == 分层数时只接受空窗口。
+    if position + draws > len(quota_values):
+        raise ValueError("stratified resume window out of range")
+
+    # 状态与当前采样输入的一致性: 位置数与分层数先比, 再核对 excluded
+    # 集合(调用方传入的重复成员与排列顺序不影响判定), 最后逐项核对指纹。
+    if state_n != n or strata_count != len(quota_values):
+        raise ValueError(
+            "checkpoint state does not match items/weights/strata/quotas"
+        )
+    if set(state_excluded) != excluded_set:
+        raise ValueError("checkpoint state does not match excluded")
+    if state["strata_digest"] != _strata_fingerprint(strata_numbers):
+        raise ValueError("checkpoint state does not match strata")
+    if state["quotas_digest"] != _quotas_fingerprint(quota_values):
+        raise ValueError("checkpoint state does not match quotas")
+    if state["items_digest"] != _items_fingerprint(items):
+        raise ValueError("checkpoint state does not match items")
+    if state["weights_digest"] != _weights_fingerprint(weights):
+        raise ValueError("checkpoint state does not match weights")
+
+    # 逐层抽样路径标记必须与创建断点时一致; 权重、strata、quotas、
+    # excluded 已核对, 这里重建完整计划并比对 exact 标记。RNG 快照与
+    # (seed, position, excluded) 的绑定已由状态摘要保证未被篡改, 故恢复
+    # 直接从快照继续, 无需从头重放。
+    planned_exact = _stratified_excluding_exact_flags(
+        list(weights), strata_numbers, quota_values, excluded_set, n
+    )
+    if planned_exact != exact:
+        raise ValueError("invalid checkpoint state: sampling plan mismatch")
+
+    # 全部校验通过后才物化结果: 直接从快照状态继续, 与一次性组合入口在
+    # 相同分层区间的结果逐项一致。
+    rng = random.Random()
+    try:
+        rng.setstate(rng_state)
+    except ValueError:
+        raise
+    except Exception as exc:
+        # 结构与取值范围已在上游校验; 任何解释器层面的额外拒绝都统一成
+        # ValueError, 绝不泄漏其他异常类型, 也不会已产出部分结果。
+        raise ValueError("invalid checkpoint RNG state") from exc
+    local_weights = list(weights)
+    indices = []
+    for number in range(position, position + draws):
+        quota = quota_values[number]
+        # 零配额(含无成员)分层只推进位置, 不消耗随机流 —— 与一次性入口
+        # 的跳过节奏一致。
+        if quota == 0:
+            continue
+        pool = [
+            i
+            for i in range(n)
+            if strata_numbers[i] == number and i not in excluded_set
+        ]
+        pool_weights = [local_weights[i] for i in pool]
+        planned_weights, use_exact = _select_sampling_plan(
+            pool_weights, quota
+        )
+        indices.extend(
+            _draw_indices_once_pool(
+                pool, planned_weights, quota, rng, use_exact
+            )
+        )
+
+    next_state = dict(state)
+    next_rng_payload = _rng_state_to_jsonable(rng.getstate())
+    next_position = position + draws
+    next_state["position"] = next_position
+    next_state["rng"] = next_rng_payload
+    # excluded 与 seed 载荷使用校验时规范化后的形式: 经
+    # deserialize_metrics 还原的状态其 Decimal 已回到等值 float, 下一状态
+    # 因此与 JSON 原生状态链逐字段一致, 可继续经任一文本路径序列化/解析
+    # 后再恢复。
+    next_state["excluded"] = list(state_excluded)
+    next_state["seed"] = seed_payload
+    # 摘要必须随 position / RNG 一并刷新, 否则链式再恢复时会因摘要失配
+    # 而失败(其余字段与原状态相同)。
+    next_state["digest"] = _stratified_excluding_checkpoint_binding_digest(
+        seed_payload, next_position, n, strata_count,
+        list(state_excluded), state["items_digest"],
+        state["weights_digest"], state["strata_digest"],
+        state["quotas_digest"], exact, next_rng_payload,
+    )
+    return indices, next_state
+
+
+def weighted_sample_stratified_excluding_resume_indices(
+    items, weights, strata, quotas, excluded, state, draws
+):
+    """从带排除的分层断点继续产出索引, 返回 (索引列表, 下一状态)。
+
+    第一个分层槽位从断点记录的 position(已消费的分层编号前缀)开始;
+    窗口结果与一次性 weighted_sample_stratified_excluding_indices(
+    items, weights, strata, quotas, excluded, seed) 在相同分层区间
+    [position, position+draws) 的拼接结果逐项一致, 分层内保持抽样先后,
+    被排除位置即使权重为正也绝不出现, 未排除的零权重位置永不入选, 重复
+    值按位置区分; 多次连续续接与一次性生成逐项相同, 恢复时无需从头重放
+    随机流。返回前完成与组合入口一致的全部输入校验(含 excluded 的集合
+    语义、排除后逐层正权重可行性与恢复窗口不越过计划范围), 并核对状态与
+    items、weights、strata、quotas、excluded 及 (seed, 位置, RNG 快照)
+    的自洽性: 状态不是映射抛 TypeError; 字段缺失或未知、版本或 kind 不
+    支持、摘要或输入不匹配、抽样路径标记不一致、跨种类状态、随机流数据
+    越界统一抛 ValueError; items/weights/strata/quotas/excluded/draws 的
+    错误沿用既有 TypeError / ValueError。所有失败都在任何结果物化之前
+    确定, 绝不返回部分结果。draws=0 返回空列表与位置、随机状态不变的
+    状态副本; 零配额分层只推进位置且不消耗随机流; 计划末尾之后只接受
+    空窗口。状态可经 serialize_metrics / deserialize_metrics 往返后继续
+    恢复, 超大整数保持精确十进制。不修改入参, 也不修改传入的状态映射与
+    excluded。
+    """
+    # 状态不是映射: TypeError(文档约定的明确分类)。映射前提下的一切
+    # 结构/版本/摘要问题在状态校验中统一为 ValueError。
+    if not isinstance(state, collections.abc.Mapping):
+        raise TypeError("checkpoint state must be a mapping")
+    # draws 的类型/取值规则独立于状态, 先按既有规则校验(TypeError /
+    # ValueError), 再解析状态。
+    _validate_draws(draws)
+    return _resume_stratified_excluding_slots_indices(
+        items, weights, strata, quotas, excluded, state, draws
+    )
+
+
+def weighted_sample_stratified_excluding_resume(
+    items, weights, strata, quotas, excluded, state, draws
+):
+    """按元素值从带排除的分层断点继续, 返回 (元素值列表, 下一状态)。
+
+    校验顺序按恢复入口约定固定: 调用开始先按组合入口完成 items、
+    weights、strata、quotas、excluded 的结构、长度、成员类型、编号与
+    配额取值、权重取值、excluded 范围以及排除后逐层正权重可行性校验
+    (这部分与 seed 无关, 以合法种子 0 试跑, 窗口语义不参与; state 携带
+    的 seed 其标签化编码随后随 state 一并校验), 再按恢复入口校验 state
+    的映射类型、版本、kind、字段集合、摘要、随机数状态以及 state 与当前
+    输入的绑定(含恢复窗口范围与逐层抽样路径标记), draws 必须是非布尔
+    非负整数。状态不是映射抛 TypeError; 非法状态、版本或 kind 不支持、
+    跨种类状态、状态与输入不匹配或恢复窗口超出计划范围等一律抛
+    ValueError; 其余输入错误沿用既有 TypeError / ValueError。所有失败
+    都在产生任何结果之前确定, JSON / Decimal / random 的异常不会以其他
+    类型泄漏, 且不修改入参或状态。
+
+    返回的元素值列表与
+    weighted_sample_stratified_excluding_resume_indices 返回的原始位置
+    逐项对应(第 j 个值恰为 items[第 j 个索引]): 相同值的不同位置分别
+    消耗, 被排除位置绝不出现。返回的下一状态与按索引入口产出的完全相同
+    (position、excluded、RNG 快照、digest 一致), 只含 JSON 原生值, 可
+    直接再次传入本入口或按索引入口, 或经 serialize_metrics /
+    deserialize_metrics 往返后继续恢复。draws=0 返回空列表与位置、随机
+    状态不变的状态副本; 零配额分层只推进位置, 不消耗随机流。
+    """
+    # 第一步: 先按组合入口完成 items、weights、strata、quotas、excluded
+    # 的结构、长度、成员类型、取值与排除后可行性校验(以合法种子 0 试跑;
+    # state 携带的 seed 其编码与类型在第三步随状态一并校验)。因此即使
+    # state 本身已损坏, 非法输入仍优先以组合入口的异常类别报告。
+    _n, _strata_numbers, _quota_values, _excluded_set = (
+        _validate_stratified_excluding_inputs(
+            items, weights, strata, quotas, 0, excluded
+        )
+    )
+    _check_stratified_excluding_quotas(
+        weights, _strata_numbers, _quota_values, _excluded_set, _n
+    )
+
+    # 第二步: 恢复入口的映射类型检查与 draws 规则(TypeError / ValueError)。
+    if not isinstance(state, collections.abc.Mapping):
+        raise TypeError("checkpoint state must be a mapping")
+    _validate_draws(draws)
+
+    # 第三步: 状态结构/版本/kind/字段/摘要/RNG、state 与输入绑定(含从
+    # 状态解出的 seed 再跑一次完整组合校验与窗口检查)、抽样路径标记
+    # 核对, 全部通过后从 RNG 快照续接产出索引。与按索引入口共用同一个
+    # 已校验核心, 因此结果、下一状态、异常类别与其逐项一致。
+    indices, next_state = _resume_stratified_excluding_slots_indices(
+        items, weights, strata, quotas, excluded, state, draws
+    )
+    # 按原始位置逐项映射为元素值: 相同值的不同位置各自独立映射。只读取
+    # items, 不修改入参。
+    return [items[i] for i in indices], next_state
+
+
+# ---------------------------------------------------------------------------
 # 按轮变化的分层配额计划采样
 # ---------------------------------------------------------------------------
 
