@@ -65,6 +65,9 @@ from app import (
     weighted_sample_stratified_excluding_schedule_counts,
     weighted_sample_stratified_excluding_schedule_stream_indices,
     weighted_sample_stratified_excluding_schedule_stream,
+    weighted_sample_stratified_excluding_schedule_checkpoint,
+    weighted_sample_stratified_excluding_schedule_resume_indices,
+    weighted_sample_stratified_excluding_schedule_resume,
     weighted_sample_stream,
     weighted_sample_stream_indices,
     weighted_sample_many_excluding,
@@ -11871,6 +11874,577 @@ class WeightedSampleStratifiedExcludingScheduleTest(unittest.TestCase):
         self.assertEqual(
             weighted_sample_indices(self.ITEMS, self.WEIGHTS, 3, 42),
             weighted_sample_indices(self.ITEMS, self.WEIGHTS, 3, 42))
+
+
+class WeightedSampleStratifiedExcludingScheduleCheckpointTest(unittest.TestCase):
+    ITEMS = ["a", "b", "c", "d", "e", "f", "g", "h"]
+    WEIGHTS = [5, 1, 3, 2, 4, 1, 2, 6]
+    STRATA = [0, 0, 1, 1, 2, 2, 2, 2]
+    # 排除 [0, 4] 后各层未排除正权重位置数为 1、2、3, 每行配额均不超过。
+    QUOTAS_SCHEDULE = [[1, 1, 2], [0, 2, 1], [1, 0, 3], [0, 0, 0],
+                       [1, 1, 1]]
+    EXCLUDED = [0, 4]
+    SEED = 20240521
+
+    def _one_shot(self, excluded=None, draws=None, seed=None):
+        return weighted_sample_stratified_excluding_schedule_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS_SCHEDULE,
+            self.EXCLUDED if excluded is None else excluded,
+            len(self.QUOTAS_SCHEDULE) if draws is None else draws,
+            self.SEED if seed is None else seed)
+
+    def test_checkpoint_state_is_json_native(self):
+        state = weighted_sample_stratified_excluding_schedule_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS_SCHEDULE,
+            self.EXCLUDED, self.SEED, start=2)
+        # json 默认序列化/还原往返不报错且内容不变(只含 JSON 原生值)。
+        self.assertEqual(json.loads(json.dumps(state)), state)
+        self.assertEqual(
+            state["kind"], "stratified_excluding_schedule")
+        self.assertEqual(state["position"], 2)
+        self.assertEqual(state["n"], len(self.ITEMS))
+        self.assertEqual(state["strata_count"], 3)
+        self.assertEqual(
+            state["schedule_length"], len(self.QUOTAS_SCHEDULE))
+        # excluded 在状态中按集合语义规范化为升序去重的位置列表。
+        self.assertEqual(state["excluded"], [0, 4])
+
+    def test_resume_window_equals_one_shot_slice(self):
+        full = self._one_shot()
+        for start in range(len(self.QUOTAS_SCHEDULE) + 1):
+            state = (
+                weighted_sample_stratified_excluding_schedule_checkpoint(
+                    self.ITEMS, self.WEIGHTS, self.STRATA,
+                    self.QUOTAS_SCHEDULE, self.EXCLUDED,
+                    self.SEED, start=start))
+            draws = len(self.QUOTAS_SCHEDULE) - start
+            rounds, _ = (
+                weighted_sample_stratified_excluding_schedule_resume_indices(
+                    self.ITEMS, self.WEIGHTS, self.STRATA,
+                    self.QUOTAS_SCHEDULE, self.EXCLUDED, state, draws))
+            self.assertEqual(rounds, full[start:])
+
+    def test_chained_resumes_equal_one_shot_run(self):
+        full = self._one_shot()
+        state = weighted_sample_stratified_excluding_schedule_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS_SCHEDULE,
+            self.EXCLUDED, self.SEED)
+        chained = []
+        for draws in (1, 2, 0, 2):
+            rounds, state = (
+                weighted_sample_stratified_excluding_schedule_resume_indices(
+                    self.ITEMS, self.WEIGHTS, self.STRATA,
+                    self.QUOTAS_SCHEDULE, self.EXCLUDED, state, draws))
+            chained.extend(rounds)
+        self.assertEqual(chained, full)
+        self.assertEqual(
+            state["position"], len(self.QUOTAS_SCHEDULE))
+
+    def test_value_resume_matches_index_resume(self):
+        state = weighted_sample_stratified_excluding_schedule_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS_SCHEDULE,
+            self.EXCLUDED, self.SEED, start=1)
+        index_rounds, index_state = (
+            weighted_sample_stratified_excluding_schedule_resume_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                self.QUOTAS_SCHEDULE, self.EXCLUDED, state, 3))
+        value_rounds, value_state = (
+            weighted_sample_stratified_excluding_schedule_resume(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                self.QUOTAS_SCHEDULE, self.EXCLUDED, state, 3))
+        self.assertEqual(
+            value_rounds,
+            [[self.ITEMS[i] for i in r] for r in index_rounds])
+        # 两个入口的下一状态逐字段一致, 可互换续接。
+        self.assertEqual(index_state, value_state)
+        tail_i, _ = (
+            weighted_sample_stratified_excluding_schedule_resume_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                self.QUOTAS_SCHEDULE, self.EXCLUDED, value_state, 1))
+        tail_v, _ = weighted_sample_stratified_excluding_schedule_resume(
+            self.ITEMS, self.WEIGHTS, self.STRATA,
+            self.QUOTAS_SCHEDULE, self.EXCLUDED, index_state, 1)
+        self.assertEqual(
+            tail_v, [[self.ITEMS[i] for i in r] for r in tail_i])
+
+    def test_resume_values_handle_duplicate_items_by_position(self):
+        items = ["x", "x", "x", "x"]
+        weights = [1, 1, 1, 1]
+        strata = [0, 0, 1, 1]
+        # 排除位置 1 后第 0 层只剩位置 0, 配额不超过 1; 第 1 层不受影响。
+        schedule = [[1, 1], [1, 2]]
+        excluded = [1]
+        state = weighted_sample_stratified_excluding_schedule_checkpoint(
+            items, weights, strata, schedule, excluded, 5)
+        index_rounds, _ = (
+            weighted_sample_stratified_excluding_schedule_resume_indices(
+                items, weights, strata, schedule, excluded, state, 2))
+        value_rounds, _ = (
+            weighted_sample_stratified_excluding_schedule_resume(
+                items, weights, strata, schedule, excluded, state, 2))
+        self.assertEqual(
+            value_rounds,
+            [[items[i] for i in r] for r in index_rounds])
+        for rd in index_rounds:
+            self.assertNotIn(1, rd)
+
+    def test_draws_zero_returns_empty_and_state_copy(self):
+        state = weighted_sample_stratified_excluding_schedule_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS_SCHEDULE,
+            self.EXCLUDED, self.SEED, start=2)
+        rounds, next_state = (
+            weighted_sample_stratified_excluding_schedule_resume_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                self.QUOTAS_SCHEDULE, self.EXCLUDED, state, 0))
+        self.assertEqual(rounds, [])
+        self.assertEqual(next_state, state)
+        self.assertIsNot(next_state, state)
+        value_rounds, value_state = (
+            weighted_sample_stratified_excluding_schedule_resume(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                self.QUOTAS_SCHEDULE, self.EXCLUDED, state, 0))
+        self.assertEqual(value_rounds, [])
+        self.assertEqual(value_state, state)
+
+    def test_zero_quota_rounds_advance_position_without_rng(self):
+        # 全零配额的轮次只推进 position, 不消耗随机流: 跨过该行的恢复与
+        # 一次性调用逐项一致。
+        schedule = [[1, 0, 1], [0, 0, 0], [1, 1, 0]]
+        state = weighted_sample_stratified_excluding_schedule_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.STRATA, schedule,
+            self.EXCLUDED, self.SEED, start=1)
+        rounds, state = (
+            weighted_sample_stratified_excluding_schedule_resume_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, schedule,
+                self.EXCLUDED, state, 2))
+        full = weighted_sample_stratified_excluding_schedule_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA, schedule,
+            self.EXCLUDED, 3, self.SEED)
+        self.assertEqual(rounds, full[1:])
+        self.assertEqual(rounds[0], [])
+        self.assertEqual(state["position"], 3)
+
+    def test_end_of_plan_accepts_only_empty_window(self):
+        state = weighted_sample_stratified_excluding_schedule_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS_SCHEDULE,
+            self.EXCLUDED, self.SEED, start=len(self.QUOTAS_SCHEDULE))
+        rounds, next_state = (
+            weighted_sample_stratified_excluding_schedule_resume_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                self.QUOTAS_SCHEDULE, self.EXCLUDED, state, 0))
+        self.assertEqual(rounds, [])
+        self.assertEqual(
+            next_state["position"], len(self.QUOTAS_SCHEDULE))
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_schedule_resume_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                self.QUOTAS_SCHEDULE, self.EXCLUDED, state, 1)
+
+    def test_resume_window_out_of_range(self):
+        state = weighted_sample_stratified_excluding_schedule_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS_SCHEDULE,
+            self.EXCLUDED, self.SEED, start=3)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_schedule_resume_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                self.QUOTAS_SCHEDULE, self.EXCLUDED, state, 3)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_schedule_resume(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                self.QUOTAS_SCHEDULE, self.EXCLUDED, state, 3)
+
+    def test_state_survives_serialize_metrics_round_trip(self):
+        state = weighted_sample_stratified_excluding_schedule_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS_SCHEDULE,
+            self.EXCLUDED, self.SEED, start=2)
+        restored = deserialize_metrics(serialize_metrics(state))
+        expected, _ = (
+            weighted_sample_stratified_excluding_schedule_resume_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                self.QUOTAS_SCHEDULE, self.EXCLUDED, state, 2))
+        actual, next_state = (
+            weighted_sample_stratified_excluding_schedule_resume_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                self.QUOTAS_SCHEDULE, self.EXCLUDED, restored, 2))
+        self.assertEqual(actual, expected)
+        # 下一状态同样可序列化往返并继续恢复。
+        full = self._one_shot()
+        restored_next = deserialize_metrics(serialize_metrics(next_state))
+        tail, _ = (
+            weighted_sample_stratified_excluding_schedule_resume_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                self.QUOTAS_SCHEDULE, self.EXCLUDED, restored_next, 1))
+        self.assertEqual(tail, full[4:])
+
+    def test_state_survives_json_round_trip(self):
+        state = weighted_sample_stratified_excluding_schedule_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS_SCHEDULE,
+            self.EXCLUDED, self.SEED, start=1)
+        restored = json.loads(json.dumps(state))
+        rounds, _ = (
+            weighted_sample_stratified_excluding_schedule_resume_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                self.QUOTAS_SCHEDULE, self.EXCLUDED, restored, 2))
+        self.assertEqual(rounds, self._one_shot()[1:3])
+
+    def test_exact_weight_types_supported(self):
+        weights = [Fraction(1, 3), Decimal("0.5"), 10 ** 60, 2,
+                   Fraction(2, 5), Decimal("1.25"), 1, 10 ** 40 + 7]
+        state = weighted_sample_stratified_excluding_schedule_checkpoint(
+            self.ITEMS, weights, self.STRATA, self.QUOTAS_SCHEDULE,
+            self.EXCLUDED, self.SEED, start=1)
+        rounds, _ = (
+            weighted_sample_stratified_excluding_schedule_resume_indices(
+                self.ITEMS, weights, self.STRATA, self.QUOTAS_SCHEDULE,
+                self.EXCLUDED, state, 4))
+        full = weighted_sample_stratified_excluding_schedule_indices(
+            self.ITEMS, weights, self.STRATA, self.QUOTAS_SCHEDULE,
+            self.EXCLUDED, 5, self.SEED)
+        self.assertEqual(rounds, full[1:])
+        # 状态可经 serialize_metrics 往返(超大整数保持精确十进制)。
+        restored = deserialize_metrics(serialize_metrics(state))
+        again, _ = (
+            weighted_sample_stratified_excluding_schedule_resume_indices(
+                self.ITEMS, weights, self.STRATA, self.QUOTAS_SCHEDULE,
+                self.EXCLUDED, restored, 4))
+        self.assertEqual(again, rounds)
+
+    def test_huge_integer_weights_keep_exact_decimal_behavior(self):
+        huge = [10 ** 5000 + 1, 10 ** 5000, 7, 2, 10 ** 4300, 1, 2, 6]
+        state = weighted_sample_stratified_excluding_schedule_checkpoint(
+            self.ITEMS, huge, self.STRATA, self.QUOTAS_SCHEDULE,
+            [4], 9, start=1)
+        restored = deserialize_metrics(serialize_metrics(state))
+        direct, _ = (
+            weighted_sample_stratified_excluding_schedule_resume_indices(
+                self.ITEMS, huge, self.STRATA, self.QUOTAS_SCHEDULE,
+                [4], state, 4))
+        resumed, _ = (
+            weighted_sample_stratified_excluding_schedule_resume_indices(
+                self.ITEMS, huge, self.STRATA, self.QUOTAS_SCHEDULE,
+                [4], restored, 4))
+        full = weighted_sample_stratified_excluding_schedule_indices(
+            self.ITEMS, huge, self.STRATA, self.QUOTAS_SCHEDULE,
+            [4], 5, 9)
+        self.assertEqual(direct, full[1:])
+        self.assertEqual(resumed, direct)
+
+    def test_checkpoint_validates_like_batch_entry(self):
+        with self.assertRaises(TypeError):
+            weighted_sample_stratified_excluding_schedule_checkpoint(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                [[1, 1, True]], [], self.SEED)
+        with self.assertRaises(ValueError):
+            # 排除 [0, 4] 后第 2 层只剩 3 个正权重位置, 配额 9 不可行。
+            weighted_sample_stratified_excluding_schedule_checkpoint(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                [[1, 1, 9]], self.EXCLUDED, self.SEED)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_schedule_checkpoint(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                self.QUOTAS_SCHEDULE, self.EXCLUDED, self.SEED, start=6)
+        with self.assertRaises(TypeError):
+            weighted_sample_stratified_excluding_schedule_checkpoint(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                self.QUOTAS_SCHEDULE, self.EXCLUDED, self.SEED, start=1.5)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_schedule_checkpoint(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                self.QUOTAS_SCHEDULE, [8], self.SEED)
+        with self.assertRaises(TypeError):
+            weighted_sample_stratified_excluding_schedule_checkpoint(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                self.QUOTAS_SCHEDULE, [True], self.SEED)
+        for bad_weights, error in (
+            ([-1] + self.WEIGHTS[1:], ValueError),
+            ([float("nan")] + self.WEIGHTS[1:], ValueError),
+            ([float("inf")] + self.WEIGHTS[1:], ValueError),
+        ):
+            with self.assertRaises(error):
+                weighted_sample_stratified_excluding_schedule_checkpoint(
+                    self.ITEMS, bad_weights, self.STRATA,
+                    self.QUOTAS_SCHEDULE, self.EXCLUDED, self.SEED)
+        # start == 计划长度合法。
+        state = weighted_sample_stratified_excluding_schedule_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS_SCHEDULE,
+            self.EXCLUDED, self.SEED,
+            start=len(self.QUOTAS_SCHEDULE))
+        self.assertEqual(
+            state["position"], len(self.QUOTAS_SCHEDULE))
+
+    def test_resume_rejects_non_mapping_state(self):
+        for bad in (None, 42, "state", [("position", 0)]):
+            with self.assertRaises(TypeError):
+                weighted_sample_stratified_excluding_schedule_resume_indices(
+                    self.ITEMS, self.WEIGHTS, self.STRATA,
+                    self.QUOTAS_SCHEDULE, self.EXCLUDED, bad, 1)
+            with self.assertRaises(TypeError):
+                weighted_sample_stratified_excluding_schedule_resume(
+                    self.ITEMS, self.WEIGHTS, self.STRATA,
+                    self.QUOTAS_SCHEDULE, self.EXCLUDED, bad, 1)
+
+    def test_resume_rejects_bad_draws(self):
+        state = weighted_sample_stratified_excluding_schedule_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS_SCHEDULE,
+            self.EXCLUDED, self.SEED)
+        for bad in (True, 1.5, "1", None):
+            with self.assertRaises(TypeError):
+                weighted_sample_stratified_excluding_schedule_resume_indices(
+                    self.ITEMS, self.WEIGHTS, self.STRATA,
+                    self.QUOTAS_SCHEDULE, self.EXCLUDED, state, bad)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_schedule_resume_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                self.QUOTAS_SCHEDULE, self.EXCLUDED, state, -1)
+
+    def test_resume_rejects_structurally_invalid_state(self):
+        state = weighted_sample_stratified_excluding_schedule_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS_SCHEDULE,
+            self.EXCLUDED, self.SEED, start=1)
+        import copy as _copy
+        # 缺失字段。
+        for key in state:
+            bad = dict(state)
+            del bad[key]
+            with self.assertRaises(ValueError):
+                weighted_sample_stratified_excluding_schedule_resume_indices(
+                    self.ITEMS, self.WEIGHTS, self.STRATA,
+                    self.QUOTAS_SCHEDULE, self.EXCLUDED, bad, 1)
+        # 多余字段。
+        bad = dict(state)
+        bad["extra"] = 1
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_schedule_resume_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                self.QUOTAS_SCHEDULE, self.EXCLUDED, bad, 1)
+        # 版本 / kind 不支持(含其他断点的 kind)。
+        for key, value in (("version", 2), ("version", "1"),
+                           ("kind", "stratified_schedule"),
+                           ("kind", "excluding_schedule"),
+                           ("kind", "stratified")):
+            bad = dict(state)
+            bad[key] = value
+            with self.assertRaises(ValueError):
+                weighted_sample_stratified_excluding_schedule_resume_indices(
+                    self.ITEMS, self.WEIGHTS, self.STRATA,
+                    self.QUOTAS_SCHEDULE, self.EXCLUDED, bad, 1)
+        # 篡改字段(摘要失配)。
+        for key, value in (("position", 0), ("n", 7), ("strata_count", 2),
+                           ("schedule_length", 4)):
+            bad = _copy.deepcopy(state)
+            bad[key] = value
+            with self.assertRaises(ValueError):
+                weighted_sample_stratified_excluding_schedule_resume_indices(
+                    self.ITEMS, self.WEIGHTS, self.STRATA,
+                    self.QUOTAS_SCHEDULE, self.EXCLUDED, bad, 1)
+        # 篡改规范化 excluded 列表(摘要失配)。
+        bad = _copy.deepcopy(state)
+        bad["excluded"] = [0]
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_schedule_resume_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                self.QUOTAS_SCHEDULE, self.EXCLUDED, bad, 1)
+        # 未规范化的 excluded(乱序/重复/越界/布尔成员)。
+        for malformed in ([4, 0], [0, 0, 4], [0, 8], [True, 4]):
+            bad = _copy.deepcopy(state)
+            bad["excluded"] = malformed
+            with self.assertRaises(ValueError):
+                weighted_sample_stratified_excluding_schedule_resume_indices(
+                    self.ITEMS, self.WEIGHTS, self.STRATA,
+                    self.QUOTAS_SCHEDULE, self.EXCLUDED, bad, 1)
+        # 篡改抽样路径标记与 RNG 快照。
+        bad = _copy.deepcopy(state)
+        bad["exact"][0][0] = not bad["exact"][0][0]
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_schedule_resume_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                self.QUOTAS_SCHEDULE, self.EXCLUDED, bad, 1)
+        bad = _copy.deepcopy(state)
+        bad["rng"]["mt"][0] += 1
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_schedule_resume_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                self.QUOTAS_SCHEDULE, self.EXCLUDED, bad, 1)
+
+    def test_resume_rejects_mismatched_inputs(self):
+        state = weighted_sample_stratified_excluding_schedule_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS_SCHEDULE,
+            self.EXCLUDED, self.SEED, start=1)
+        resume = (
+            weighted_sample_stratified_excluding_schedule_resume_indices)
+        # items / weights / strata / quotas_schedule / excluded 任一不匹配
+        # 都拒绝。
+        with self.assertRaises(ValueError):
+            resume(["a", "b", "c", "d", "e", "f", "g", "z"],
+                   self.WEIGHTS, self.STRATA, self.QUOTAS_SCHEDULE,
+                   self.EXCLUDED, state, 1)
+        with self.assertRaises(ValueError):
+            resume(self.ITEMS, [5, 1, 3, 2, 4, 1, 2, 7],
+                   self.STRATA, self.QUOTAS_SCHEDULE,
+                   self.EXCLUDED, state, 1)
+        with self.assertRaises(ValueError):
+            resume(self.ITEMS, self.WEIGHTS,
+                   [0, 0, 1, 1, 2, 2, 2, 1],
+                   self.QUOTAS_SCHEDULE, self.EXCLUDED, state, 1)
+        with self.assertRaises(ValueError):
+            resume(self.ITEMS, self.WEIGHTS, self.STRATA,
+                   [[0, 1, 2]] + self.QUOTAS_SCHEDULE[1:],
+                   self.EXCLUDED, state, 1)
+        with self.assertRaises(ValueError):
+            resume(self.ITEMS, self.WEIGHTS, self.STRATA,
+                   self.QUOTAS_SCHEDULE + [[0, 0, 0]],
+                   self.EXCLUDED, state, 1)
+        with self.assertRaises(ValueError):
+            resume(self.ITEMS, self.WEIGHTS, self.STRATA,
+                   self.QUOTAS_SCHEDULE, [0], state, 1)
+        with self.assertRaises(ValueError):
+            resume(self.ITEMS, self.WEIGHTS, self.STRATA,
+                   self.QUOTAS_SCHEDULE, [0, 4, 5], state, 1)
+        # 权重类型变化(同值不同类型)同样改变抽样路径, 必须拒绝。
+        weights = list(self.WEIGHTS)
+        weights[0] = 5.0
+        with self.assertRaises(ValueError):
+            resume(self.ITEMS, weights, self.STRATA,
+                   self.QUOTAS_SCHEDULE, self.EXCLUDED, state, 1)
+
+    def test_excluded_set_semantics_match_across_checkpoint_and_resume(self):
+        # 重复成员与排列顺序不影响规范化结果, 也不影响恢复窗口。
+        reference_state = (
+            weighted_sample_stratified_excluding_schedule_checkpoint(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS_SCHEDULE,
+                [0, 4], self.SEED, start=1))
+        full = self._one_shot()
+        for excluded in ([4, 0], [0, 0, 4], (4, 0, 0, 4), [4, 0, 4]):
+            state = (
+                weighted_sample_stratified_excluding_schedule_checkpoint(
+                    self.ITEMS, self.WEIGHTS, self.STRATA,
+                    self.QUOTAS_SCHEDULE, excluded, self.SEED, start=1))
+            self.assertEqual(state["excluded"], [0, 4])
+            self.assertEqual(state, reference_state)
+            rounds, _ = (
+                weighted_sample_stratified_excluding_schedule_resume_indices(
+                    self.ITEMS, self.WEIGHTS, self.STRATA,
+                    self.QUOTAS_SCHEDULE, excluded, state, 4))
+            self.assertEqual(rounds, full[1:])
+
+    def test_empty_excluded_matches_non_excluding_schedule_checkpoint(self):
+        state = weighted_sample_stratified_excluding_schedule_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS_SCHEDULE,
+            [], 731, start=2)
+        rounds, _ = (
+            weighted_sample_stratified_excluding_schedule_resume_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                self.QUOTAS_SCHEDULE, [], state, 3))
+        full = weighted_sample_stratified_schedule_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS_SCHEDULE,
+            5, 731)
+        self.assertEqual(rounds, full[2:])
+        # 两个 kind 的状态互不接受。
+        plain_state = weighted_sample_stratified_schedule_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS_SCHEDULE,
+            731, start=2)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_schedule_resume_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                self.QUOTAS_SCHEDULE, [], plain_state, 1)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_schedule_resume_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                self.QUOTAS_SCHEDULE, state, 1)
+
+    def test_excluded_and_zero_weight_positions_never_chosen(self):
+        # 位置 0 被排除; 位置 1、5 未被排除但权重为零 —— 任何恢复轮次都
+        # 不得选中这三类位置; 第 2 层配额为 1 时只能选到位置 4。
+        items = list("abcdef")
+        weights = [1, 0, 1, 1, 1, 0]
+        strata = [0, 0, 1, 1, 2, 2]
+        schedule = [[0, 1, 1], [0, 2, 1]]
+        excluded = [0]
+        full = weighted_sample_stratified_excluding_schedule_indices(
+            items, weights, strata, schedule, excluded, 2, 11)
+        state = weighted_sample_stratified_excluding_schedule_checkpoint(
+            items, weights, strata, schedule, excluded, 11)
+        rounds, _ = (
+            weighted_sample_stratified_excluding_schedule_resume_indices(
+                items, weights, strata, schedule, excluded, state, 2))
+        self.assertEqual(rounds, full)
+        for rd in rounds:
+            for position in rd:
+                self.assertNotIn(position, (0, 1, 5))
+        # 未排除层在只剩零权重位置时配额必须为 0, 否则创建断点即失败。
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_schedule_checkpoint(
+                items, weights, strata, [[1, 1, 1]], excluded, 11)
+
+    def test_value_resume_input_validation_precedes_state_check(self):
+        # 元素值入口先做组合批量入口校验: 即使 state 不是映射, 非法计划
+        # 仍优先抛 TypeError; 输入合法时非映射 state 才以 TypeError 拒绝。
+        with self.assertRaises(TypeError):
+            weighted_sample_stratified_excluding_schedule_resume(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                [[1, True, 2]], self.EXCLUDED, "not-a-mapping", 1)
+        with self.assertRaises(TypeError):
+            weighted_sample_stratified_excluding_schedule_resume(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                self.QUOTAS_SCHEDULE, self.EXCLUDED, 42, 1)
+        state = weighted_sample_stratified_excluding_schedule_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS_SCHEDULE,
+            self.EXCLUDED, self.SEED, start=1)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_schedule_resume(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                [[1, 1]], self.EXCLUDED, state, 1)
+        with self.assertRaises(TypeError):
+            weighted_sample_stratified_excluding_schedule_resume(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                self.QUOTAS_SCHEDULE, 1.5, state, 1)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_schedule_resume(
+                self.ITEMS, self.WEIGHTS, self.STRATA,
+                self.QUOTAS_SCHEDULE, [9], state, 1)
+
+    def test_resume_does_not_mutate_inputs_or_state(self):
+        items = list(self.ITEMS)
+        weights = list(self.WEIGHTS)
+        strata = list(self.STRATA)
+        schedule = [list(row) for row in self.QUOTAS_SCHEDULE]
+        excluded = [4, 0, 0, 4]
+        state = weighted_sample_stratified_excluding_schedule_checkpoint(
+            items, weights, strata, schedule, excluded, self.SEED, start=1)
+        import copy as _copy
+        snapshot = _copy.deepcopy(state)
+        weighted_sample_stratified_excluding_schedule_resume_indices(
+            items, weights, strata, schedule, excluded, state, 2)
+        weighted_sample_stratified_excluding_schedule_resume(
+            items, weights, strata, schedule, excluded, state, 2)
+        self.assertEqual(state, snapshot)
+        self.assertEqual(items, self.ITEMS)
+        self.assertEqual(weights, self.WEIGHTS)
+        self.assertEqual(strata, self.STRATA)
+        self.assertEqual(
+            schedule, [list(row) for row in self.QUOTAS_SCHEDULE])
+        self.assertEqual(excluded, [4, 0, 0, 4])
+
+    def test_empty_plan_session(self):
+        state = weighted_sample_stratified_excluding_schedule_checkpoint(
+            self.ITEMS, self.WEIGHTS, self.STRATA, [], [], self.SEED)
+        self.assertEqual(state["position"], 0)
+        self.assertEqual(state["schedule_length"], 0)
+        self.assertEqual(state["excluded"], [])
+        rounds, state = (
+            weighted_sample_stratified_excluding_schedule_resume_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, [], [], state, 0))
+        self.assertEqual(rounds, [])
+        self.assertEqual(state["position"], 0)
+
+    def test_empty_items_session(self):
+        state = weighted_sample_stratified_excluding_schedule_checkpoint(
+            [], [], [], [[], []], [], self.SEED)
+        rounds, state = (
+            weighted_sample_stratified_excluding_schedule_resume_indices(
+                [], [], [], [[], []], [], state, 2))
+        self.assertEqual(rounds, [[], []])
+        self.assertEqual(state["position"], 2)
 
 
 if __name__ == "__main__":
