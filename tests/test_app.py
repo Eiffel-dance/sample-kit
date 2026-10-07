@@ -52,6 +52,11 @@ from app import (
     weighted_sample_stratified_schedule_checkpoint,
     weighted_sample_stratified_schedule_resume_indices,
     weighted_sample_stratified_schedule_resume,
+    weighted_sample_stratified_excluding_indices,
+    weighted_sample_stratified_excluding,
+    weighted_sample_stratified_excluding_counts,
+    weighted_sample_stratified_excluding_stream_indices,
+    weighted_sample_stratified_excluding_stream,
     weighted_sample_stream,
     weighted_sample_stream_indices,
     weighted_sample_many_excluding,
@@ -10498,6 +10503,477 @@ class WeightedSampleExcludingScheduleTest(unittest.TestCase):
                 self.ITEMS, weights, 3, (0, 4), 4, 42),
             weighted_sample_excluding_schedule_indices(
                 self.ITEMS, [list(weights)] * 4, 3, (0, 4), 4, 42))
+
+
+class WeightedSampleStratifiedExcludingTest(unittest.TestCase):
+    ITEMS = ["a", "b", "c", "d", "e", "f", "g", "h"]
+    WEIGHTS = [5, 1, 3, 2, 4, 1, 2, 6]
+    STRATA = [0, 0, 1, 1, 2, 2, 2, 2]
+    QUOTAS = [1, 1, 2]
+    EXCLUDED = [0, 4]
+    SEED = 20240521
+
+    def test_deterministic_same_seed(self):
+        first = weighted_sample_stratified_excluding_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+            self.EXCLUDED, self.SEED)
+        second = weighted_sample_stratified_excluding_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+            self.EXCLUDED, self.SEED)
+        self.assertEqual(first, second)
+        self.assertEqual(
+            first,
+            weighted_sample_stratified_excluding_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+                excluded=self.EXCLUDED, seed=self.SEED))
+
+    def test_excluded_positions_never_chosen(self):
+        for seed in range(30):
+            indices = weighted_sample_stratified_excluding_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+                self.EXCLUDED, seed)
+            self.assertEqual(len(indices), sum(self.QUOTAS))
+            self.assertEqual(len(set(indices)), len(indices))
+            for position in self.EXCLUDED:
+                self.assertNotIn(position, indices)
+
+    def test_strata_processed_in_ascending_number_order(self):
+        indices = weighted_sample_stratified_excluding_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+            self.EXCLUDED, self.SEED)
+        cursor = 0
+        for number, quota in enumerate(self.QUOTAS):
+            segment = indices[cursor:cursor + quota]
+            cursor += quota
+            self.assertEqual(len(segment), quota)
+            for position in segment:
+                self.assertEqual(self.STRATA[position], number)
+
+    def test_excluded_set_semantics_ignore_order_and_duplicates(self):
+        base = weighted_sample_stratified_excluding_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+            [0, 4], self.SEED)
+        for excluded in ([4, 0], [0, 0, 4], (4, 0, 0, 4), [4, 0, 4]):
+            self.assertEqual(
+                base,
+                weighted_sample_stratified_excluding_indices(
+                    self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+                    excluded, self.SEED))
+
+    def test_empty_excluded_matches_stratified_entries(self):
+        for seed in (0, 1, self.SEED, 987654):
+            self.assertEqual(
+                weighted_sample_stratified_excluding_indices(
+                    self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+                    [], seed),
+                weighted_sample_stratified_indices(
+                    self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+                    seed))
+            self.assertEqual(
+                weighted_sample_stratified_excluding(
+                    self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+                    (), seed),
+                weighted_sample_stratified(
+                    self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+                    seed))
+
+    def test_values_entry_corresponds_to_indices_entry(self):
+        indices = weighted_sample_stratified_excluding_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+            self.EXCLUDED, self.SEED)
+        values = weighted_sample_stratified_excluding(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+            self.EXCLUDED, self.SEED)
+        self.assertEqual(values, [self.ITEMS[i] for i in indices])
+
+    def test_duplicate_values_distinct_positions(self):
+        items = ["x", "x", "x", "x"]
+        weights = [1, 1, 1, 1]
+        strata = [0, 0, 1, 1]
+        indices = weighted_sample_stratified_excluding_indices(
+            items, weights, strata, [1, 1], [0], 5)
+        self.assertEqual(len(indices), 2)
+        self.assertEqual(len(set(indices)), 2)
+        self.assertNotIn(0, indices)
+        values = weighted_sample_stratified_excluding(
+            items, weights, strata, [1, 1], [0], 5)
+        self.assertEqual(values, [items[i] for i in indices])
+
+    def test_zero_weight_and_excluded_never_chosen(self):
+        items = ["a", "b", "c", "d"]
+        weights = [0, 3, 0, 2]
+        strata = [0, 0, 1, 1]
+        for seed in range(20):
+            self.assertEqual(
+                weighted_sample_stratified_excluding_indices(
+                    items, weights, strata, [1, 1], [], seed),
+                [1, 3])
+            # 排除位置 1 后第 0 层没有可用的正权重位置。
+            with self.assertRaises(ValueError):
+                weighted_sample_stratified_excluding_indices(
+                    items, weights, strata, [1, 1], [1], seed)
+
+    def test_all_zero_quotas_returns_empty_after_validation(self):
+        self.assertEqual(
+            weighted_sample_stratified_excluding_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, [0, 0, 0],
+                self.EXCLUDED, self.SEED),
+            [])
+        self.assertEqual(
+            weighted_sample_stratified_excluding(
+                self.ITEMS, self.WEIGHTS, self.STRATA, [0, 0, 0],
+                self.EXCLUDED, self.SEED),
+            [])
+        # 全部配额为零仍完成权重取值与 excluded 校验。
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_indices(
+                self.ITEMS, [-1] + self.WEIGHTS[1:], self.STRATA,
+                [0, 0, 0], self.EXCLUDED, self.SEED)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, [0, 0, 0],
+                [8], self.SEED)
+
+    def test_empty_items_requires_empty_strata_quotas_excluded(self):
+        self.assertEqual(
+            weighted_sample_stratified_excluding_indices(
+                [], [], [], [], []), [])
+        self.assertEqual(
+            weighted_sample_stratified_excluding([], [], [], [], []), [])
+        self.assertEqual(
+            weighted_sample_stratified_excluding_counts(
+                [], [], [], [], [], 3, 0), [])
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_indices(
+                [], [], [], [], [0])
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_indices(
+                [], [], [0], [], [])
+
+    def test_excluded_positive_weight_may_make_layer_infeasible(self):
+        # 第 0 层位置 0、1 权重均为正; 都排除后配额 1 不可行。
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+                [0, 1], self.SEED)
+        # 只排除一个仍可行, 且第 0 层只能选中另一个。
+        indices = weighted_sample_stratified_excluding_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+            [0], self.SEED)
+        self.assertEqual(indices[0], 1)
+        # 零权重位置不计入可行性: 第 0 层 [5, 0] 配额 2 不可行。
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_indices(
+                self.ITEMS, [5, 0] + self.WEIGHTS[2:], self.STRATA,
+                [2, 0, 0], [], self.SEED)
+
+    def test_stream_first_round_matches_one_shot(self):
+        rounds = list(weighted_sample_stratified_excluding_stream_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+            self.EXCLUDED, 3, self.SEED))
+        self.assertEqual(len(rounds), 3)
+        self.assertEqual(
+            rounds[0],
+            weighted_sample_stratified_excluding_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+                self.EXCLUDED, self.SEED))
+        for round_indices in rounds:
+            self.assertEqual(len(round_indices), sum(self.QUOTAS))
+            self.assertEqual(len(set(round_indices)), len(round_indices))
+            for position in self.EXCLUDED:
+                self.assertNotIn(position, round_indices)
+
+    def test_stream_start_skips_complete_rounds(self):
+        full = list(weighted_sample_stratified_excluding_stream_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+            self.EXCLUDED, 6, self.SEED))
+        window = list(weighted_sample_stratified_excluding_stream_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+            self.EXCLUDED, 3, self.SEED, 2))
+        self.assertEqual(window, full[2:5])
+        # start 越过已生成的轮次仍确定且与完整流切片一致。
+        tail = list(weighted_sample_stratified_excluding_stream_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+            self.EXCLUDED, 1, self.SEED, 5))
+        self.assertEqual(tail, full[5:6])
+
+    def test_stream_values_entry_corresponds_to_indices_entry(self):
+        index_rounds = list(
+            weighted_sample_stratified_excluding_stream_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+                self.EXCLUDED, 4, self.SEED, 1))
+        value_rounds = list(weighted_sample_stratified_excluding_stream(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+            self.EXCLUDED, 4, self.SEED, 1))
+        self.assertEqual(
+            value_rounds,
+            [[self.ITEMS[i] for i in round_indices]
+             for round_indices in index_rounds])
+
+    def test_stream_zero_quota_rounds_yield_empty_lists(self):
+        rounds = list(weighted_sample_stratified_excluding_stream_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA, [0, 0, 0],
+            self.EXCLUDED, 3, self.SEED, 2))
+        self.assertEqual(rounds, [[], [], []])
+
+    def test_stream_draws_zero_validates_and_yields_nothing(self):
+        stream = weighted_sample_stratified_excluding_stream_indices(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+            self.EXCLUDED, 0, self.SEED, 10)
+        self.assertEqual(list(stream), [])
+        # draws=0 仍完成全部校验。
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_stream_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+                [0, 1], 0, self.SEED)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_stream_indices(
+                self.ITEMS, [-1] + self.WEIGHTS[1:], self.STRATA,
+                self.QUOTAS, self.EXCLUDED, 0, self.SEED)
+        with self.assertRaises(TypeError):
+            weighted_sample_stratified_excluding_stream_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+                "04", 0, self.SEED)
+
+    def test_stream_validation_happens_at_creation(self):
+        # 非法输入在创建迭代对象时抛出, 不延迟到迭代期间。
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_stream_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+                [0, 1], 2, self.SEED)
+        with self.assertRaises(TypeError):
+            weighted_sample_stratified_excluding_stream(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+                self.EXCLUDED, 1.5, self.SEED)
+
+    def test_counts_match_stream_indices_flattened(self):
+        for start, draws in ((0, 5), (2, 3), (4, 1), (0, 1)):
+            rounds = list(
+                weighted_sample_stratified_excluding_stream_indices(
+                    self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+                    self.EXCLUDED, draws, self.SEED, start))
+            counts = weighted_sample_stratified_excluding_counts(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+                self.EXCLUDED, draws, self.SEED, start)
+            self.assertEqual(len(counts), len(self.ITEMS))
+            flattened = [0] * len(self.ITEMS)
+            for round_indices in rounds:
+                for position in round_indices:
+                    flattened[position] += 1
+            self.assertEqual(counts, flattened)
+            self.assertEqual(sum(counts), sum(self.QUOTAS) * draws)
+            for position in self.EXCLUDED:
+                self.assertEqual(counts[position], 0)
+
+    def test_counts_excluded_positions_always_zero(self):
+        counts = weighted_sample_stratified_excluding_counts(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+            self.EXCLUDED, 10, self.SEED)
+        self.assertEqual(counts[0], 0)
+        self.assertEqual(counts[4], 0)
+
+    def test_counts_draws_zero_returns_all_zeros_after_validation(self):
+        self.assertEqual(
+            weighted_sample_stratified_excluding_counts(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+                self.EXCLUDED, 0, self.SEED, 7),
+            [0] * len(self.ITEMS))
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_counts(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+                [0, 1], 0, self.SEED)
+
+    def test_counts_serialize_roundtrip_exact(self):
+        counts = weighted_sample_stratified_excluding_counts(
+            self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+            self.EXCLUDED, 5, self.SEED, 1)
+        text = serialize_metrics(counts)
+        self.assertEqual(deserialize_metrics(text), counts)
+        self.assertEqual(
+            deserialize_metrics(serialize_metrics({"counts": counts})),
+            {"counts": counts})
+
+    def test_fraction_decimal_and_huge_integer_weights(self):
+        items = ["a", "b", "c", "d"]
+        weights = [Fraction(1, 10 ** 30), Decimal("1E-25"), 10 ** 80, 2]
+        strata = [0, 0, 1, 1]
+        first = weighted_sample_stratified_excluding_indices(
+            items, weights, strata, [1, 1], [0], 17)
+        second = weighted_sample_stratified_excluding_indices(
+            items, weights, strata, [1, 1], [0], 17)
+        self.assertEqual(first, second)
+        self.assertEqual(len(first), 2)
+        self.assertNotIn(0, first)
+        # 超大整数权重在该层中必然被选中。
+        self.assertIn(2, first)
+        # excluded 为空时与分层入口在精确权重路径上逐项一致。
+        self.assertEqual(
+            weighted_sample_stratified_excluding_indices(
+                items, weights, strata, [1, 1], [], 17),
+            weighted_sample_stratified_indices(
+                items, weights, strata, [1, 1], 17))
+        # 流式入口首轮与一次性入口逐项一致。
+        self.assertEqual(
+            list(weighted_sample_stratified_excluding_stream_indices(
+                items, weights, strata, [1, 1], [0], 1, 17))[0],
+            first)
+
+    def test_validation_type_errors(self):
+        good = (self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+                self.EXCLUDED)
+        # items / weights / strata / quotas / excluded 结构错误。
+        with self.assertRaises(TypeError):
+            weighted_sample_stratified_excluding_indices(
+                "abcdefgh", *good[1:], seed=self.SEED)
+        with self.assertRaises(TypeError):
+            weighted_sample_stratified_excluding_indices(
+                self.ITEMS, "12345678", self.STRATA, self.QUOTAS,
+                self.EXCLUDED, seed=self.SEED)
+        with self.assertRaises(TypeError):
+            weighted_sample_stratified_excluding_indices(
+                self.ITEMS, self.WEIGHTS, "00012222", self.QUOTAS,
+                self.EXCLUDED, seed=self.SEED)
+        with self.assertRaises(TypeError):
+            weighted_sample_stratified_excluding_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, "112",
+                self.EXCLUDED, seed=self.SEED)
+        with self.assertRaises(TypeError):
+            weighted_sample_stratified_excluding_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+                "04", seed=self.SEED)
+        # seed 类型错误。
+        with self.assertRaises(TypeError):
+            weighted_sample_stratified_excluding_indices(
+                *good, seed=object())
+        # strata / quotas / excluded 成员类型错误。
+        with self.assertRaises(TypeError):
+            weighted_sample_stratified_excluding_indices(
+                self.ITEMS, self.WEIGHTS, [True] * 8, self.QUOTAS,
+                self.EXCLUDED, seed=self.SEED)
+        with self.assertRaises(TypeError):
+            weighted_sample_stratified_excluding_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, [1, 1, 2.0],
+                self.EXCLUDED, seed=self.SEED)
+        with self.assertRaises(TypeError):
+            weighted_sample_stratified_excluding_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+                [0.5], seed=self.SEED)
+        with self.assertRaises(TypeError):
+            weighted_sample_stratified_excluding_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+                [True], seed=self.SEED)
+        # 权重元素类型错误。
+        with self.assertRaises(TypeError):
+            weighted_sample_stratified_excluding_indices(
+                self.ITEMS, [True] * 8, self.STRATA, self.QUOTAS,
+                self.EXCLUDED, seed=self.SEED)
+        with self.assertRaises(TypeError):
+            weighted_sample_stratified_excluding_indices(
+                self.ITEMS, ["1"] * 8, self.STRATA, self.QUOTAS,
+                self.EXCLUDED, seed=self.SEED)
+        # draws / start 类型错误(流式与频次入口)。
+        for entry in (weighted_sample_stratified_excluding_stream_indices,
+                      weighted_sample_stratified_excluding_counts):
+            with self.assertRaises(TypeError):
+                entry(self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+                      self.EXCLUDED, 1.5, self.SEED)
+            with self.assertRaises(TypeError):
+                entry(self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+                      self.EXCLUDED, True, self.SEED)
+            with self.assertRaises(TypeError):
+                entry(self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+                      self.EXCLUDED, 1, self.SEED, 0.5)
+
+    def test_validation_value_errors(self):
+        # 长度不一致。
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_indices(
+                self.ITEMS, self.WEIGHTS[:-1], self.STRATA, self.QUOTAS,
+                self.EXCLUDED, self.SEED)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA[:-1], self.QUOTAS,
+                self.EXCLUDED, self.SEED)
+        # 编号越界与 quotas 长度约束。
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_indices(
+                self.ITEMS, self.WEIGHTS, [-1] + self.STRATA[1:],
+                self.QUOTAS, self.EXCLUDED, self.SEED)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, [1, 1],
+                self.EXCLUDED, self.SEED)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, [1, 1, -1],
+                self.EXCLUDED, self.SEED)
+        # 权重取值错误。
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_indices(
+                self.ITEMS, [-1] + self.WEIGHTS[1:], self.STRATA,
+                self.QUOTAS, self.EXCLUDED, self.SEED)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_indices(
+                self.ITEMS, [float("nan")] * 8, self.STRATA,
+                self.QUOTAS, self.EXCLUDED, self.SEED)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_indices(
+                self.ITEMS, [float("inf")] + self.WEIGHTS[1:], self.STRATA,
+                self.QUOTAS, self.EXCLUDED, self.SEED)
+        # excluded 越界。
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+                [8], self.SEED)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+                [-1], self.SEED)
+        # draws / start 取值错误。
+        for entry in (weighted_sample_stratified_excluding_stream_indices,
+                      weighted_sample_stratified_excluding_counts):
+            with self.assertRaises(ValueError):
+                entry(self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+                      self.EXCLUDED, -1, self.SEED)
+            with self.assertRaises(ValueError):
+                entry(self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+                      self.EXCLUDED, 1, self.SEED, -1)
+
+    def test_failure_produces_no_partial_result_and_inputs_unchanged(self):
+        items = list(self.ITEMS)
+        weights = list(self.WEIGHTS)
+        strata = list(self.STRATA)
+        quotas = list(self.QUOTAS)
+        excluded = list(self.EXCLUDED)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_counts(
+                items, weights, strata, quotas, excluded, -1, self.SEED)
+        with self.assertRaises(ValueError):
+            weighted_sample_stratified_excluding_indices(
+                items, weights, strata, quotas, [0, 1], self.SEED)
+        self.assertEqual(items, self.ITEMS)
+        self.assertEqual(weights, self.WEIGHTS)
+        self.assertEqual(strata, self.STRATA)
+        self.assertEqual(quotas, self.QUOTAS)
+        self.assertEqual(excluded, self.EXCLUDED)
+
+    def test_existing_entries_unchanged(self):
+        # 组合入口的存在不改变既有分层、排除与采样入口的行为。
+        self.assertEqual(
+            weighted_sample_stratified_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+                self.SEED),
+            weighted_sample_stratified_excluding_indices(
+                self.ITEMS, self.WEIGHTS, self.STRATA, self.QUOTAS,
+                (), self.SEED))
+        self.assertEqual(
+            weighted_sample_indices(self.ITEMS, self.WEIGHTS, 3, 42),
+            weighted_sample_indices(self.ITEMS, self.WEIGHTS, 3, 42))
+        self.assertEqual(
+            weighted_sample_excluding_indices(
+                self.ITEMS, self.WEIGHTS, 3, (0, 4), 42),
+            weighted_sample_excluding_indices(
+                self.ITEMS, self.WEIGHTS, 3, (4, 0, 0), 42))
 
 
 if __name__ == "__main__":
